@@ -50,3 +50,7 @@ vcpkg/
 
 # Ignore local cache used by e.g. clangd
 .cache/
+
+ns3env/
+config.sh
+ns-3.46-lena-gym.zip
