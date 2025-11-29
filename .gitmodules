@@ -1,0 +1,9 @@
+[submodule "conrib/opengym"]
+	path = conrib/opengym
+	url = https://github.com/GmelaN/ns3-gym
+[submodule "contrib/nr"]
+	path = contrib/nr
+	url = https://github.com/GmelaN/ns-3.46-lena-bwp
+[submodule "contrib/opengym"]
+	path = contrib/opengym
+	url = https://github.com/GmelaN/ns3-gym
