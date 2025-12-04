@@ -8,7 +8,8 @@
             "name": "(gdb) Launch from scratch",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/${relativeFileDirname}/ns3-dev-${fileBasenameNoExtension}-${input:buildType}",
+            // "program": "${workspaceFolder}/build/${relativeFileDirname}/ns3.46-${fileBasenameNoExtension}-${input:buildType}",
+            "program": "${workspaceFolder}/build/${relativeFileDirname}/ns3.46-${fileBasenameNoExtension}-default",
             "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
@@ -33,7 +34,8 @@
             "name": "(lldb) Launch from scratch",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/${relativeFileDirname}/ns3-dev-${fileBasenameNoExtension}-${input:buildType}",
+            // "program": "${workspaceFolder}/build/${relativeFileDirname}/ns3.46-${fileBasenameNoExtension}-${input:buildType}",
+            "program": "${workspaceFolder}/build/${relativeFileDirname}/ns3.46-${fileBasenameNoExtension}-default",
             "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
@@ -51,7 +53,8 @@
             "name": "(gdb) Launch testrunner",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/utils/ns3-dev-test-runner-${input:buildType}",
+            // "program": "${workspaceFolder}/build/utils/ns3.46-test-runner-${input:buildType}",
+            "program": "${workspaceFolder}/build/utils/ns3.46-test-runner-default",
             "args": [
                 "--suite=${selectedText}"
             ],
@@ -78,7 +81,8 @@
             "name": "(lldb) Launch testrunner",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/utils/ns3-dev-test-runner-${input:buildType}",
+            // "program": "${workspaceFolder}/build/utils/ns3.46-test-runner-${input:buildType}",
+            "program": "${workspaceFolder}/build/utils/ns3.46-test-runner-default",
             "args": [
                 "--suite=${selectedText}"
             ],
@@ -95,19 +99,19 @@
             "MIMode": "lldb"
         }
     ],
-    "inputs": [
-        {
-            "type": "pickString",
-            "id": "buildType",
-            "description": "What is the build option?",
-            "options": [
-                "debug",
-                "default",
-                "optimized",
-                "release",
-                "minsizerel"
-            ],
-            "default": "default"
-        }
-    ]
+    // "inputs": [
+    //     {
+    //         "type": "pickString",
+    //         "id": "buildType",
+    //         "description": "What is the build option?",
+    //         "options": [
+    //             "debug",
+    //             "default",
+    //             "optimized",
+    //             "release",
+    //             "minsizerel"
+    //         ],
+    //         "default": "default"
+    //     }
+    // ]
 }
