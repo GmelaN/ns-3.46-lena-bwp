@@ -5,6 +5,8 @@
 // - UE3: stays on wide for whole run
 // Collects per-flow throughput and mean delay using FlowMonitor.
 
+// 지연이 고려된 BWP 스위치 동작 확인 예제 
+
 #include "ns3/applications-module.h"
 #include "ns3/bwp-manager-gnb.h"
 #include "ns3/bwp-manager-ue.h"
