@@ -44,6 +44,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <sstream>
+#include <cmath>
 #include <vector>
 #include <map>
 
@@ -59,7 +60,9 @@ static bool enableInternalPolicy = true; // set true to use helper's built-in po
 static Ptr<NrBwpSwitchTriggerHelper> g_triggerHelper;
 static Ptr<NrBwpSwitchController> g_bwpController;
 static std::vector<double> g_bwpPowerMw = {50.0, 400.0}; // example mW for narrow/wide 5 / 40 MHz
-static uint8_t g_initialBwpId = 0;                        // default start on narrow BWP
+static std::vector<double> g_bwpBandwidthHz = {5e6, 40e6};
+static double g_spectralEfficiency = 1.0;
+static uint8_t g_initialBwpId = 0; // default start on narrow BWP
 
 static void
 DlQueueTrace(uint16_t rnti, uint8_t lcid, uint32_t queueBytes, uint16_t bwpId)
@@ -76,7 +79,7 @@ DlQueueTrace(uint16_t rnti, uint8_t lcid, uint32_t queueBytes, uint16_t bwpId)
 // static NrBwpSwitchDecision
 // ProbeTriggerPolicy(const NrBwpSwitchState& state)
 // {
-//     NS_LOG_UNCOND("TriggerHelper probe rnti=" << state.bsr.rnti << " avgAoI=" << state.avgAoISeconds
+//     NS_LOG_UNCOND("TriggerHelper probe rnti=" << state.bsr.rnti << " avgAoI=" << state.avgAoIMs
 //                                               << "s bin=" << +state.aoiBin
 //                                               << " avgQueue=" << state.avgQueueSizeBytes
 //                                               << "B bin=" << +state.queueBin
@@ -99,50 +102,54 @@ static std::unordered_map<uint16_t, EnergyState> g_energyByRnti;
 static std::unordered_map<uint16_t, uint32_t> g_ueIndexByRnti;
 
 static void
-PdcpTxTrace(uint16_t rnti, uint8_t lcid, uint32_t /*size*/)
+PdcpTxTraceDl(uint16_t rnti, uint8_t lcid, uint32_t size)
 {
-    if (g_bwpController)
+    auto it = g_energyByRnti.find(rnti);
+    if (it == g_energyByRnti.end())
     {
-        g_bwpController->RecordEnqueue(rnti, lcid);
+        return;
     }
-    if (g_triggerHelper)
+    auto& st = it->second;
+    if (!st.initialized)
     {
-        g_triggerHelper->RecordEnqueue(rnti, lcid);
+        st.initialized = true;
+        st.currentBwp = g_initialBwpId;
+    }
+    uint8_t bwp = st.currentBwp;
+    if (bwp < g_bwpPowerMw.size() && bwp < g_bwpBandwidthHz.size() &&
+        g_bwpBandwidthHz[bwp] > 0.0 && g_spectralEfficiency > 0.0)
+    {
+        double airTime = (8.0 * size) / (g_bwpBandwidthHz[bwp] * g_spectralEfficiency);
+        double energyJ = g_bwpPowerMw[bwp] * 1e-3 * airTime;
+        st.energyJ += energyJ;
     }
 }
 
 static void
-PdcpRxTrace(uint16_t rnti, uint8_t lcid, uint32_t /*size*/, uint64_t /*delayNs*/)
+PdcpRxTraceDl(uint16_t rnti, uint8_t lcid, uint32_t /*size*/, uint64_t delayNs)
 {
+    Time delay = NanoSeconds(delayNs);
     if (g_bwpController)
     {
-        g_bwpController->RecordAck(rnti, lcid);
+        g_bwpController->RecordAoiSample(delay);
     }
     if (g_triggerHelper)
     {
-        g_triggerHelper->RecordAck(rnti, lcid);
+        g_triggerHelper->RecordAoiSample(rnti, lcid, delay);
     }
 }
 
 static void
 OnSwitchEnergy(uint16_t rnti, uint8_t fromBwp, uint8_t toBwp, double switchEnergyJ)
 {
-    double now = Simulator::Now().GetSeconds();
     auto& st = g_energyByRnti[rnti];
-    if (st.initialized && st.currentBwp < g_bwpPowerMw.size())
-    {
-        st.energyJ += (now - st.lastTime) * g_bwpPowerMw[st.currentBwp] * 1e-3;
-    }
-    else
-    {
-        st.initialized = true;
-    }
-    st.lastTime = now;
+    st.initialized = true;
+    st.lastTime = Simulator::Now().GetSeconds();
     st.currentBwp = toBwp;
     st.energyJ += switchEnergyJ;
 
     NS_LOG_INFO("SwitchEnergyTrace rnti=" << rnti << " from=" << +fromBwp << " to=" << +toBwp
-                                          << " energyJ=" << switchEnergyJ);
+                                          << " switchEnergyJ=" << switchEnergyJ);
 }
 
 static void
@@ -156,10 +163,8 @@ ConnectPdcpTracesUe(std::string context, uint64_t imsi, uint16_t cellId, uint16_
         return;
     }
     std::string base = context.substr(0, context.rfind('/')); // strip "/RandomAccessSuccessful"
-    Config::ConnectWithoutContextFailSafe(base + "/DataRadioBearerMap/*/NrPdcp/TxPDU",
-                                          MakeCallback(&PdcpTxTrace));
     Config::ConnectWithoutContextFailSafe(base + "/DataRadioBearerMap/*/NrPdcp/RxPDU",
-                                          MakeCallback(&PdcpRxTrace));
+                                          MakeCallback(&PdcpRxTraceDl));
 }
 
 static void
@@ -174,9 +179,7 @@ ConnectPdcpTracesGnb(std::string context, uint64_t imsi, uint16_t cellId, uint16
     std::ostringstream base;
     base << context.substr(0, context.rfind('/')) << "/UeMap/" << static_cast<uint32_t>(rnti);
     Config::ConnectWithoutContextFailSafe(base.str() + "/DataRadioBearerMap/*/NrPdcp/TxPDU",
-                                          MakeCallback(&PdcpTxTrace));
-    Config::ConnectWithoutContextFailSafe(base.str() + "/DataRadioBearerMap/*/NrPdcp/RxPDU",
-                                          MakeCallback(&PdcpRxTrace));
+                                          MakeCallback(&PdcpTxTraceDl));
 }
 
 static void
@@ -198,7 +201,7 @@ RegisterUeWithController(const Ptr<NrBwpSwitchController>& ctrl,
         return;
     }
 
-    // Seed energy accounting even if no switches happen.
+    // Seed energy accounting with the initial BWP.
     g_energyByRnti[rnti] = EnergyState{true, Simulator::Now().GetSeconds(), g_initialBwpId, 0.0};
     g_ueIndexByRnti[rnti] = ueIndex;
 
@@ -217,7 +220,7 @@ main(int argc, char* argv[])
     cmd.AddValue("simTime", "Simulation time in seconds", simTime);
     cmd.AddValue("numUes", "Number of UEs", numUes);
     cmd.AddValue("initialBwp", "Initial BWP for all UEs (0=narrow, 1=wide)", g_initialBwpId);
-    cmd.AddValue("enableInternalPolicy", "Enable trigger helper built-in Q-learning policy", enableInternalPolicy);
+    cmd.AddValue("enableQlearning", "Enable trigger helper built-in Q-learning policy", enableInternalPolicy);
     cmd.Parse(argc, argv);
 
     LogComponentEnableAll(LogLevel(LOG_PREFIX_TIME));
@@ -243,6 +246,7 @@ main(int argc, char* argv[])
     Ptr<NrPointToPointEpcHelper> epcHelper = CreateObject<NrPointToPointEpcHelper>();
     nrHelper->SetEpcHelper(epcHelper);
     nrHelper->SetSchedulerTypeId(NrMacSchedulerOfdmaRR::GetTypeId());
+    nrHelper->SetSchedulerAttribute("EnableHarqReTx", BooleanValue(false));
 
     // Two CCs (treated as two BWPs for forcing): narrow 5 MHz, wide 40 MHz.
     CcBwpCreator ccBwpCreator;
@@ -303,26 +307,43 @@ main(int argc, char* argv[])
     Ptr<BwpManagerGnb> gnbBwpMgr =
         DynamicCast<BwpManagerGnb>(gnbDevs.Get(0)->GetObject<NrGnbNetDevice>()->GetComponentCarrierManager());
     // Apply a switching delay (e.g., 2 ms) to mimic guard time for both gNB/UE managers.
-    gnbBwpMgr->SetAttributeSwitchingDelay(MilliSeconds(1));
+    gnbBwpMgr->SetAttributeSwitchingDelay(MilliSeconds(20));
+    gnbBwpMgr->SetAttribute("TxPowerBwp0Mw", DoubleValue(g_bwpPowerMw.at(0)));
+    gnbBwpMgr->SetAttribute("TxPowerBwp1Mw", DoubleValue(g_bwpPowerMw.at(1)));
+    gnbBwpMgr->SetAttribute("TxBandwidthBwp0Hz", DoubleValue(g_bwpBandwidthHz.at(0)));
+    gnbBwpMgr->SetAttribute("TxBandwidthBwp1Hz", DoubleValue(g_bwpBandwidthHz.at(1)));
+    gnbBwpMgr->SetAttribute("TxSpectralEfficiency", DoubleValue(g_spectralEfficiency));
 
-    
+
     g_triggerHelper = CreateObject<NrBwpSwitchTriggerHelper>();
     g_triggerHelper->SetAttribute("EnableInternalPolicy", BooleanValue(enableInternalPolicy));
+    if(enableInternalPolicy)
+    {
+        NS_LOG_UNCOND("Q-LEARNING");
+        g_triggerHelper->SetAttribute("InternalPolicyMode", EnumValue(NrBwpSwitchTriggerHelper::InternalPolicyMode::POLICY_Q_LEARNING));
+    }
+    else
+    {
+        NS_LOG_UNCOND("QUEUE_WINDOW_DETECTION");
+        g_triggerHelper->SetAttribute("InternalPolicyMode", EnumValue(NrBwpSwitchTriggerHelper::InternalPolicyMode::POLICY_WINDOW_DETECT));
+    }
+    
     // Give enough time for RA/RRC to complete so enqueue/ACK/BSR land before first evaluation.
     g_triggerHelper->SetAttribute("StartDelay", TimeValue(MilliSeconds(60)));
     g_triggerHelper->SetAttribute("EvaluationPeriod", TimeValue(MilliSeconds(50)));
     // Push bins to react to even lighter load/latency so BWP1 becomes eligible sooner.
-    g_triggerHelper->SetAttribute("QueueThreshold1", UintegerValue(500));
-    g_triggerHelper->SetAttribute("QueueThreshold2", UintegerValue(2000));
+    g_triggerHelper->SetAttribute("QueueThreshold1", UintegerValue(1000));
+    g_triggerHelper->SetAttribute("QueueThreshold2", UintegerValue(3000));
     g_triggerHelper->SetAttribute("AoIThreshold1", TimeValue(MilliSeconds(5)));
     g_triggerHelper->SetAttribute("AoIThreshold2", TimeValue(MilliSeconds(10)));
     // Bias learning toward AoI by reducing energy weight/scale and updating all UEs every round.
     g_triggerHelper->SetAttribute("PreferenceEnergy", DoubleValue(0.5));
     g_triggerHelper->SetAttribute("PreferenceAoI", DoubleValue(0.5));
-    g_triggerHelper->SetAttribute("RewardEnergyNorm", DoubleValue(0.1)); // J scale
-    g_triggerHelper->SetAttribute("RewardAoiNorm", DoubleValue(0.005));  // s scale (~5 ms)
-    g_triggerHelper->SetAttribute("Epsilon", DoubleValue(0.5));
-    g_triggerHelper->SetAttribute("EpsilonDecay", DoubleValue(5e-5));
+    g_triggerHelper->SetAttribute("RewardEnergyNorm", DoubleValue(5.0)); // J scale
+    g_triggerHelper->SetAttribute("RewardAoiNorm", DoubleValue(10.0));  // ms scale (~5 ms)
+    g_triggerHelper->SetAttribute("Epsilon", DoubleValue(0.2));
+    g_triggerHelper->SetAttribute("EpsilonMin", DoubleValue(0.02));
+    g_triggerHelper->SetAttribute("EpsilonDecay", DoubleValue(5e-3));
     g_triggerHelper->SetAttribute("LearningRate", DoubleValue(0.05));
     g_triggerHelper->SetAttribute("EvalGroupModulo", UintegerValue(1));
     g_triggerHelper->SetAttribute("StaticPowerBwp0Mw", DoubleValue(g_bwpPowerMw.at(0)));
@@ -375,11 +396,12 @@ main(int argc, char* argv[])
         ftp->SetRemote(InetSocketAddress(ueIpIfaces.GetAddress(i), port));
         ftp->SetProtocol(UdpSocketFactory::GetTypeId());
 
-        // High duty-cycle traffic to widen the queue gap between 5 MHz and 40 MHz BWPs.
-        double readingMean = readingTimeRng->GetValue(0.04, 0.06); // seconds
-        double fileSizeMu = fileSizeMuRng->GetValue(10.8, 11.0); // lognormal mu -> mean ~50-65 KB
+        // Less frequent, larger file transfers (~5 MB) to create bursty load.
+        double readingMean = readingTimeRng->GetValue(0.1, 1.0); // seconds (0.1s to 1s)
+        double baseFileSizeMu = std::log(50 * 1024 * 1024); // ln(bytes) for ~50 MB median
+        double fileSizeMu = fileSizeMuRng->GetValue(baseFileSizeMu - 0.05, baseFileSizeMu + 0.05);
         double fileSizeSigma = fileSizeSigmaRng->GetValue(0.08, 0.12); // lognormal sigma
-        ftp->SetAttribute("MaxFileSize", UintegerValue(256 * 1024)); // 256 KB
+        ftp->SetAttribute("MaxFileSize", UintegerValue(50 * 1024 * 1024)); // 50 MB
 
         uint32_t packetSize = static_cast<uint32_t>(packetSizeRng->GetValue(900, 1100));
         ftp->SetAttribute("ReadingTimeMean", DoubleValue(readingMean));
@@ -398,7 +420,7 @@ main(int argc, char* argv[])
     serverApps.Start(MilliSeconds(50));
     serverApps.Stop(Seconds(simTime));
 
-    // Connect PDCP Tx/Rx traces after RRC is ready, to feed TriggerHelper AoI automatically.
+    // Connect PDCP traces after RRC is ready (DL only: gNB Tx -> UE Rx) to feed AoI.
     Config::Connect("/NodeList/*/DeviceList/*/NrUeRrc/ConnectionReconfiguration",
                     MakeCallback(&ConnectPdcpTracesUe));
     Config::Connect("/NodeList/*/DeviceList/*/NrGnbRrc/ConnectionReconfiguration",
@@ -497,18 +519,13 @@ main(int argc, char* argv[])
     }
 
 
-    // Energy estimate from actual BWP switch trace (static power + switch energy).
-    double simEnd = Simulator::Now().GetSeconds();
+    // Energy estimate from PDCP TX bytes using fixed spectral efficiency.
     double energySum = 0.0;
     uint32_t energyCount = 0;
     for (auto& kv : g_energyByRnti)
     {
         uint16_t rnti = kv.first;
         auto& st = kv.second;
-        if (st.initialized && st.currentBwp < g_bwpPowerMw.size())
-        {
-            st.energyJ += (simEnd - st.lastTime) * g_bwpPowerMw[st.currentBwp] * 1e-3;
-        }
         uint32_t ueIdx = 0;
         auto it = g_ueIndexByRnti.find(rnti);
         if (it != g_ueIndexByRnti.end())

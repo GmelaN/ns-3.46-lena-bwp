@@ -54,3 +54,6 @@ vcpkg/
 ns3env/
 config.sh
 ns-3.46-lena-gym.zip
+scratch/bwp-switch-mac-priority.cc
+
+*.out
