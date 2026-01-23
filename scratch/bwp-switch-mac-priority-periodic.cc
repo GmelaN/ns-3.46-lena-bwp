@@ -33,9 +33,7 @@
 #include "ns3/simulator.h"
 #include "ns3/ipv4-flow-classifier.h"
 #include "ns3/random-variable-stream.h"
-#include "ns3/tcp-socket-factory.h"
 #include "ns3/udp-socket-factory.h"
-#include "ns3/traffic-generator-ftp-single.h"
 #include "ns3/double.h"
 #include "ns3/uinteger.h"
 
@@ -55,67 +53,17 @@ NS_LOG_COMPONENT_DEFINE("BwpSwitchMultiExample");
 static uint32_t simTime = 10;
 static uint8_t numUes = 30;
 static bool enableInternalPolicy = true; // set true to use helper's built-in policy
-static uint32_t burstFileSizeBytes = 1024 * 1024; // bytes per burst, 1KB
-static uint32_t burstPacketSize = 1024; // bytes
-static double burstIntervalMs = 200.0; // milliseconds between bursts
-static uint32_t burstStartJitterMs = 50; // small de-sync across UEs
+static uint8_t fixedMcs = 28;
+static uint32_t trafficPacketSize = 1024; // bytes
+static double trafficPeriodMs = 10.0; // milliseconds
 
 // Timeline-based policy state shared with controller
 static Ptr<NrBwpSwitchTriggerHelper> g_triggerHelper;
 static Ptr<NrBwpSwitchController> g_bwpController;
 static std::vector<double> g_bwpPowerMw = {50.0, 400.0}; // example mW for narrow/wide 5 / 40 MHz
 static std::vector<double> g_bwpBandwidthHz = {5e6, 40e6};
-static double g_spectralEfficiency = 1.0;
+static double g_spectralEfficiency = 5.55; // bit/s/Hz for fixed MCS 28 (NrLteMiErrorModel table)
 static uint8_t g_initialBwpId = 1; // default start on wide BWP
-
-class TrafficGeneratorPeriodicFtp : public TrafficGeneratorFtpSingle
-{
-  public:
-    static TypeId GetTypeId();
-    TrafficGeneratorPeriodicFtp() = default;
-    ~TrafficGeneratorPeriodicFtp() override = default;
-
-  private:
-    void StartApplication() override;
-    void PacketBurstSent() override;
-
-    Time m_interBurstTime{Seconds(0.2)};
-};
-
-TypeId
-TrafficGeneratorPeriodicFtp::GetTypeId()
-{
-    static TypeId tid =
-        TypeId("ns3::TrafficGeneratorPeriodicFtp")
-            .SetParent<TrafficGeneratorFtpSingle>()
-            .SetGroupName("Applications")
-            .AddConstructor<TrafficGeneratorPeriodicFtp>()
-            .AddAttribute("InterBurstTime",
-                          "Time between periodic bursts",
-                          TimeValue(Seconds(0.2)),
-                          MakeTimeAccessor(&TrafficGeneratorPeriodicFtp::m_interBurstTime),
-                          MakeTimeChecker());
-    return tid;
-}
-
-void
-TrafficGeneratorPeriodicFtp::StartApplication()
-{
-    SendPacketBurst();
-}
-
-void
-TrafficGeneratorPeriodicFtp::PacketBurstSent()
-{
-    if (m_interBurstTime.IsZero())
-    {
-        Simulator::ScheduleNow(&TrafficGenerator::SendPacketBurst, this);
-    }
-    else
-    {
-        Simulator::Schedule(m_interBurstTime, &TrafficGenerator::SendPacketBurst, this);
-    }
-}
 
 static void
 DlQueueTrace(uint16_t rnti, uint8_t lcid, uint32_t queueBytes, uint16_t bwpId)
@@ -274,10 +222,8 @@ main(int argc, char* argv[])
     cmd.AddValue("numUes", "Number of UEs", numUes);
     cmd.AddValue("initialBwp", "Initial BWP for all UEs (0=narrow, 1=wide)", g_initialBwpId);
     cmd.AddValue("enableQlearning", "Enable trigger helper built-in Q-learning policy", enableInternalPolicy);
-    cmd.AddValue("burstFileSize", "Periodic burst size in bytes", burstFileSizeBytes);
-    cmd.AddValue("burstPacketSize", "Packet size in bytes for each burst", burstPacketSize);
-    cmd.AddValue("burstIntervalMs", "Inter-burst interval in milliseconds", burstIntervalMs);
-    cmd.AddValue("burstStartJitterMs", "Start-time jitter in milliseconds", burstStartJitterMs);
+    cmd.AddValue("trafficPacketSize", "Periodic traffic packet size in bytes", trafficPacketSize);
+    cmd.AddValue("trafficPeriodMs", "Periodic traffic interval in milliseconds", trafficPeriodMs);
     cmd.Parse(argc, argv);
 
     LogComponentEnableAll(LogLevel(LOG_PREFIX_TIME));
@@ -288,17 +234,17 @@ main(int argc, char* argv[])
 
     // Clamp initial BWP to available BWPs (0..1).
     g_initialBwpId = std::min<uint8_t>(g_initialBwpId, 1);
-    if (burstPacketSize < 12)
+    if (trafficPacketSize < 12)
     {
-        burstPacketSize = 12;
+        trafficPacketSize = 12;
     }
-    if (burstPacketSize > 65507)
+    if (trafficPacketSize > 65507)
     {
-        burstPacketSize = 65507;
+        trafficPacketSize = 65507;
     }
-    if (burstIntervalMs <= 0.0)
+    if (trafficPeriodMs <= 0.0)
     {
-        burstIntervalMs = 1.0;
+        trafficPeriodMs = 1.0;
     }
 
     NodeContainer gnbNodes;
@@ -316,6 +262,10 @@ main(int argc, char* argv[])
     nrHelper->SetEpcHelper(epcHelper);
     nrHelper->SetSchedulerTypeId(NrMacSchedulerOfdmaRR::GetTypeId());
     nrHelper->SetSchedulerAttribute("EnableHarqReTx", BooleanValue(false));
+    nrHelper->SetSchedulerAttribute("FixedMcsDl", BooleanValue(true));
+    nrHelper->SetSchedulerAttribute("FixedMcsUl", BooleanValue(true));
+    nrHelper->SetSchedulerAttribute("StartingMcsDl", UintegerValue(fixedMcs));
+    nrHelper->SetSchedulerAttribute("StartingMcsUl", UintegerValue(fixedMcs));
 
     // Two CCs (treated as two BWPs for forcing): narrow 5 MHz, wide 40 MHz.
     CcBwpCreator ccBwpCreator;
@@ -417,7 +367,7 @@ main(int argc, char* argv[])
     g_triggerHelper->SetAttribute("EvalGroupModulo", UintegerValue(1));
     g_triggerHelper->SetAttribute("StaticPowerBwp0Mw", DoubleValue(g_bwpPowerMw.at(0)));
     g_triggerHelper->SetAttribute("StaticPowerBwp1Mw", DoubleValue(g_bwpPowerMw.at(1)));
-    
+
     g_triggerHelper->SetAttribute("SwitchThresholdBytes", UintegerValue(2000));
     g_triggerHelper->SetGnbManager(gnbBwpMgr);
     // g_triggerHelper->SetPolicy(MakeCallback(&ProbeTriggerPolicy));
@@ -441,8 +391,9 @@ main(int argc, char* argv[])
                                           MakeCallback(&NrBwpSwitchController::HandleBsr, bwpController));
     gnbBwpMgr->TraceConnectWithoutContext("SwitchEnergy", MakeCallback(&OnSwitchEnergy));
 
-    // Applications: DL sinks per UE; periodic FTP-like burst traffic from remote host.
+    // Applications: DL sinks per UE; periodic traffic generated from remote host.
     ApplicationContainer serverApps;
+    ApplicationContainer clientApps;
     Ptr<UniformRandomVariable> startJitterRng = CreateObject<UniformRandomVariable>();
     for (uint32_t i = 0; i < ueNodes.GetN(); ++i)
     {
@@ -459,20 +410,18 @@ main(int argc, char* argv[])
         NrEpsBearer bearer(NrEpsBearer::NGBR_LOW_LAT_EMBB);
         nrHelper->ActivateDedicatedEpsBearer(ueDevs.Get(i), bearer, tft);
 
-        Ptr<TrafficGeneratorPeriodicFtp> ftp = CreateObject<TrafficGeneratorPeriodicFtp>();
-        ftp->SetRemote(InetSocketAddress(ueIpIfaces.GetAddress(i), port));
-        ftp->SetProtocol(UdpSocketFactory::GetTypeId());
+        UdpClientHelper client(ueIpIfaces.GetAddress(i), port);
+        client.SetAttribute("MaxPackets", UintegerValue(0));
+        client.SetAttribute("Interval", TimeValue(MilliSeconds(trafficPeriodMs)));
+        client.SetAttribute("PacketSize", UintegerValue(trafficPacketSize));
 
-        ftp->SetAttribute("FileSize", UintegerValue(burstFileSizeBytes));
-        ftp->SetAttribute("PacketSize", UintegerValue(burstPacketSize));
-        ftp->SetAttribute("InterBurstTime", TimeValue(MilliSeconds(burstIntervalMs)));
-
-        // Stagger start slightly so bursts are de-synchronized across UEs.
-        uint32_t startJitterMs = startJitterRng->GetInteger(0, burstStartJitterMs);
+        // Stagger start slightly so periodic flows are de-synchronized across UEs.
+        uint32_t startJitterMs = startJitterRng->GetInteger(0, 20);
         Time startTime = MilliSeconds(60 + startJitterMs);
-        ftp->SetStartTime(startTime);
-        ftp->SetStopTime(Seconds(simTime));
-        remoteHost.Get(0)->AddApplication(ftp);
+        ApplicationContainer clientApp = client.Install(remoteHost.Get(0));
+        clientApp.Start(startTime);
+        clientApp.Stop(Seconds(simTime));
+        clientApps.Add(clientApp);
     }
 
     serverApps.Start(MilliSeconds(50));
