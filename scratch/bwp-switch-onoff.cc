@@ -29,6 +29,7 @@
 #include "ns3/nr-mac-scheduler-ns3.h"
 #include "ns3/nr-ue-net-device.h"
 #include "ns3/nr-ue-phy.h"
+#include "ns3/inet-socket-address.h"
 #include "ns3/point-to-point-helper.h"
 #include "ns3/simulator.h"
 #include "ns3/ipv4-flow-classifier.h"
@@ -36,6 +37,7 @@
 #include "ns3/udp-socket-factory.h"
 #include "ns3/double.h"
 #include "ns3/uinteger.h"
+#include "ns3/data-rate.h"
 
 #include "ns3/command-line.h"
 
@@ -51,11 +53,14 @@ using namespace ns3;
 NS_LOG_COMPONENT_DEFINE("BwpSwitchMultiExample");
 
 static uint32_t simTime = 10;
-static uint8_t numUes = 30;
-static bool enableInternalPolicy = true; // set true to use helper's built-in policy
+static uint8_t numUes = 1;
+static uint8_t internalPolicy = NrBwpSwitchTriggerHelper::InternalPolicyMode::NO_POLICY_BWP0;
 static uint8_t fixedMcs = 28;
-static uint32_t trafficPacketSize = 1024; // bytes
-static double trafficPeriodMs = 10.0; // milliseconds
+static uint32_t onoffPacketSize = 1024; // bytes
+static double onDurationMs = 200.0;
+static double offDurationMs = 200.0;
+static double onoffPktIntervalMs = 10.0; // milliseconds between packets during ON
+static uint32_t onoffStartJitterMs = 50; // milliseconds
 
 // Timeline-based policy state shared with controller
 static Ptr<NrBwpSwitchTriggerHelper> g_triggerHelper;
@@ -64,6 +69,30 @@ static std::vector<double> g_bwpPowerMw = {50.0, 400.0}; // example mW for narro
 static std::vector<double> g_bwpBandwidthHz = {5e6, 40e6};
 static double g_spectralEfficiency = 5.55; // bit/s/Hz for fixed MCS 28 (NrLteMiErrorModel table)
 static uint8_t g_initialBwpId = 1; // default start on wide BWP
+static double g_queueThresholdBytes = 2000.0;
+static std::unordered_set<uint16_t> g_pdcpUeConnected;
+static std::unordered_set<uint16_t> g_pdcpGnbConnected;
+struct EnergyState
+{
+    bool initialized{false};
+    double lastTime{0.0};
+    uint8_t currentBwp{0};
+    double energyJ{0.0};
+};
+static std::unordered_map<uint16_t, EnergyState> g_energyByRnti;
+static std::unordered_map<uint16_t, uint32_t> g_ueIndexByRnti;
+static std::vector<uint16_t> g_rntiByUeIndex;
+static std::map<Ipv4Address, uint32_t> g_ueIpToIndex;
+static std::unordered_map<uint32_t, double> g_lastGenTxTimeByUeIdx;
+static std::unordered_map<uint32_t, double> g_lastGenIntervalMsByUeIdx;
+static std::unordered_map<uint32_t, bool> g_lastGenBurstByUeIdx;
+static std::unordered_map<uint32_t, bool> g_onoffStateByUeIdx;
+static std::unordered_map<uint32_t, bool> g_lastOnOffOldStateByUeIdx;
+static std::unordered_map<uint32_t, double> g_lastOnOffTimeByUeIdx;
+static std::unordered_map<uint32_t, uint64_t> g_onoffSeqByUeIdx;
+static std::unordered_map<uint16_t, uint64_t> g_lastOnOffSeqByRnti;
+static std::unordered_map<uint16_t, uint64_t> g_lastOnOffSeqByRntiDecision;
+static std::unordered_map<uint64_t, uint32_t> g_appKeyToUeIndex;
 
 static void
 DlQueueTrace(uint16_t rnti, uint8_t lcid, uint32_t queueBytes, uint16_t bwpId)
@@ -72,7 +101,23 @@ DlQueueTrace(uint16_t rnti, uint8_t lcid, uint32_t queueBytes, uint16_t bwpId)
     {
         return;
     }
-    g_triggerHelper->NotifyDlQueue(rnti, lcid, static_cast<uint8_t>(bwpId), 0, queueBytes);
+    g_triggerHelper->NotifyDlQueue(rnti, lcid, static_cast<uint8_t>(bwpId), queueBytes);
+}
+
+static NrBwpSwitchDecision
+SchedIntervalPolicy(const NrBwpSwitchState& state)
+{
+    NrBwpSwitchDecision decision;
+    if (state.switchingRemaining.IsZero() &&
+        state.avgQueueSizeBytes >= g_queueThresholdBytes)
+    {
+        decision.targetBwpId = 1;
+    }
+    else
+    {
+        decision.targetBwpId = 0;
+    }
+    return decision;
 }
 
 
@@ -90,17 +135,7 @@ DlQueueTrace(uint16_t rnti, uint8_t lcid, uint32_t queueBytes, uint16_t bwpId)
 // }
 
 
-static std::unordered_set<uint16_t> g_pdcpUeConnected;
-static std::unordered_set<uint16_t> g_pdcpGnbConnected;
-struct EnergyState
-{
-    bool initialized{false};
-    double lastTime{0.0};
-    uint8_t currentBwp{0};
-    double energyJ{0.0};
-};
-static std::unordered_map<uint16_t, EnergyState> g_energyByRnti;
-static std::unordered_map<uint16_t, uint32_t> g_ueIndexByRnti;
+
 
 static void
 PdcpTxTraceDl(uint16_t rnti, uint8_t lcid, uint32_t size)
@@ -138,6 +173,112 @@ PdcpRxTraceDl(uint16_t rnti, uint8_t lcid, uint32_t /*size*/, uint64_t delayNs)
     {
         g_triggerHelper->RecordAoiSample(rnti, lcid, delay);
     }
+}
+
+static void
+DecisionTrace(uint16_t rnti, const NrBwpSwitchState& state, const NrBwpSwitchDecision& /*decision*/)
+{
+    auto ueIt = g_ueIndexByRnti.find(rnti);
+    if (ueIt == g_ueIndexByRnti.end())
+    {
+        return;
+    }
+    uint32_t ueIdx = ueIt->second;
+    auto seqIt = g_onoffSeqByUeIdx.find(ueIdx);
+    if (seqIt == g_onoffSeqByUeIdx.end())
+    {
+        return;
+    }
+    uint64_t seq = seqIt->second;
+    uint64_t& lastSeq = g_lastOnOffSeqByRntiDecision[rnti];
+    if (seq > lastSeq)
+    {
+        double now = Simulator::Now().GetSeconds();
+        double onoffTime = g_lastOnOffTimeByUeIdx[ueIdx];
+        double delayMs = (now - onoffTime) * 1000.0;
+        bool onState = g_onoffStateByUeIdx[ueIdx];
+        NS_LOG_UNCOND(Simulator::Now().As(Time::MS) << ": DecisionTrace ONOFF: " << (onState ? "ON" : "OFF")
+                                          << ", rnti " << rnti
+                                          << ", delay: " << delayMs
+                                          << ", avgQueueBytes: " << state.avgQueueSizeBytes
+                                          << ", avgAoIMs: " << state.avgAoIMs);
+        lastSeq = seq;
+    }
+}
+
+static void
+OnOffStateTrace(std::string path, bool oldState, bool newState)
+{
+    uint32_t nodeId = 0;
+    uint32_t appIndex = 0;
+    auto pos = path.find("/NodeList/");
+    if (pos == std::string::npos)
+    {
+        return;
+    }
+    pos += std::string("/NodeList/").size();
+    size_t end = path.find('/', pos);
+    if (end == std::string::npos)
+    {
+        return;
+    }
+    nodeId = static_cast<uint32_t>(std::stoul(path.substr(pos, end - pos)));
+    pos = path.find("/ApplicationList/", end);
+    if (pos == std::string::npos)
+    {
+        return;
+    }
+    pos += std::string("/ApplicationList/").size();
+    end = path.find('/', pos);
+    if (end == std::string::npos)
+    {
+        return;
+    }
+    appIndex = static_cast<uint32_t>(std::stoul(path.substr(pos, end - pos)));
+    uint64_t key = (static_cast<uint64_t>(nodeId) << 32) | appIndex;
+    auto it = g_appKeyToUeIndex.find(key);
+    if (it == g_appKeyToUeIndex.end())
+    {
+        return;
+    }
+    uint32_t ueIdx = it->second;
+    g_lastOnOffOldStateByUeIdx[ueIdx] = oldState;
+    g_onoffStateByUeIdx[ueIdx] = newState;
+    g_lastOnOffTimeByUeIdx[ueIdx] = Simulator::Now().GetSeconds();
+    g_onoffSeqByUeIdx[ueIdx] = g_onoffSeqByUeIdx[ueIdx] + 1;
+    uint16_t rnti = (ueIdx < g_rntiByUeIndex.size()) ? g_rntiByUeIndex[ueIdx] : 0;
+    NS_LOG_UNCOND(Simulator::Now().As(Time::MS) << ": ONOFF state changed for UE " << ueIdx
+                                               << " (RNTI " << rnti << ")"
+                                               << " -> " << (newState ? "ON" : "OFF")
+                                               << " at t=" << Simulator::Now().GetSeconds() << " s");
+    (void)oldState;
+}
+
+static void
+OnOffTxTrace(std::string path, Ptr<const Packet> /*packet*/, const Address& from, const Address& to)
+{
+    (void)path;
+    (void)from;
+    InetSocketAddress dst = InetSocketAddress::ConvertFrom(to);
+    Ipv4Address dstAddr = dst.GetIpv4();
+    auto it = g_ueIpToIndex.find(dstAddr);
+    if (it == g_ueIpToIndex.end())
+    {
+        return;
+    }
+    uint32_t ueIdx = it->second;
+    double now = Simulator::Now().GetSeconds();
+    auto lastIt = g_lastGenTxTimeByUeIdx.find(ueIdx);
+    if (lastIt != g_lastGenTxTimeByUeIdx.end())
+    {
+        double intervalMs = (now - lastIt->second) * 1000.0;
+        bool burst = g_onoffStateByUeIdx[ueIdx];
+        g_lastGenIntervalMsByUeIdx[ueIdx] = intervalMs;
+        g_lastGenBurstByUeIdx[ueIdx] = burst;
+
+        uint16_t rnti = (ueIdx < g_rntiByUeIndex.size()) ? g_rntiByUeIndex[ueIdx] : 0;
+    }
+    g_lastGenTxTimeByUeIdx[ueIdx] = now;
 }
 
 static void
@@ -205,6 +346,11 @@ RegisterUeWithController(const Ptr<NrBwpSwitchController>& ctrl,
     // Seed energy accounting with the initial BWP.
     g_energyByRnti[rnti] = EnergyState{true, Simulator::Now().GetSeconds(), g_initialBwpId, 0.0};
     g_ueIndexByRnti[rnti] = ueIndex;
+    if (g_rntiByUeIndex.size() <= ueIndex)
+    {
+        g_rntiByUeIndex.resize(ueIndex + 1, 0);
+    }
+    g_rntiByUeIndex[ueIndex] = rnti;
 
     ctrl->AddUeManager(rnti, ueDev->GetBwpManager());
     ueDev->GetBwpManager()->ForceActiveBwp(g_initialBwpId);
@@ -214,6 +360,7 @@ RegisterUeWithController(const Ptr<NrBwpSwitchController>& ctrl,
     NS_LOG_INFO("Registered UE" << ueIndex << " rnti=" << rnti);
 }
 
+
 int
 main(int argc, char* argv[])
 {
@@ -221,37 +368,56 @@ main(int argc, char* argv[])
     cmd.AddValue("simTime", "Simulation time in seconds", simTime);
     cmd.AddValue("numUes", "Number of UEs", numUes);
     cmd.AddValue("initialBwp", "Initial BWP for all UEs (0=narrow, 1=wide)", g_initialBwpId);
-    cmd.AddValue("enableQlearning", "Enable trigger helper built-in Q-learning policy", enableInternalPolicy);
-    cmd.AddValue("trafficPacketSize", "Periodic traffic packet size in bytes", trafficPacketSize);
-    cmd.AddValue("trafficPeriodMs", "Periodic traffic interval in milliseconds", trafficPeriodMs);
+    cmd.AddValue("policyMode", "0: Q-learning, 1: window detect, 2: no policy(BWP0) 3: no policy(BWP1)", internalPolicy);
+    cmd.AddValue("onoffPacketSize", "Packet size in bytes during ON", onoffPacketSize);
+    cmd.AddValue("onDurationMs", "ON duration in milliseconds", onDurationMs);
+    cmd.AddValue("offDurationMs", "OFF duration in milliseconds", offDurationMs);
+    cmd.AddValue("onoffPktIntervalMs", "Inter-packet time during ON in milliseconds", onoffPktIntervalMs);
+    cmd.AddValue("onoffStartJitterMs", "Start jitter in milliseconds", onoffStartJitterMs);
+    cmd.AddValue("queueThresholdBytes",
+                 "If avg DL queue is >= this (bytes), switch to BWP1",
+                 g_queueThresholdBytes);
     cmd.Parse(argc, argv);
 
     LogComponentEnableAll(LogLevel(LOG_PREFIX_TIME));
     LogComponentEnableAll(LogLevel(LOG_PREFIX_FUNC));
+    Config::SetDefault("ns3::NrGnbMac::EnableRlcIatKfLog", BooleanValue(true));
+    Config::SetDefault("ns3::NrGnbMac::EnableRlcBytesKfLog", BooleanValue(true));
     // LogComponentEnable("BwpSwitchMultiExample", LOG_LEVEL_INFO);
     // LogComponentEnable("NrBwpSwitchTriggerHelper", LOG_LEVEL_INFO);
     // LogComponentEnable("BwpManagerGnb", LOG_LEVEL_INFO);
 
     // Clamp initial BWP to available BWPs (0..1).
     g_initialBwpId = std::min<uint8_t>(g_initialBwpId, 1);
-    if (trafficPacketSize < 12)
+    if (onoffPacketSize < 12)
     {
-        trafficPacketSize = 12;
+        onoffPacketSize = 12;
     }
-    if (trafficPacketSize > 65507)
+    if (onoffPacketSize > 65507)
     {
-        trafficPacketSize = 65507;
+        onoffPacketSize = 65507;
     }
-    if (trafficPeriodMs <= 0.0)
+    if (onDurationMs <= 0.0)
     {
-        trafficPeriodMs = 1.0;
+        onDurationMs = 1.0;
+    }
+    if (offDurationMs <= 0.0)
+    {
+        offDurationMs = 1.0;
+    }
+    if (onoffPktIntervalMs <= 0.0)
+    {
+        onoffPktIntervalMs = 1.0;
+    }
+    if (onoffStartJitterMs > 1000)
+    {
+        onoffStartJitterMs = 1000;
     }
 
     NodeContainer gnbNodes;
     gnbNodes.Create(1);
     NodeContainer ueNodes;
     ueNodes.Create(numUes);
-
     MobilityHelper mobility;
     mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
     mobility.Install(gnbNodes);
@@ -305,10 +471,9 @@ main(int argc, char* argv[])
     Ipv4Address remoteHostAddr = internetIpIfaces.GetAddress(1);
 
     Ipv4InterfaceContainer ueIpIfaces = epcHelper->AssignUeIpv4Address(ueDevs);
-    std::map<Ipv4Address, uint32_t> ueIpToIndex;
     for (uint32_t i = 0; i < ueIpIfaces.GetN(); ++i)
     {
-        ueIpToIndex.emplace(ueIpIfaces.GetAddress(i), i);
+        g_ueIpToIndex.emplace(ueIpIfaces.GetAddress(i), i);
     }
     Ipv4StaticRoutingHelper ipv4RoutingHelper;
     Ptr<Ipv4StaticRouting> remoteHostStaticRouting =
@@ -335,16 +500,39 @@ main(int argc, char* argv[])
 
 
     g_triggerHelper = CreateObject<NrBwpSwitchTriggerHelper>();
-    g_triggerHelper->SetAttribute("EnableInternalPolicy", BooleanValue(true));
-    if(enableInternalPolicy)
+    // external policy가 필요한 경우 EnableInternalPolicy=false로 두고 SetPolicy 통해 콜백 등록.
+    if (internalPolicy == NrBwpSwitchTriggerHelper::POLICY_Q_LEARNING)
     {
         NS_LOG_UNCOND("Q-LEARNING");
-        g_triggerHelper->SetAttribute("InternalPolicyMode", EnumValue(NrBwpSwitchTriggerHelper::InternalPolicyMode::POLICY_Q_LEARNING));
+        g_triggerHelper->SetAttribute("EnableInternalPolicy", BooleanValue(true));
+        g_triggerHelper->SetAttribute(
+            "InternalPolicyMode",
+            EnumValue(NrBwpSwitchTriggerHelper::InternalPolicyMode::POLICY_Q_LEARNING));
+    }
+    else if (internalPolicy == NrBwpSwitchTriggerHelper::POLICY_WINDOW_DETECT)
+    {
+        NS_LOG_UNCOND("WINDOW DETECTION");
+        g_triggerHelper->SetAttribute("EnableInternalPolicy", BooleanValue(true));
+        g_triggerHelper->SetPolicy(MakeCallback(&SchedIntervalPolicy));
+    }
+    else if (internalPolicy == NrBwpSwitchTriggerHelper::NO_POLICY_BWP0)
+    {
+        NS_LOG_UNCOND("NO POLICY (BWP 0)");
+        g_triggerHelper->SetAttribute("EnableInternalPolicy", BooleanValue(true));
+        g_triggerHelper->SetPolicy(MakeCallback(&SchedIntervalPolicy));
+
+    }
+    else if (internalPolicy == NrBwpSwitchTriggerHelper::NO_POLICY_BWP1)
+    {
+        NS_LOG_UNCOND("NO POLICY (BWP 1)");
+        g_triggerHelper->SetAttribute("EnableInternalPolicy", BooleanValue(true));
+        g_triggerHelper->SetPolicy(MakeCallback(&SchedIntervalPolicy));
     }
     else
     {
-        NS_LOG_UNCOND("QUEUE_WINDOW_DETECTION");
-        g_triggerHelper->SetAttribute("InternalPolicyMode", EnumValue(NrBwpSwitchTriggerHelper::InternalPolicyMode::POLICY_WINDOW_DETECT));
+        NS_LOG_UNCOND("POLICY PARSING FAILED. DEFAULTING INTO NO POLICY (BWP 0)");
+        g_triggerHelper->SetAttribute("EnableInternalPolicy", BooleanValue(true));
+        g_triggerHelper->SetPolicy(MakeCallback(&SchedIntervalPolicy));
     }
     
     // Give enough time for RA/RRC to complete so enqueue/ACK/BSR land before first evaluation.
@@ -370,6 +558,7 @@ main(int argc, char* argv[])
 
     g_triggerHelper->SetAttribute("SwitchThresholdBytes", UintegerValue(2000));
     g_triggerHelper->SetGnbManager(gnbBwpMgr);
+    g_triggerHelper->TraceConnectWithoutContext("DecisionTrace", MakeCallback(&DecisionTrace));
     // g_triggerHelper->SetPolicy(MakeCallback(&ProbeTriggerPolicy));
     for (uint32_t bwpIdx = 0; bwpIdx < allBwps.size(); ++bwpIdx)
     {
@@ -387,11 +576,9 @@ main(int argc, char* argv[])
     g_triggerHelper->SetDecisionCallback(MakeCallback(&NrBwpSwitchController::OnHelperDecision, bwpController));
     bwpController->SetGnbManager(gnbBwpMgr);
     // bwpController->SetPolicy(MakeCallback(&TimelinePolicy));
-    gnbBwpMgr->TraceConnectWithoutContext("BsrReport",
-                                          MakeCallback(&NrBwpSwitchController::HandleBsr, bwpController));
     gnbBwpMgr->TraceConnectWithoutContext("SwitchEnergy", MakeCallback(&OnSwitchEnergy));
 
-    // Applications: DL sinks per UE; periodic traffic generated from remote host.
+    // Applications: DL sinks per UE; periodic ON/OFF traffic generated from remote host.
     ApplicationContainer serverApps;
     ApplicationContainer clientApps;
     Ptr<UniformRandomVariable> startJitterRng = CreateObject<UniformRandomVariable>();
@@ -410,19 +597,48 @@ main(int argc, char* argv[])
         NrEpsBearer bearer(NrEpsBearer::NGBR_LOW_LAT_EMBB);
         nrHelper->ActivateDedicatedEpsBearer(ueDevs.Get(i), bearer, tft);
 
-        UdpClientHelper client(ueIpIfaces.GetAddress(i), port);
-        client.SetAttribute("MaxPackets", UintegerValue(0));
-        client.SetAttribute("Interval", TimeValue(MilliSeconds(trafficPeriodMs)));
-        client.SetAttribute("PacketSize", UintegerValue(trafficPacketSize));
+        OnOffHelper onoff("ns3::UdpSocketFactory",
+                          InetSocketAddress(ueIpIfaces.GetAddress(i), port));
+        onoff.SetAttribute("PacketSize", UintegerValue(onoffPacketSize));
+        double rateBps = (onoffPktIntervalMs > 0.0)
+                             ? (static_cast<double>(onoffPacketSize) * 8.0 /
+                                (onoffPktIntervalMs / 1000.0))
+                             : 0.0;
+        onoff.SetAttribute("DataRate", DataRateValue(DataRate(static_cast<uint64_t>(rateBps))));
+        std::ostringstream onTime;
+        std::ostringstream offTime;
+        onTime << "ns3::ConstantRandomVariable[Constant=" << (onDurationMs / 1000.0) << "]";
+        offTime << "ns3::ConstantRandomVariable[Constant=" << (offDurationMs / 1000.0) << "]";
+        onoff.SetAttribute("OnTime", StringValue(onTime.str()));
+        onoff.SetAttribute("OffTime", StringValue(offTime.str()));
+
+        ApplicationContainer appContainer = onoff.Install(remoteHost.Get(0));
 
         // Stagger start slightly so periodic flows are de-synchronized across UEs.
-        uint32_t startJitterMs = startJitterRng->GetInteger(0, 20);
+        uint32_t startJitterMs = startJitterRng->GetInteger(0, onoffStartJitterMs);
         Time startTime = MilliSeconds(60 + startJitterMs);
-        ApplicationContainer clientApp = client.Install(remoteHost.Get(0));
-        clientApp.Start(startTime);
-        clientApp.Stop(Seconds(simTime));
-        clientApps.Add(clientApp);
+        appContainer.Start(startTime);
+        appContainer.Stop(Seconds(simTime));
+        clientApps.Add(appContainer);
+
+        Ptr<Application> app = appContainer.Get(0);
+        Ptr<Node> remote = remoteHost.Get(0);
+        uint32_t appIndex = 0;
+        for (uint32_t j = 0; j < remote->GetNApplications(); ++j)
+        {
+            if (remote->GetApplication(j) == app)
+            {
+                appIndex = j;
+                break;
+            }
+        }
+        uint64_t key = (static_cast<uint64_t>(remote->GetId()) << 32) | appIndex;
+        g_appKeyToUeIndex[key] = i;
     }
+    Config::Connect("/NodeList/*/ApplicationList/*/$ns3::OnOffApplication/TxWithAddresses",
+                    MakeCallback(&OnOffTxTrace));
+    Config::Connect("/NodeList/*/ApplicationList/*/$ns3::OnOffApplication/OnOffState",
+                    MakeCallback(&OnOffStateTrace));
 
     serverApps.Start(MilliSeconds(50));
     serverApps.Stop(Seconds(simTime));
@@ -488,8 +704,8 @@ main(int argc, char* argv[])
             (st.rxPackets > 0) ? (st.delaySum.GetSeconds() / st.rxPackets * 1000.0) : 0.0;
 
         uint32_t ueIdx = 0;
-        auto it = ueIpToIndex.find(t.destinationAddress);
-        if (it != ueIpToIndex.end())
+        auto it = g_ueIpToIndex.find(t.destinationAddress);
+        if (it != g_ueIpToIndex.end())
         {
             ueIdx = it->second;
         }

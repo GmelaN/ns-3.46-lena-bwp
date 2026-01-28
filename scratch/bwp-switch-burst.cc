@@ -29,11 +29,11 @@
 #include "ns3/nr-mac-scheduler-ns3.h"
 #include "ns3/nr-ue-net-device.h"
 #include "ns3/nr-ue-phy.h"
+#include "ns3/inet-socket-address.h"
 #include "ns3/point-to-point-helper.h"
 #include "ns3/simulator.h"
 #include "ns3/ipv4-flow-classifier.h"
 #include "ns3/random-variable-stream.h"
-#include "ns3/tcp-socket-factory.h"
 #include "ns3/udp-socket-factory.h"
 #include "ns3/traffic-generator-ftp-single.h"
 #include "ns3/double.h"
@@ -53,69 +53,26 @@ using namespace ns3;
 NS_LOG_COMPONENT_DEFINE("BwpSwitchMultiExample");
 
 static uint32_t simTime = 10;
-static uint8_t numUes = 30;
-static bool enableInternalPolicy = true; // set true to use helper's built-in policy
-static uint32_t burstFileSizeBytes = 1024 * 1024; // bytes per burst, 1KB
-static uint32_t burstPacketSize = 1024; // bytes
+static uint8_t numUes = 1;
+static bool enableInternalPolicy = false; // set true to use helper's built-in policy
+static uint8_t fixedMcs = 28;
+static uint32_t burstFileSizeBytes = 1024 * 1024; // bytes per burst
+static uint32_t burstPacketSizeMin = 30; // bytes
+static uint32_t burstPacketSizeMax = 2000; // bytes
 static double burstIntervalMs = 200.0; // milliseconds between bursts
-static uint32_t burstStartJitterMs = 50; // small de-sync across UEs
+static double burstPktIntervalMs = 1.0; // milliseconds between packets within a burst
+static uint32_t burstStartJitterMs = 50; // milliseconds
+static uint32_t idlePacketSize = 64; // bytes
+static double idlePktIntervalMs = 200.0; // milliseconds between idle packets
 
 // Timeline-based policy state shared with controller
 static Ptr<NrBwpSwitchTriggerHelper> g_triggerHelper;
 static Ptr<NrBwpSwitchController> g_bwpController;
 static std::vector<double> g_bwpPowerMw = {50.0, 400.0}; // example mW for narrow/wide 5 / 40 MHz
 static std::vector<double> g_bwpBandwidthHz = {5e6, 40e6};
-static double g_spectralEfficiency = 1.0;
+static double g_spectralEfficiency = 5.55; // bit/s/Hz for fixed MCS 28 (NrLteMiErrorModel table)
 static uint8_t g_initialBwpId = 1; // default start on wide BWP
-
-class TrafficGeneratorPeriodicFtp : public TrafficGeneratorFtpSingle
-{
-  public:
-    static TypeId GetTypeId();
-    TrafficGeneratorPeriodicFtp() = default;
-    ~TrafficGeneratorPeriodicFtp() override = default;
-
-  private:
-    void StartApplication() override;
-    void PacketBurstSent() override;
-
-    Time m_interBurstTime{Seconds(0.2)};
-};
-
-TypeId
-TrafficGeneratorPeriodicFtp::GetTypeId()
-{
-    static TypeId tid =
-        TypeId("ns3::TrafficGeneratorPeriodicFtp")
-            .SetParent<TrafficGeneratorFtpSingle>()
-            .SetGroupName("Applications")
-            .AddConstructor<TrafficGeneratorPeriodicFtp>()
-            .AddAttribute("InterBurstTime",
-                          "Time between periodic bursts",
-                          TimeValue(Seconds(0.2)),
-                          MakeTimeAccessor(&TrafficGeneratorPeriodicFtp::m_interBurstTime),
-                          MakeTimeChecker());
-    return tid;
-}
-
-void
-TrafficGeneratorPeriodicFtp::StartApplication()
-{
-    SendPacketBurst();
-}
-
-void
-TrafficGeneratorPeriodicFtp::PacketBurstSent()
-{
-    if (m_interBurstTime.IsZero())
-    {
-        Simulator::ScheduleNow(&TrafficGenerator::SendPacketBurst, this);
-    }
-    else
-    {
-        Simulator::Schedule(m_interBurstTime, &TrafficGenerator::SendPacketBurst, this);
-    }
-}
+static double g_queueThresholdBytes = 2000.0;
 
 static void
 DlQueueTrace(uint16_t rnti, uint8_t lcid, uint32_t queueBytes, uint16_t bwpId)
@@ -124,7 +81,23 @@ DlQueueTrace(uint16_t rnti, uint8_t lcid, uint32_t queueBytes, uint16_t bwpId)
     {
         return;
     }
-    g_triggerHelper->NotifyDlQueue(rnti, lcid, static_cast<uint8_t>(bwpId), 0, queueBytes);
+    g_triggerHelper->NotifyDlQueue(rnti, lcid, static_cast<uint8_t>(bwpId), queueBytes);
+}
+
+static NrBwpSwitchDecision
+SchedIntervalPolicy(const NrBwpSwitchState& state)
+{
+    NrBwpSwitchDecision decision;
+    if (state.switchingRemaining.IsZero() &&
+        state.avgQueueSizeBytes >= g_queueThresholdBytes)
+    {
+        decision.targetBwpId = 1;
+    }
+    else
+    {
+        decision.targetBwpId = 0;
+    }
+    return decision;
 }
 
 
@@ -153,6 +126,18 @@ struct EnergyState
 };
 static std::unordered_map<uint16_t, EnergyState> g_energyByRnti;
 static std::unordered_map<uint16_t, uint32_t> g_ueIndexByRnti;
+static std::vector<uint16_t> g_rntiByUeIndex;
+static std::map<Ipv4Address, uint32_t> g_ueIpToIndex;
+static std::unordered_map<uint32_t, double> g_lastGenTxTimeByUeIdx;
+static std::unordered_map<uint32_t, double> g_lastGenIntervalMsByUeIdx;
+static std::unordered_map<uint32_t, uint32_t> g_lastGenPktSizeByUeIdx;
+static std::unordered_map<uint32_t, bool> g_lastGenBurstByUeIdx;
+static std::unordered_map<uint32_t, bool> g_onoffStateByUeIdx;
+static std::unordered_map<uint32_t, double> g_lastOnOffTimeByUeIdx;
+static std::unordered_map<uint32_t, double> g_lastBurstStartTimeByUeIdx;
+static std::unordered_map<uint32_t, uint64_t> g_onoffSeqByUeIdx;
+static std::unordered_map<uint16_t, uint64_t> g_lastOnOffSeqByRnti;
+static std::unordered_map<uint64_t, uint32_t> g_appKeyToUeIndex;
 
 static void
 PdcpTxTraceDl(uint16_t rnti, uint8_t lcid, uint32_t size)
@@ -190,6 +175,241 @@ PdcpRxTraceDl(uint16_t rnti, uint8_t lcid, uint32_t /*size*/, uint64_t delayNs)
     {
         g_triggerHelper->RecordAoiSample(rnti, lcid, delay);
     }
+}
+
+static void
+DecisionTrace(uint16_t rnti, const NrBwpSwitchState& state, const NrBwpSwitchDecision& /*decision*/)
+{
+    auto ueIt = g_ueIndexByRnti.find(rnti);
+    if (ueIt == g_ueIndexByRnti.end())
+    {
+        return;
+    }
+    uint32_t ueIdx = ueIt->second;
+    auto seqIt = g_onoffSeqByUeIdx.find(ueIdx);
+    if (seqIt == g_onoffSeqByUeIdx.end())
+    {
+        return;
+    }
+    uint64_t seq = seqIt->second;
+    uint64_t& lastSeq = g_lastOnOffSeqByRnti[rnti];
+    if (seq > lastSeq)
+    {
+        double now = Simulator::Now().GetSeconds();
+        double onoffTime = g_lastOnOffTimeByUeIdx[ueIdx];
+        double delayMs = (now - onoffTime) * 1000.0;
+        bool onState = g_onoffStateByUeIdx[ueIdx];
+        NS_LOG_UNCOND(Simulator::Now().As(Time::MS) << ": DecisionTrace after ONOFF ue=" << ueIdx
+                                          << " rnti=" << rnti
+                                          << " onoff=" << (onState ? "ON" : "OFF")
+                                          << " delayMs=" << delayMs
+                                          << " avgQueueBytes=" << state.avgQueueSizeBytes
+                                          << " avgAoIMs=" << state.avgAoIMs);
+        lastSeq = seq;
+    }
+}
+
+static void
+RecordBurstState(uint32_t ueIdx, bool isOn)
+{
+    g_onoffStateByUeIdx[ueIdx] = isOn;
+    double nowSeconds = Simulator::Now().GetSeconds();
+    g_lastOnOffTimeByUeIdx[ueIdx] = nowSeconds;
+    g_onoffSeqByUeIdx[ueIdx] = g_onoffSeqByUeIdx[ueIdx] + 1;
+    uint16_t rnti = (ueIdx < g_rntiByUeIndex.size()) ? g_rntiByUeIndex[ueIdx] : 0;
+    double expectedBurstDurationMs = 0.0;
+    uint32_t sizeMin = std::min(burstPacketSizeMin, burstPacketSizeMax);
+    uint32_t sizeMax = std::max(burstPacketSizeMin, burstPacketSizeMax);
+    uint32_t sizeAvg = (sizeMin + sizeMax) / 2;
+    if (sizeAvg > 0)
+    {
+        uint32_t numPkts = (burstFileSizeBytes + sizeAvg - 1) / sizeAvg;
+        if (numPkts > 1)
+        {
+            expectedBurstDurationMs = (numPkts - 1) * burstPktIntervalMs;
+        }
+    }
+
+    double burstDurationMs = 0.0;
+    const char* durationType = "expected";
+    if (isOn)
+    {
+        g_lastBurstStartTimeByUeIdx[ueIdx] = nowSeconds;
+        burstDurationMs = expectedBurstDurationMs;
+    }
+    else
+    {
+        durationType = "actual";
+        auto startIt = g_lastBurstStartTimeByUeIdx.find(ueIdx);
+        if (startIt != g_lastBurstStartTimeByUeIdx.end() &&
+            nowSeconds > startIt->second)
+        {
+            burstDurationMs = (nowSeconds - startIt->second) * 1000.0;
+        }
+    }
+
+    uint32_t lastPktSize = 0;
+    auto pktIt = g_lastGenPktSizeByUeIdx.find(ueIdx);
+    if (pktIt != g_lastGenPktSizeByUeIdx.end())
+    {
+        lastPktSize = pktIt->second;
+    }
+
+    double nextBurstEtaMs = isOn ? (expectedBurstDurationMs + burstIntervalMs)
+                                 : burstIntervalMs;
+    NS_LOG_UNCOND(Simulator::Now().As(Time::MS) << ": BURST "
+                                                << (isOn ? "ON" : "OFF")
+                                                << " ue=" << ueIdx
+                                                << " rnti=" << rnti
+                                                << " pktIatMs=" << burstPktIntervalMs
+                                                << " pktSizeRange=" << sizeMin << "-" << sizeMax
+                                                << " lastPktSize=" << lastPktSize
+                                                << " burstDurMs=" << burstDurationMs
+                                                << " durType=" << durationType
+                                                << " nextBurstEtaMs=" << nextBurstEtaMs);
+}
+
+class TrafficGeneratorPeriodicFtp : public TrafficGeneratorFtpSingle
+{
+  public:
+    static TypeId GetTypeId();
+    void SetUeIndex(uint32_t ueIndex)
+    {
+        m_ueIndex = ueIndex;
+    }
+
+  private:
+    void StartApplication() override
+    {
+        StartBurst();
+    }
+
+    Time GetNextPacketTime() const override
+    {
+        return m_packetInterval;
+    }
+
+    uint32_t GetNextPacketSize() const override
+    {
+        uint32_t minSize = std::min(m_packetSizeMin, m_packetSizeMax);
+        uint32_t maxSize = std::max(m_packetSizeMin, m_packetSizeMax);
+        minSize = std::max<uint32_t>(minSize, 1);
+        maxSize = std::max<uint32_t>(maxSize, minSize);
+        return m_packetSizeRng->GetInteger(minSize, maxSize);
+    }
+
+    void StartBurst()
+    {
+        RecordBurstState(m_ueIndex, true);
+        SendPacketBurst();
+    }
+
+    void PacketBurstSent() override
+    {
+        RecordBurstState(m_ueIndex, false);
+        if (m_interBurstTime.IsZero())
+        {
+            Simulator::ScheduleNow(&TrafficGeneratorPeriodicFtp::StartBurst, this);
+        }
+        else
+        {
+            Simulator::Schedule(m_interBurstTime, &TrafficGeneratorPeriodicFtp::StartBurst, this);
+        }
+    }
+
+    Time m_interBurstTime{Seconds(0.2)};
+    Time m_packetInterval{MilliSeconds(10)};
+    uint32_t m_ueIndex{0};
+    uint32_t m_packetSizeMin{1000};
+    uint32_t m_packetSizeMax{5000};
+    Ptr<UniformRandomVariable> m_packetSizeRng{CreateObject<UniformRandomVariable>()};
+};
+
+NS_OBJECT_ENSURE_REGISTERED(TrafficGeneratorPeriodicFtp);
+
+TypeId
+TrafficGeneratorPeriodicFtp::GetTypeId()
+{
+    static TypeId tid =
+        TypeId("ns3::TrafficGeneratorPeriodicFtp")
+            .SetParent<TrafficGeneratorFtpSingle>()
+            .SetGroupName("Applications")
+            .AddConstructor<TrafficGeneratorPeriodicFtp>()
+            .AddAttribute("InterBurstTime",
+                          "Time between periodic bursts",
+                          TimeValue(Seconds(0.2)),
+                          MakeTimeAccessor(&TrafficGeneratorPeriodicFtp::m_interBurstTime),
+                          MakeTimeChecker())
+            .AddAttribute("PacketInterval",
+                          "Time between packets within a burst",
+                          TimeValue(MilliSeconds(10)),
+                          MakeTimeAccessor(&TrafficGeneratorPeriodicFtp::m_packetInterval),
+                          MakeTimeChecker())
+            .AddAttribute("PacketSizeMin",
+                          "Minimum packet size (bytes) within a burst",
+                          UintegerValue(1000),
+                          MakeUintegerAccessor(&TrafficGeneratorPeriodicFtp::m_packetSizeMin),
+                          MakeUintegerChecker<uint32_t>(1))
+            .AddAttribute("PacketSizeMax",
+                          "Maximum packet size (bytes) within a burst",
+                          UintegerValue(5000),
+                          MakeUintegerAccessor(&TrafficGeneratorPeriodicFtp::m_packetSizeMax),
+                          MakeUintegerChecker<uint32_t>(1));
+    return tid;
+}
+
+static void
+TrafficGenTxTrace(std::string path, Ptr<const Packet> packet)
+{
+    uint32_t nodeId = 0;
+    uint32_t appIndex = 0;
+    auto pos = path.find("/NodeList/");
+    if (pos == std::string::npos)
+    {
+        return;
+    }
+    pos += std::string("/NodeList/").size();
+    size_t end = path.find('/', pos);
+    if (end == std::string::npos)
+    {
+        return;
+    }
+    nodeId = static_cast<uint32_t>(std::stoul(path.substr(pos, end - pos)));
+    pos = path.find("/ApplicationList/", end);
+    if (pos == std::string::npos)
+    {
+        return;
+    }
+    pos += std::string("/ApplicationList/").size();
+    end = path.find('/', pos);
+    if (end == std::string::npos)
+    {
+        return;
+    }
+    appIndex = static_cast<uint32_t>(std::stoul(path.substr(pos, end - pos)));
+    uint64_t key = (static_cast<uint64_t>(nodeId) << 32) | appIndex;
+    auto it = g_appKeyToUeIndex.find(key);
+    if (it == g_appKeyToUeIndex.end())
+    {
+        return;
+    }
+    uint32_t ueIdx = it->second;
+    g_lastGenPktSizeByUeIdx[ueIdx] = packet ? packet->GetSize() : 0;
+    double now = Simulator::Now().GetSeconds();
+    auto lastIt = g_lastGenTxTimeByUeIdx.find(ueIdx);
+    if (lastIt != g_lastGenTxTimeByUeIdx.end())
+    {
+        double intervalMs = (now - lastIt->second) * 1000.0;
+        bool burst = g_onoffStateByUeIdx[ueIdx];
+        g_lastGenIntervalMsByUeIdx[ueIdx] = intervalMs;
+        g_lastGenBurstByUeIdx[ueIdx] = burst;
+
+        uint16_t rnti = (ueIdx < g_rntiByUeIndex.size()) ? g_rntiByUeIndex[ueIdx] : 0;
+    //     NS_LOG_UNCOND(Simulator::Now().As(Time::MS) << ": GEN_TX ue=" << ueIdx << " rnti=" << rnti
+    //                                << " genIatMs=" << intervalMs
+    //                                << " burst=" << (burst ? "ON" : "OFF"));
+    }
+    g_lastGenTxTimeByUeIdx[ueIdx] = now;
 }
 
 static void
@@ -257,6 +477,11 @@ RegisterUeWithController(const Ptr<NrBwpSwitchController>& ctrl,
     // Seed energy accounting with the initial BWP.
     g_energyByRnti[rnti] = EnergyState{true, Simulator::Now().GetSeconds(), g_initialBwpId, 0.0};
     g_ueIndexByRnti[rnti] = ueIndex;
+    if (g_rntiByUeIndex.size() <= ueIndex)
+    {
+        g_rntiByUeIndex.resize(ueIndex + 1, 0);
+    }
+    g_rntiByUeIndex[ueIndex] = rnti;
 
     ctrl->AddUeManager(rnti, ueDev->GetBwpManager());
     ueDev->GetBwpManager()->ForceActiveBwp(g_initialBwpId);
@@ -274,38 +499,77 @@ main(int argc, char* argv[])
     cmd.AddValue("numUes", "Number of UEs", numUes);
     cmd.AddValue("initialBwp", "Initial BWP for all UEs (0=narrow, 1=wide)", g_initialBwpId);
     cmd.AddValue("enableQlearning", "Enable trigger helper built-in Q-learning policy", enableInternalPolicy);
-    cmd.AddValue("burstFileSize", "Periodic burst size in bytes", burstFileSizeBytes);
-    cmd.AddValue("burstPacketSize", "Packet size in bytes for each burst", burstPacketSize);
-    cmd.AddValue("burstIntervalMs", "Inter-burst interval in milliseconds", burstIntervalMs);
-    cmd.AddValue("burstStartJitterMs", "Start-time jitter in milliseconds", burstStartJitterMs);
+    cmd.AddValue("burstFileSizeBytes", "Burst file size in bytes", burstFileSizeBytes);
+    cmd.AddValue("burstPacketSizeMin", "Burst packet size minimum in bytes", burstPacketSizeMin);
+    cmd.AddValue("burstPacketSizeMax", "Burst packet size maximum in bytes", burstPacketSizeMax);
+    cmd.AddValue("burstIntervalMs", "Inter-burst time in milliseconds", burstIntervalMs);
+    cmd.AddValue("burstPktIntervalMs", "Inter-packet time within a burst in milliseconds", burstPktIntervalMs);
+    cmd.AddValue("burstStartJitterMs", "Burst start jitter in milliseconds", burstStartJitterMs);
+    cmd.AddValue("idlePacketSize", "Idle packet size in bytes", idlePacketSize);
+    cmd.AddValue("idlePktIntervalMs", "Idle packet interval in milliseconds", idlePktIntervalMs);
+    cmd.AddValue("queueThresholdBytes",
+                 "If avg DL queue is >= this (bytes), switch to BWP1",
+                 g_queueThresholdBytes);
     cmd.Parse(argc, argv);
 
     LogComponentEnableAll(LogLevel(LOG_PREFIX_TIME));
     LogComponentEnableAll(LogLevel(LOG_PREFIX_FUNC));
+    Config::SetDefault("ns3::NrGnbMac::EnableRlcIatKfLog", BooleanValue(true));
     // LogComponentEnable("BwpSwitchMultiExample", LOG_LEVEL_INFO);
     // LogComponentEnable("NrBwpSwitchTriggerHelper", LOG_LEVEL_INFO);
     // LogComponentEnable("BwpManagerGnb", LOG_LEVEL_INFO);
 
     // Clamp initial BWP to available BWPs (0..1).
     g_initialBwpId = std::min<uint8_t>(g_initialBwpId, 1);
-    if (burstPacketSize < 12)
+    if (burstPacketSizeMin < 12)
     {
-        burstPacketSize = 12;
+        burstPacketSizeMin = 12;
     }
-    if (burstPacketSize > 65507)
+    if (burstPacketSizeMax < 12)
     {
-        burstPacketSize = 65507;
+        burstPacketSizeMax = 12;
+    }
+    if (burstPacketSizeMin > 65507)
+    {
+        burstPacketSizeMin = 65507;
+    }
+    if (burstPacketSizeMax > 65507)
+    {
+        burstPacketSizeMax = 65507;
+    }
+    if (burstPacketSizeMin > burstPacketSizeMax)
+    {
+        std::swap(burstPacketSizeMin, burstPacketSizeMax);
     }
     if (burstIntervalMs <= 0.0)
     {
         burstIntervalMs = 1.0;
+    }
+    if (burstPktIntervalMs <= 0.0)
+    {
+        burstPktIntervalMs = 1.0;
+    }
+    if (burstStartJitterMs > 1000)
+    {
+        burstStartJitterMs = 1000;
+    }
+    if (idlePacketSize < 12)
+    {
+        idlePacketSize = 12;
+    }
+    if (idlePacketSize > 65507)
+    {
+        idlePacketSize = 65507;
+    }
+    if (idlePktIntervalMs <= 0.0)
+    {
+        idlePktIntervalMs = 1.0;
     }
 
     NodeContainer gnbNodes;
     gnbNodes.Create(1);
     NodeContainer ueNodes;
     ueNodes.Create(numUes);
-
     MobilityHelper mobility;
     mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
     mobility.Install(gnbNodes);
@@ -316,6 +580,10 @@ main(int argc, char* argv[])
     nrHelper->SetEpcHelper(epcHelper);
     nrHelper->SetSchedulerTypeId(NrMacSchedulerOfdmaRR::GetTypeId());
     nrHelper->SetSchedulerAttribute("EnableHarqReTx", BooleanValue(false));
+    nrHelper->SetSchedulerAttribute("FixedMcsDl", BooleanValue(true));
+    nrHelper->SetSchedulerAttribute("FixedMcsUl", BooleanValue(true));
+    nrHelper->SetSchedulerAttribute("StartingMcsDl", UintegerValue(fixedMcs));
+    nrHelper->SetSchedulerAttribute("StartingMcsUl", UintegerValue(fixedMcs));
 
     // Two CCs (treated as two BWPs for forcing): narrow 5 MHz, wide 40 MHz.
     CcBwpCreator ccBwpCreator;
@@ -355,10 +623,9 @@ main(int argc, char* argv[])
     Ipv4Address remoteHostAddr = internetIpIfaces.GetAddress(1);
 
     Ipv4InterfaceContainer ueIpIfaces = epcHelper->AssignUeIpv4Address(ueDevs);
-    std::map<Ipv4Address, uint32_t> ueIpToIndex;
     for (uint32_t i = 0; i < ueIpIfaces.GetN(); ++i)
     {
-        ueIpToIndex.emplace(ueIpIfaces.GetAddress(i), i);
+        g_ueIpToIndex.emplace(ueIpIfaces.GetAddress(i), i);
     }
     Ipv4StaticRoutingHelper ipv4RoutingHelper;
     Ptr<Ipv4StaticRouting> remoteHostStaticRouting =
@@ -385,16 +652,19 @@ main(int argc, char* argv[])
 
 
     g_triggerHelper = CreateObject<NrBwpSwitchTriggerHelper>();
-    g_triggerHelper->SetAttribute("EnableInternalPolicy", BooleanValue(true));
-    if(enableInternalPolicy)
+    if (enableInternalPolicy)
     {
         NS_LOG_UNCOND("Q-LEARNING");
-        g_triggerHelper->SetAttribute("InternalPolicyMode", EnumValue(NrBwpSwitchTriggerHelper::InternalPolicyMode::POLICY_Q_LEARNING));
+        g_triggerHelper->SetAttribute("EnableInternalPolicy", BooleanValue(true));
+        g_triggerHelper->SetAttribute(
+            "InternalPolicyMode",
+            EnumValue(NrBwpSwitchTriggerHelper::InternalPolicyMode::POLICY_Q_LEARNING));
     }
     else
     {
-        NS_LOG_UNCOND("QUEUE_WINDOW_DETECTION");
-        g_triggerHelper->SetAttribute("InternalPolicyMode", EnumValue(NrBwpSwitchTriggerHelper::InternalPolicyMode::POLICY_WINDOW_DETECT));
+        NS_LOG_UNCOND("SCHED-INTERVAL POLICY");
+        g_triggerHelper->SetAttribute("EnableInternalPolicy", BooleanValue(false));
+        g_triggerHelper->SetPolicy(MakeCallback(&SchedIntervalPolicy));
     }
     
     // Give enough time for RA/RRC to complete so enqueue/ACK/BSR land before first evaluation.
@@ -417,9 +687,10 @@ main(int argc, char* argv[])
     g_triggerHelper->SetAttribute("EvalGroupModulo", UintegerValue(1));
     g_triggerHelper->SetAttribute("StaticPowerBwp0Mw", DoubleValue(g_bwpPowerMw.at(0)));
     g_triggerHelper->SetAttribute("StaticPowerBwp1Mw", DoubleValue(g_bwpPowerMw.at(1)));
-    
+
     g_triggerHelper->SetAttribute("SwitchThresholdBytes", UintegerValue(2000));
     g_triggerHelper->SetGnbManager(gnbBwpMgr);
+    g_triggerHelper->TraceConnectWithoutContext("DecisionTrace", MakeCallback(&DecisionTrace));
     // g_triggerHelper->SetPolicy(MakeCallback(&ProbeTriggerPolicy));
     for (uint32_t bwpIdx = 0; bwpIdx < allBwps.size(); ++bwpIdx)
     {
@@ -437,19 +708,23 @@ main(int argc, char* argv[])
     g_triggerHelper->SetDecisionCallback(MakeCallback(&NrBwpSwitchController::OnHelperDecision, bwpController));
     bwpController->SetGnbManager(gnbBwpMgr);
     // bwpController->SetPolicy(MakeCallback(&TimelinePolicy));
-    gnbBwpMgr->TraceConnectWithoutContext("BsrReport",
-                                          MakeCallback(&NrBwpSwitchController::HandleBsr, bwpController));
     gnbBwpMgr->TraceConnectWithoutContext("SwitchEnergy", MakeCallback(&OnSwitchEnergy));
 
-    // Applications: DL sinks per UE; periodic FTP-like burst traffic from remote host.
+    // Applications: DL sinks per UE; periodic burst traffic + low-rate idle traffic.
     ApplicationContainer serverApps;
+    ApplicationContainer clientApps;
+    ApplicationContainer idleClientApps;
     Ptr<UniformRandomVariable> startJitterRng = CreateObject<UniformRandomVariable>();
     for (uint32_t i = 0; i < ueNodes.GetN(); ++i)
     {
         uint16_t port = 5000 + i;
+        uint16_t idlePort = 6000 + i;
         PacketSinkHelper sinkHelper("ns3::UdpSocketFactory",
                                     InetSocketAddress(Ipv4Address::GetAny(), port));
         serverApps.Add(sinkHelper.Install(ueNodes.Get(i)));
+        PacketSinkHelper idleSinkHelper("ns3::UdpSocketFactory",
+                                        InetSocketAddress(Ipv4Address::GetAny(), idlePort));
+        serverApps.Add(idleSinkHelper.Install(ueNodes.Get(i)));
 
         Ptr<NrEpcTft> tft = Create<NrEpcTft>();
         NrEpcTft::PacketFilter pf;
@@ -459,21 +734,58 @@ main(int argc, char* argv[])
         NrEpsBearer bearer(NrEpsBearer::NGBR_LOW_LAT_EMBB);
         nrHelper->ActivateDedicatedEpsBearer(ueDevs.Get(i), bearer, tft);
 
+        Ptr<NrEpcTft> idleTft = Create<NrEpcTft>();
+        NrEpcTft::PacketFilter idlePf;
+        idlePf.localPortStart = idlePort;
+        idlePf.localPortEnd = idlePort;
+        idleTft->Add(idlePf);
+        NrEpsBearer idleBearer(NrEpsBearer::NGBR_LOW_LAT_EMBB);
+        nrHelper->ActivateDedicatedEpsBearer(ueDevs.Get(i), idleBearer, idleTft);
+
         Ptr<TrafficGeneratorPeriodicFtp> ftp = CreateObject<TrafficGeneratorPeriodicFtp>();
         ftp->SetRemote(InetSocketAddress(ueIpIfaces.GetAddress(i), port));
         ftp->SetProtocol(UdpSocketFactory::GetTypeId());
-
         ftp->SetAttribute("FileSize", UintegerValue(burstFileSizeBytes));
-        ftp->SetAttribute("PacketSize", UintegerValue(burstPacketSize));
+        ftp->SetAttribute("PacketSizeMin", UintegerValue(burstPacketSizeMin));
+        ftp->SetAttribute("PacketSizeMax", UintegerValue(burstPacketSizeMax));
         ftp->SetAttribute("InterBurstTime", TimeValue(MilliSeconds(burstIntervalMs)));
+        ftp->SetAttribute("PacketInterval", TimeValue(MilliSeconds(burstPktIntervalMs)));
+        ftp->SetUeIndex(i);
 
-        // Stagger start slightly so bursts are de-synchronized across UEs.
+        // Stagger start slightly so periodic flows are de-synchronized across UEs.
         uint32_t startJitterMs = startJitterRng->GetInteger(0, burstStartJitterMs);
         Time startTime = MilliSeconds(60 + startJitterMs);
         ftp->SetStartTime(startTime);
         ftp->SetStopTime(Seconds(simTime));
         remoteHost.Get(0)->AddApplication(ftp);
+        clientApps.Add(ftp);
+
+        Ptr<Application> app = ftp;
+        Ptr<Node> remote = remoteHost.Get(0);
+        uint32_t appIndex = 0;
+        for (uint32_t j = 0; j < remote->GetNApplications(); ++j)
+        {
+            if (remote->GetApplication(j) == app)
+            {
+                appIndex = j;
+                break;
+            }
+        }
+        uint64_t key = (static_cast<uint64_t>(remote->GetId()) << 32) | appIndex;
+        g_appKeyToUeIndex[key] = i;
+
+        UdpClientHelper idleClient(ueIpIfaces.GetAddress(i), idlePort);
+        idleClient.SetAttribute("MaxPackets", UintegerValue(0));
+        idleClient.SetAttribute("Interval", TimeValue(MilliSeconds(idlePktIntervalMs)));
+        idleClient.SetAttribute("PacketSize", UintegerValue(idlePacketSize));
+        ApplicationContainer idleApp = idleClient.Install(remoteHost.Get(0));
+        Time idleStart = MilliSeconds(60 + startJitterRng->GetInteger(0, burstStartJitterMs));
+        idleApp.Start(idleStart);
+        idleApp.Stop(Seconds(simTime));
+        idleClientApps.Add(idleApp);
     }
+    Config::Connect("/NodeList/*/ApplicationList/*/$ns3::TrafficGeneratorPeriodicFtp/Tx",
+                    MakeCallback(&TrafficGenTxTrace));
 
     serverApps.Start(MilliSeconds(50));
     serverApps.Stop(Seconds(simTime));
@@ -539,8 +851,8 @@ main(int argc, char* argv[])
             (st.rxPackets > 0) ? (st.delaySum.GetSeconds() / st.rxPackets * 1000.0) : 0.0;
 
         uint32_t ueIdx = 0;
-        auto it = ueIpToIndex.find(t.destinationAddress);
-        if (it != ueIpToIndex.end())
+        auto it = g_ueIpToIndex.find(t.destinationAddress);
+        if (it != g_ueIpToIndex.end())
         {
             ueIdx = it->second;
         }
