@@ -55,6 +55,7 @@ NS_LOG_COMPONENT_DEFINE("BwpSwitchMultiExample");
 
 static uint32_t simTime = 10;
 static uint8_t numUes = 30;
+static bool g_fixedBwp = false;
 static bool enableInternalPolicy = true; // set true to use helper's built-in policy
 static bool enableMixedTraffic = true; // small background packets + large periodic bursts
 // static uint32_t burstFileSizeBytes = 1024 * 1024; // bytes per burst, 1MB
@@ -312,6 +313,24 @@ static std::unordered_map<uint16_t, EnergyState> g_energyByRnti;
 static std::unordered_map<uint16_t, uint32_t> g_ueIndexByRnti;
 
 static void
+UpdateStaticEnergy(EnergyState& st, double nowSeconds)
+{
+    if (!st.initialized)
+    {
+        st.initialized = true;
+        st.lastTime = nowSeconds;
+        st.currentBwp = g_initialBwpId;
+        return;
+    }
+    double dt = nowSeconds - st.lastTime;
+    if (dt > 0.0 && st.currentBwp < g_bwpStaticPowerMw.size())
+    {
+        st.energyJ += g_bwpStaticPowerMw[st.currentBwp] * 1e-3 * dt;
+    }
+    st.lastTime = nowSeconds;
+}
+
+static void
 PdcpTxTraceDl(uint16_t rnti, uint8_t lcid, uint32_t size)
 {
     auto it = g_energyByRnti.find(rnti);
@@ -320,11 +339,7 @@ PdcpTxTraceDl(uint16_t rnti, uint8_t lcid, uint32_t size)
         return;
     }
     auto& st = it->second;
-    if (!st.initialized)
-    {
-        st.initialized = true;
-        st.currentBwp = g_initialBwpId;
-    }
+    UpdateStaticEnergy(st, Simulator::Now().GetSeconds());
     uint8_t bwp = st.currentBwp;
     if (bwp < g_bwpPowerMw.size() && bwp < g_bwpBandwidthHz.size() &&
         g_bwpBandwidthHz[bwp] > 0.0 && g_spectralEfficiency > 0.0)
@@ -353,8 +368,8 @@ static void
 OnSwitchEnergy(uint16_t rnti, uint8_t fromBwp, uint8_t toBwp, double switchEnergyJ)
 {
     auto& st = g_energyByRnti[rnti];
-    st.initialized = true;
-    st.lastTime = Simulator::Now().GetSeconds();
+    double nowSeconds = Simulator::Now().GetSeconds();
+    UpdateStaticEnergy(st, nowSeconds);
     st.currentBwp = toBwp;
     st.energyJ += switchEnergyJ;
 
@@ -430,6 +445,7 @@ main(int argc, char* argv[])
     cmd.AddValue("simTime", "Simulation time in seconds", simTime);
     cmd.AddValue("numUes", "Number of UEs", numUes);
     cmd.AddValue("initialBwp", "Initial BWP for all UEs (0=narrow, 1=wide)", g_initialBwpId);
+    cmd.AddValue("fixedBwp", "Use only initial BWP.", g_fixedBwp);
     cmd.AddValue("enableQlearning", "Enable trigger helper built-in Q-learning policy", enableInternalPolicy);
     cmd.AddValue("enableMixedTraffic",
                  "Enable mixed traffic (background small packets + periodic large bursts)",
@@ -573,16 +589,20 @@ main(int argc, char* argv[])
 
 
     g_triggerHelper = CreateObject<NrBwpSwitchTriggerHelper>();
-    g_triggerHelper->SetAttribute("EnableInternalPolicy", BooleanValue(true));
-    if(enableInternalPolicy)
+    g_triggerHelper->SetAttribute("EnableInternalPolicy", BooleanValue(!g_fixedBwp));
+    if(!g_fixedBwp && enableInternalPolicy)
     {
         NS_LOG_UNCOND("Q-LEARNING");
         g_triggerHelper->SetAttribute("InternalPolicyMode", EnumValue(NrBwpSwitchTriggerHelper::InternalPolicyMode::POLICY_Q_LEARNING));
     }
-    else
+    else if(!g_fixedBwp)
     {
         NS_LOG_UNCOND("QUEUE_WINDOW_DETECTION");
         g_triggerHelper->SetAttribute("InternalPolicyMode", EnumValue(NrBwpSwitchTriggerHelper::InternalPolicyMode::POLICY_WINDOW_DETECT));
+    }
+    else
+    {
+        NS_LOG_UNCOND("FIXED_BWP_" << static_cast<uint32_t>(g_initialBwpId));
     }
     
     // Give enough time for RA/RRC to complete so enqueue/ACK/BSR land before first evaluation.
@@ -796,13 +816,15 @@ main(int argc, char* argv[])
     }
 
 
-    // Energy estimate from PDCP TX bytes using fixed spectral efficiency.
+    // Energy estimate from PDCP TX bytes + static BWP dwell power + switch costs.
     double energySum = 0.0;
     uint32_t energyCount = 0;
+    double finalNowSeconds = Simulator::Now().GetSeconds();
     for (auto& kv : g_energyByRnti)
     {
         uint16_t rnti = kv.first;
         auto& st = kv.second;
+        UpdateStaticEnergy(st, finalNowSeconds);
         uint32_t ueIdx = 0;
         auto it = g_ueIndexByRnti.find(rnti);
         if (it != g_ueIndexByRnti.end())
