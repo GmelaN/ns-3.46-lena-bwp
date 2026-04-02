@@ -65,7 +65,9 @@ def _per_ue_tail(metrics: dict[str, list[float]]) -> dict[str, float]:
 def _per_ue_distribution_summary(metric_values: dict[str, list[float]]) -> dict[str, dict[str, float]]:
     patterns = {
         "thr_mbps": r"^ue\d+_thr_mbps$",
+        "goodput_mbps": r"^ue\d+_goodput_mbps$",
         "aoi_ms": r"^ue\d+_aoi_ms$",
+        "bler": r"^ue\d+_bler$",
         "aoi_burst_ms": r"^ue\d+_aoi_burst_ms$",
         "aoi_bg_ms": r"^ue\d+_aoi_bg_ms$",
     }

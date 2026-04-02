@@ -172,6 +172,7 @@ static uint8_t g_mcsHighThreshold = 12;
 static uint32_t g_mcsSwitchCount = 5;
 static double g_minSwitchIntervalMs = 0.0;
 static bool g_enableMcsSwitch = false;
+static bool g_enableHarqReTx = true;
 
 struct McsSwitchState
 {
@@ -194,7 +195,7 @@ static uint32_t g_openGymPort = 5555;
 static double g_envStepTime = 0.02; // 20 ms
 static double g_simTime = 2.0;
 static double g_appStartTime = 0.3;
-static double g_switchDelayMsCfg = 0.1;
+static double g_switchDelayMsCfg = 10.0;
 static double g_queueNormBytes = 200000.0;
 static double g_rewardLambdaSwitch = 0.0001;
 static double g_rewardLambdaQueue = 0.20;
@@ -233,7 +234,16 @@ static std::vector<double> g_lastBwpAvgMcs;
 static std::vector<uint8_t> g_targetMcsByUe;
 
 static std::vector<Ptr<NrMacSchedulerNs3>> g_dlSchedulers;
+static std::vector<Ptr<NrGnbMac>> g_gnbMacs;
 static std::vector<Ptr<NrMacSchedulerOfdmaAequitas>> g_aequitasSchedulers;
+
+struct PendingBwpSwitch
+{
+    EventId m_deadlineEvent;
+    uint8_t m_targetBwp{0};
+};
+
+static std::unordered_map<uint16_t, PendingBwpSwitch> g_pendingBwpSwitchByRnti;
 
 static uint32_t g_lastIntervalSwitchCount = 0;
 static uint32_t g_nextIntervalSwitchCount = 0;
@@ -561,6 +571,63 @@ class SimpleDqnAgent
 static std::unique_ptr<SimpleDqnAgent> g_dqnAgent;
 
 static bool
+HasPendingBwpSwitch(uint16_t rnti)
+{
+    auto it = g_pendingBwpSwitchByRnti.find(rnti);
+    return it != g_pendingBwpSwitchByRnti.end() && it->second.m_deadlineEvent.IsPending();
+}
+
+static void
+FlushDlHarqStateForUe(uint16_t rnti, uint8_t bwpId)
+{
+    if (bwpId >= g_dlSchedulers.size() || bwpId >= g_gnbMacs.size())
+    {
+        return;
+    }
+
+    Ptr<NrMacSchedulerNs3> sched = g_dlSchedulers[bwpId];
+    if (sched)
+    {
+        sched->FlushDlHarqProcesses(rnti);
+    }
+    Ptr<NrGnbMac> gnbMac = g_gnbMacs[bwpId];
+    if (gnbMac)
+    {
+        gnbMac->FlushDlHarqBuffers(rnti);
+    }
+}
+
+static void
+ExecutePendingBwpSwitch(uint16_t rnti, uint8_t targetBwp)
+{
+    auto ueIt = g_ueMgrByRnti.find(rnti);
+    if (!g_gnbBwpMgr || ueIt == g_ueMgrByRnti.end())
+    {
+        g_pendingBwpSwitchByRnti.erase(rnti);
+        return;
+    }
+
+    uint8_t currentBwp = g_initialBwpId;
+    uint8_t forced = g_gnbBwpMgr->GetForcedUeBwp(rnti);
+    if (forced != std::numeric_limits<uint8_t>::max())
+    {
+        currentBwp = forced;
+    }
+    FlushDlHarqStateForUe(rnti, currentBwp);
+
+    g_gnbBwpMgr->ForceUeBwp(rnti, targetBwp);
+    ueIt->second->ForceActiveBwp(targetBwp);
+    g_mcsStateByRnti[rnti].lastSwitchTime = Simulator::Now().GetSeconds();
+    auto idxIt = g_ueIdxByRnti.find(rnti);
+    if (idxIt != g_ueIdxByRnti.end() && idxIt->second < g_currentBwpByUe.size())
+    {
+        uint32_t ueIdx = idxIt->second;
+        g_currentBwpByUe[ueIdx] = targetBwp;
+    }
+    g_pendingBwpSwitchByRnti.erase(rnti);
+}
+
+static bool
 SwitchUeBwp(uint16_t rnti, uint8_t targetBwp)
 {
     if (!g_gnbBwpMgr)
@@ -568,7 +635,7 @@ SwitchUeBwp(uint16_t rnti, uint8_t targetBwp)
         g_nextSwitchRejectMgrMissingCount++;
         return false;
     }
-    if (g_gnbBwpMgr->IsSwitching(rnti))
+    if (g_gnbBwpMgr->IsSwitching(rnti) || HasPendingBwpSwitch(rnti))
     {
         g_nextSwitchRejectMgrBusyCount++;
         return false;
@@ -579,14 +646,17 @@ SwitchUeBwp(uint16_t rnti, uint8_t targetBwp)
         g_nextSwitchRejectUeMgrMissingCount++;
         return false;
     }
-    g_gnbBwpMgr->ForceUeBwp(rnti, targetBwp);
-    ueIt->second->ForceActiveBwp(targetBwp);
-    g_mcsStateByRnti[rnti].lastSwitchTime = Simulator::Now().GetSeconds();
+
+    PendingBwpSwitch pending;
+    pending.m_targetBwp = targetBwp;
+    pending.m_deadlineEvent =
+        Simulator::Schedule(MilliSeconds(g_switchDelayMsCfg), &ExecutePendingBwpSwitch, rnti, targetBwp);
+    g_pendingBwpSwitchByRnti[rnti] = pending;
+
     auto idxIt = g_ueIdxByRnti.find(rnti);
-    if (idxIt != g_ueIdxByRnti.end() && idxIt->second < g_currentBwpByUe.size())
+    if (idxIt != g_ueIdxByRnti.end() && idxIt->second < g_switchCooldownUntilSByUe.size())
     {
         uint32_t ueIdx = idxIt->second;
-        g_currentBwpByUe[ueIdx] = targetBwp;
         g_switchCooldownUntilSByUe[ueIdx] =
             Simulator::Now().GetSeconds() + (g_switchDelayMsCfg / 1000.0);
     }
@@ -793,7 +863,7 @@ ConnectAoiPacketSinkTrace(Ptr<Application> app, uint32_t ueIdx, uint8_t type)
     sink->TraceConnectWithoutContext("Rx", MakeBoundCallback(&OnPacketSinkRx, ueIdx, type));
 }
 
-static void
+[[maybe_unused]] static void
 BurstOnOffStateTrace(uint32_t ueIdx, bool oldState, bool newState)
 {
     (void)oldState;
@@ -1790,11 +1860,60 @@ MyGetReward()
     if (g_rlDrqnProfile)
     {
         double rewardSum = 0.0;
+        g_lastMeanAoiMs = 0.0;
+        double aoiPenaltySum = 0.0;
+        double goodputTermSum = 0.0;
+        double auxTermSum = 0.0;
+        double seTermSum = 0.0;
+        double switchPenaltySum = 0.0;
         for (uint32_t ueIdx = 0; ueIdx < numUes; ++ueIdx)
         {
-            rewardSum += ComputeDrqnLiteReward(ueIdx);
+            double currentAoiMs = ComputeUeMeanAoiMs(ueIdx);
+            g_lastMeanAoiMs += currentAoiMs;
+            double prevQueueBytes =
+                (ueIdx < g_prevRewardQueueBytesByUe.size()) ? g_prevRewardQueueBytesByUe[ueIdx] : 0.0;
+            double currentQueueBytes = ComputeDlRlcQueueBytes(ueIdx);
+            uint64_t currentTxBytes = ComputeUeTxBytes(ueIdx);
+            uint64_t prevTxBytes = (ueIdx < g_prevRewardTxBytesByUe.size()) ? g_prevRewardTxBytesByUe[ueIdx] : 0u;
+            uint64_t arrivedBytesRaw = (currentTxBytes >= prevTxBytes) ? (currentTxBytes - prevTxBytes) : 0u;
+            uint64_t deliveredBytesRaw = (ueIdx < g_stepTbBytesByUe.size()) ? g_stepTbBytesByUe[ueIdx] : 0u;
+            double reward = ComputeDrqnLiteReward(ueIdx);
+            rewardSum += reward;
+            aoiPenaltySum += -Clamp01(currentAoiMs / std::max(1.0, g_dqnDelayTargetMs));
+            goodputTermSum += deliveredBytesRaw > 0u ? std::log1p(static_cast<double>(deliveredBytesRaw)) : 0.0;
+            if (ueIdx < g_lastRewardPrevQueueBytesByUe.size())
+            {
+                g_lastRewardPrevQueueBytesByUe[ueIdx] = prevQueueBytes;
+            }
+            if (ueIdx < g_lastRewardArrivedBytesByUe.size())
+            {
+                g_lastRewardArrivedBytesByUe[ueIdx] = arrivedBytesRaw;
+            }
+            if (ueIdx < g_lastRewardDeliveredBytesByUe.size())
+            {
+                g_lastRewardDeliveredBytesByUe[ueIdx] = deliveredBytesRaw;
+            }
+            if (ueIdx < g_prevRewardQueueBytesByUe.size())
+            {
+                g_prevRewardQueueBytesByUe[ueIdx] = currentQueueBytes;
+            }
+            if (ueIdx < g_prevRewardAoiMsByUe.size())
+            {
+                g_prevRewardAoiMsByUe[ueIdx] = currentAoiMs;
+            }
+            if (ueIdx < g_prevRewardTxBytesByUe.size())
+            {
+                g_prevRewardTxBytesByUe[ueIdx] = currentTxBytes;
+            }
         }
-        return static_cast<float>(rewardSum / static_cast<double>(numUes));
+        g_lastMeanAoiMs /= numUes;
+        g_lastMeanRewardAoiTerm = aoiPenaltySum / static_cast<double>(numUes);
+        g_lastMeanRewardThrTerm = goodputTermSum / static_cast<double>(numUes);
+        g_lastMeanRewardPdrTerm = auxTermSum / static_cast<double>(numUes);
+        g_lastMeanRewardSeTerm = seTermSum / static_cast<double>(numUes);
+        g_lastMeanRewardSwitchPenalty = switchPenaltySum / static_cast<double>(numUes);
+        g_lastMeanRewardTotal = rewardSum / static_cast<double>(numUes);
+        return static_cast<float>(g_lastMeanRewardTotal);
     }
     g_lastMeanAoiMs = 0.0;
     double rewardSum = 0.0;
@@ -2230,6 +2349,7 @@ main(int argc, char* argv[])
     cmd.AddValue("mcsSwitchCount", "Consecutive MCS samples required to switch", g_mcsSwitchCount);
     cmd.AddValue("minSwitchIntervalMs", "Minimum time between switches (ms)", g_minSwitchIntervalMs);
     cmd.AddValue("enableMcsSwitch", "Enable MCS-based BWP switching", g_enableMcsSwitch);
+    cmd.AddValue("enableHarqReTx", "Enable HARQ retransmissions in the NR scheduler", g_enableHarqReTx);
     cmd.AddValue("switchDelayMs", "BWP switching delay (ms)", switchDelayMs);
     cmd.AddValue("enableOpenGym", "Enable OpenGym interface (ns3-gym)", g_enableOpenGym);
     cmd.AddValue("openGymPort", "OpenGym TCP port", g_openGymPort);
@@ -2448,6 +2568,8 @@ main(int argc, char* argv[])
     }
     g_ueIdxByRnti.clear();
     g_dlSchedulers.clear();
+    g_gnbMacs.clear();
+    g_pendingBwpSwitchByRnti.clear();
     g_totalPrbByBwp.clear();
     g_lastIntervalSwitchCount = 0;
     g_nextIntervalSwitchCount = 0;
@@ -2631,15 +2753,15 @@ main(int argc, char* argv[])
     // Keep only a light set of obstructions so FR2 remains usable under load
     // while still seeing occasional blockage events across the whole UE cloud.
     Ptr<Building> building0 = CreateObject<Building>();
-    building0->SetBoundaries(Box(-24.0, -12.0, -10.0, 4.0, 0.0, 16.0));
+    building0->SetBoundaries(Box(-18.0, -6.0, -7.0, 9.0, 0.0, 18.0));
     building0->SetBuildingType(Building::Residential);
     building0->SetExtWallsType(Building::ConcreteWithWindows);
-    building0->SetNFloors(3);
+    building0->SetNFloors(4);
     building0->SetNRoomsX(1);
     building0->SetNRoomsY(1);
 
     Ptr<Building> building1 = CreateObject<Building>();
-    building1->SetBoundaries(Box(10.0, 22.0, 6.0, 18.0, 0.0, 18.0));
+    building1->SetBoundaries(Box(12.0, 24.0, 10.0, 22.0, 0.0, 18.0));
     building1->SetBuildingType(Building::Residential);
     building1->SetExtWallsType(Building::ConcreteWithWindows);
     building1->SetNFloors(3);
@@ -2647,44 +2769,26 @@ main(int argc, char* argv[])
     building1->SetNRoomsY(1);
 
     Ptr<Building> building2 = CreateObject<Building>();
-    building2->SetBoundaries(Box(18.0, 32.0, -20.0, -8.0, 0.0, 14.0));
+    building2->SetBoundaries(Box(14.0, 30.0, -22.0, -10.0, 0.0, 16.0));
     building2->SetBuildingType(Building::Residential);
     building2->SetExtWallsType(Building::ConcreteWithWindows);
-    building2->SetNFloors(2);
+    building2->SetNFloors(3);
     building2->SetNRoomsX(1);
     building2->SetNRoomsY(1);
 
-    // Ptr<Building> building3 = CreateObject<Building>();
-    // building3->SetBoundaries(Box(-8.0, 4.0, 12.0, 24.0, 0.0, 18.0));
-    // building3->SetBuildingType(Building::Residential);
-    // building3->SetExtWallsType(Building::ConcreteWithWindows);
-    // building3->SetNFloors(3);
-    // building3->SetNRoomsX(1);
-    // building3->SetNRoomsY(1);
+    Ptr<Building> building3 = CreateObject<Building>();
+    building3->SetBoundaries(Box(-4.0, 6.0, 16.0, 30.0, 0.0, 20.0));
+    building3->SetBuildingType(Building::Residential);
+    building3->SetNFloors(4);
+    building3->SetNRoomsX(1);
+    building3->SetNRoomsY(1);
 
-    // Ptr<Building> building4 = CreateObject<Building>();
-    // building4->SetBoundaries(Box(-6.0, 8.0, -26.0, -14.0, 0.0, 16.0));
-    // building4->SetBuildingType(Building::Residential);
-    // building4->SetExtWallsType(Building::ConcreteWithWindows);
-    // building4->SetNFloors(3);
-    // building4->SetNRoomsX(1);
-    // building4->SetNRoomsY(1);
-
-    // Ptr<Building> building5 = CreateObject<Building>();
-    // building5->SetBoundaries(Box(28.0, 40.0, 10.0, 22.0, 0.0, 20.0));
-    // building5->SetBuildingType(Building::Residential);
-    // building5->SetExtWallsType(Building::ConcreteWithWindows);
-    // building5->SetNFloors(4);
-    // building5->SetNRoomsX(1);
-    // building5->SetNRoomsY(1);
-
-    // Ptr<Building> building6 = CreateObject<Building>();
-    // building6->SetBoundaries(Box(-30.0, -18.0, 8.0, 20.0, 0.0, 14.0));
-    // building6->SetBuildingType(Building::Residential);
-    // building6->SetExtWallsType(Building::ConcreteWithWindows);
-    // building6->SetNFloors(2);
-    // building6->SetNRoomsX(1);
-    // building6->SetNRoomsY(1);
+    Ptr<Building> building4 = CreateObject<Building>();
+    building4->SetBoundaries(Box(-2.0, 8.0, -30.0, -16.0, 0.0, 18.0));
+    building4->SetBuildingType(Building::Residential);
+    building4->SetNFloors(3);
+    building4->SetNRoomsX(1);
+    building4->SetNRoomsY(1);
 
     BuildingsHelper::Install(gnbNodes);
     BuildingsHelper::Install(ueNodes);
@@ -2722,7 +2826,7 @@ main(int argc, char* argv[])
     {
         nrHelper->SetSchedulerTypeId(NrMacSchedulerOfdmaRR::GetTypeId());
     }
-    nrHelper->SetSchedulerAttribute("EnableHarqReTx", BooleanValue(false));
+    nrHelper->SetSchedulerAttribute("EnableHarqReTx", BooleanValue(g_enableHarqReTx));
     if (g_schedulerPolicy == "aequitas" || g_bwpBaseline == "aequitas")
     {
         nrHelper->SetSchedulerAttribute("EnableMcsSelection",
@@ -2759,11 +2863,13 @@ main(int argc, char* argv[])
         g_gnbBwpMgr = gnbNetDev->GetBwpManager();
         if (g_gnbBwpMgr)
         {
-            g_gnbBwpMgr->SetAttributeSwitchingDelay(MilliSeconds(switchDelayMs));
+            // The scenario-level deferred switch timer owns the full switch-delay budget.
+            g_gnbBwpMgr->SetAttributeSwitchingDelay(MilliSeconds(0));
         }
         for (uint8_t bwpId = 0; bwpId < gnbNetDev->GetCcMapSize(); ++bwpId)
         {
             Ptr<NrGnbMac> gnbMac = gnbNetDev->GetMac(bwpId);
+            g_gnbMacs.push_back(gnbMac);
             if (gnbMac)
             {
                 gnbMac->TraceConnectWithoutContext("DlScheduling",

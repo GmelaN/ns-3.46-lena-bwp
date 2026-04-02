@@ -1110,6 +1110,26 @@ ApplyPerUeMcsOverridesToSchedulers()
     }
 }
 
+static uint8_t
+EstimateBaselineDlMcsForUe(uint32_t ueIdx, uint8_t bwpTarget)
+{
+    if (ueIdx >= g_rntiByUeIdx.size())
+    {
+        return g_rlInitialMcs;
+    }
+    uint16_t rnti = g_rntiByUeIdx[ueIdx];
+    if (rnti == 0)
+    {
+        return g_rlInitialMcs;
+    }
+    if (bwpTarget >= g_dlSchedulers.size() || !g_dlSchedulers[bwpTarget])
+    {
+        return (ueIdx < g_lastMcsByUe.size()) ? static_cast<uint8_t>(std::lround(g_lastMcsByUe[ueIdx]))
+                                              : g_rlInitialMcs;
+    }
+    return g_dlSchedulers[bwpTarget]->EstimateDlMcsFromCurrentCqiForRnti(rnti);
+}
+
 static void
 ApplyAequitasInputsToSchedulers()
 {
@@ -1852,7 +1872,9 @@ MyExecuteActions(Ptr<OpenGymDataContainer> action)
 
         if (g_enableRlMcsControl && ueIdx < g_targetMcsByUe.size())
         {
-            int target = static_cast<int>(g_targetMcsByUe[ueIdx]) + delta;
+            uint8_t targetBwpId = (bwpTarget == 0) ? g_lowBwpId : g_highBwpId;
+            int baseMcs = static_cast<int>(EstimateBaselineDlMcsForUe(ueIdx, targetBwpId));
+            int target = baseMcs + delta;
             target = std::max(0, std::min(27, target));
             g_targetMcsByUe[ueIdx] = static_cast<uint8_t>(target);
         }
@@ -1861,10 +1883,13 @@ MyExecuteActions(Ptr<OpenGymDataContainer> action)
         {
             uint8_t current = (ueIdx < g_currentBwpByUe.size()) ? GetCurrentUeBwp(ueIdx) : 0;
             uint8_t target = (bwpTarget == 0) ? g_lowBwpId : g_highBwpId;
+            uint8_t targetBwpId = (bwpTarget == 0) ? g_lowBwpId : g_highBwpId;
+            uint8_t baseMcs = EstimateBaselineDlMcsForUe(ueIdx, targetBwpId);
             uint8_t targetMcs = (ueIdx < g_targetMcsByUe.size()) ? g_targetMcsByUe[ueIdx] : 0;
             NS_LOG_UNCOND("[rl-debug] action ue="
                           << ueIdx << " code=" << code << " current_bwp=" << unsigned(current)
-                          << " target_bwp=" << unsigned(target) << " mcs_delta=" << int(delta)
+                          << " target_bwp=" << unsigned(target) << " base_mcs=" << unsigned(baseMcs)
+                          << " mcs_delta=" << int(delta)
                           << " target_mcs=" << unsigned(targetMcs)
                           << " prb_utility=" << ComputeUePrbUtility(ueIdx)
                           << " thr_mbps=" << ComputeUeThroughputMbps(ueIdx)
@@ -2460,12 +2485,9 @@ main(int argc, char* argv[])
         nrHelper->SetSchedulerAttribute("EnableMcsSelection",
                                         BooleanValue(g_aequitasEnableMcsSelection));
     }
-    nrHelper->SetSchedulerAttribute("FixedMcsDl", BooleanValue(g_enableRlMcsControl));
+    nrHelper->SetSchedulerAttribute("FixedMcsDl", BooleanValue(false));
     nrHelper->SetSchedulerAttribute("FixedMcsUl", BooleanValue(false));
-    if (g_enableRlMcsControl)
-    {
-        nrHelper->SetSchedulerAttribute("StartingMcsDl", UintegerValue(g_rlInitialMcs));
-    }
+    nrHelper->SetSchedulerAttribute("StartingMcsDl", UintegerValue(g_rlInitialMcs));
 
     Config::SetDefault("ns3::NrAmc::ErrorModelType",
                        TypeIdValue(TypeId::LookupByName(errorModel)));
@@ -2512,7 +2534,7 @@ main(int argc, char* argv[])
             }
             if (g_enableRlMcsControl && sched)
             {
-                sched->SetAttribute("FixedMcsDl", BooleanValue(true));
+                sched->SetAttribute("FixedMcsDl", BooleanValue(false));
                 sched->SetAttribute("StartingMcsDl", UintegerValue(g_rlInitialMcs));
             }
             Ptr<NrGnbPhy> gnbPhy = gnbNetDev->GetPhy(bwpId);
