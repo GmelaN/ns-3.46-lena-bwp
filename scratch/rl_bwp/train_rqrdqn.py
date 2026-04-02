@@ -84,6 +84,30 @@ def steps_per_episode(cfg: EnvConfig, *, shared_per_ue: bool) -> int:
     return base_steps
 
 
+def save_checkpoint(
+    out_dir: str,
+    episode_count: int,
+    online_net: RqrdqnNet,
+    obs_dim: int,
+    action_dim: int,
+    hidden_dim: int,
+    num_quantiles: int,
+    q_cfg: RqrdqnConfig,
+) -> str:
+    ckpt_path = os.path.join(out_dir, f"checkpoint_ep{episode_count:04d}.pt")
+    ckpt = {
+        "state_dict": online_net.state_dict(),
+        "obs_dim": obs_dim,
+        "action_dim": action_dim,
+        "hidden_dim": hidden_dim,
+        "num_quantiles": num_quantiles,
+        "rqrdqn_config": asdict(q_cfg),
+        "episode": episode_count,
+    }
+    torch.save(ckpt, ckpt_path)
+    return ckpt_path
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train recurrent quantile DQN over OpenGym/ns3 env.")
     parser.add_argument("--backend", choices=["mock", "ns3"], default="mock")
@@ -110,10 +134,10 @@ def main():
     parser.add_argument("--seq-len", type=int, default=8)
     parser.add_argument("--burn-in", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--replay-capacity", type=int, default=2000)
+    parser.add_argument("--replay-capacity", type=int, default=5000)
     parser.add_argument("--warmup-sequences", type=int, default=64)
     parser.add_argument("--target-sync", type=int, default=100)
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--gamma", type=float, default=0.98)
     parser.add_argument("--eps-start", type=float, default=1.0)
     parser.add_argument("--eps-end", type=float, default=0.05)
@@ -121,6 +145,9 @@ def main():
     parser.add_argument("--train-updates-per-step", type=int, default=1)
     parser.add_argument("--final-train-updates", type=int, default=256)
     parser.add_argument("--min-completed-episodes", type=int, default=1)
+    parser.add_argument("--reward-bin-size", type=int, default=300)
+    parser.add_argument("--disable-step-reward-log", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--save-every-episodes", type=int, default=0)
     parser.add_argument("--huber-kappa", type=float, default=1.0)
     parser.add_argument("--action-selection-quantile", type=float, default=0.2)
     parser.add_argument("--conditional-risk-selection", action=argparse.BooleanOptionalAction, default=False)
@@ -143,30 +170,46 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     episode_metrics_path = os.path.join(out_dir, "train_episode_metrics.csv")
     step_reward_log_path = os.path.join(out_dir, "step_reward_log.csv")
+    reward_bin_log_path = os.path.join(out_dir, "train_reward_bins_300.csv")
+    value_loss_log_path = os.path.join(out_dir, "value_loss_300.csv")
+    td_quantile_fieldnames = [f"td_abs_q{i:02d}" for i in range(args.num_quantiles)]
     with open(episode_metrics_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
             fieldnames=["episode", "global_step", "mean_reward", "mean_thr_mbps", "mean_aoi_ms"],
         )
         writer.writeheader()
-    with open(step_reward_log_path, "w", encoding="utf-8", newline="") as f:
+    with open(reward_bin_log_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=[
-                "episode",
-                "episode_step",
-                "global_step",
-                "ue_index",
-                "reward",
-                "mean_thr_mbps",
-                "mean_aoi_ms",
-                "reward_aoi_penalty_local",
-                "reward_goodput_term_local",
-                "reward_aux_term_local",
-                "reward_switch_penalty_local",
-            ],
+            fieldnames=["episode", "bin_index", "bin_size", "global_step_end", "avg_reward"],
         )
         writer.writeheader()
+    with open(value_loss_log_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["episode", "global_step_end", "window_steps", "num_updates", "avg_value_loss", *td_quantile_fieldnames],
+        )
+        writer.writeheader()
+    if not args.disable_step_reward_log:
+        with open(step_reward_log_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "episode",
+                    "episode_step",
+                    "global_step",
+                    "ue_index",
+                    "reward",
+                    "mean_thr_mbps",
+                    "mean_aoi_ms",
+                    "reward_aoi_penalty_local",
+                    "reward_goodput_term_local",
+                    "reward_aux_term_local",
+                    "reward_switch_penalty_local",
+                ],
+            )
+            writer.writeheader()
 
     cfg, env = build_env(args, seed=args.seed)
     episode_step_budget = steps_per_episode(cfg, shared_per_ue=bool(args.shared_per_ue))
@@ -219,6 +262,10 @@ def main():
     global_step = 0
     episode_count = 0
     episode_step = 0
+    episode_bin_index = 0
+    reward_bin_values: list[float] = []
+    value_loss_bin_values: list[float] = []
+    td_quantile_bin_values: list[list[float]] = []
     recent_rewards: list[float] = []
     loss_history: list[float] = []
     last_step_info: dict[str, float] = {}
@@ -261,30 +308,52 @@ def main():
             "reward_aux_term_local": float(step_info.get("reward_aux_term_local", 0.0)),
             "reward_switch_penalty_local": float(step_info.get("reward_switch_penalty_local", 0.0)),
         }
-        with open(step_reward_log_path, "a", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=[
-                    "episode",
-                    "episode_step",
-                    "global_step",
-                    "ue_index",
-                    "reward",
-                    "mean_thr_mbps",
-                    "mean_aoi_ms",
-                    "reward_aoi_penalty_local",
-                    "reward_goodput_term_local",
-                    "reward_aux_term_local",
-                    "reward_switch_penalty_local",
-                ],
-            )
-            writer.writerow(step_row)
+        reward_bin_values.append(float(reward))
+        if not args.disable_step_reward_log:
+            with open(step_reward_log_path, "a", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=[
+                        "episode",
+                        "episode_step",
+                        "global_step",
+                        "ue_index",
+                        "reward",
+                        "mean_thr_mbps",
+                        "mean_aoi_ms",
+                        "reward_aoi_penalty_local",
+                        "reward_goodput_term_local",
+                        "reward_aux_term_local",
+                        "reward_switch_penalty_local",
+                    ],
+                )
+                writer.writerow(step_row)
+        if len(reward_bin_values) == args.reward_bin_size:
+            with open(reward_bin_log_path, "a", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["episode", "bin_index", "bin_size", "global_step_end", "avg_reward"],
+                )
+                writer.writerow(
+                    {
+                        "episode": episode_count + 1,
+                        "bin_index": episode_bin_index,
+                        "bin_size": len(reward_bin_values),
+                        "global_step_end": global_step + 1,
+                        "avg_reward": float(sum(reward_bin_values) / len(reward_bin_values)),
+                    }
+                )
+            reward_bin_values.clear()
+            episode_bin_index += 1
 
         if len(replay) >= args.warmup_sequences:
             for _ in range(args.train_updates_per_step):
                 batch = replay.sample(args.batch_size)
-                loss = train_batch(online_net, target_net, optimizer, batch, q_cfg, device)
+                train_stats = train_batch(online_net, target_net, optimizer, batch, q_cfg, device)
+                loss = float(train_stats["loss"])
                 loss_history.append(loss)
+                value_loss_bin_values.append(loss)
+                td_quantile_bin_values.append([float(x) for x in train_stats["quantile_td_abs"]])
 
         if global_step > 0 and global_step % args.target_sync == 0:
             target_net.load_state_dict(online_net.state_dict())
@@ -292,6 +361,27 @@ def main():
         obs = next_obs
         hidden = next_hidden.detach()
         global_step += 1
+
+        if global_step % 300 == 0:
+            avg_td_quantiles = np.mean(np.asarray(td_quantile_bin_values, dtype=np.float64), axis=0) if td_quantile_bin_values else np.zeros(args.num_quantiles, dtype=np.float64)
+            row = {
+                "episode": episode_count + 1,
+                "global_step_end": global_step,
+                "window_steps": 300,
+                "num_updates": len(value_loss_bin_values),
+                "avg_value_loss": float(sum(value_loss_bin_values) / len(value_loss_bin_values))
+                if value_loss_bin_values
+                else 0.0,
+            }
+            row.update({name: float(avg_td_quantiles[i]) for i, name in enumerate(td_quantile_fieldnames)})
+            with open(value_loss_log_path, "a", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["episode", "global_step_end", "window_steps", "num_updates", "avg_value_loss", *td_quantile_fieldnames],
+                )
+                writer.writerow(row)
+            value_loss_bin_values.clear()
+            td_quantile_bin_values.clear()
 
         if done:
             for seq_td in episode_to_sequences(episode_transitions, args.seq_len):
@@ -312,10 +402,38 @@ def main():
                     fieldnames=["episode", "global_step", "mean_reward", "mean_thr_mbps", "mean_aoi_ms"],
                 )
                 writer.writerow(episode_row)
+            if reward_bin_values:
+                with open(reward_bin_log_path, "a", encoding="utf-8", newline="") as f:
+                    writer = csv.DictWriter(
+                        f,
+                        fieldnames=["episode", "bin_index", "bin_size", "global_step_end", "avg_reward"],
+                    )
+                    writer.writerow(
+                        {
+                            "episode": episode_count,
+                            "bin_index": episode_bin_index,
+                            "bin_size": len(reward_bin_values),
+                            "global_step_end": global_step,
+                            "avg_reward": float(sum(reward_bin_values) / len(reward_bin_values)),
+                        }
+                    )
+                reward_bin_values.clear()
             obs, _ = env.reset()
             obs = obs.astype("float32")
             hidden = online_net.zero_hidden(1, device)
             episode_step = 0
+            episode_bin_index = 0
+            if args.save_every_episodes > 0 and episode_count % args.save_every_episodes == 0:
+                save_checkpoint(
+                    out_dir,
+                    episode_count,
+                    online_net,
+                    obs_dim,
+                    action_dim,
+                    args.hidden_dim,
+                    args.num_quantiles,
+                    q_cfg,
+                )
 
     if episode_transitions:
         for seq_td in episode_to_sequences(episode_transitions, args.seq_len):
@@ -324,19 +442,41 @@ def main():
     if len(replay) >= args.warmup_sequences:
         for _ in range(args.final_train_updates):
             batch = replay.sample(args.batch_size)
-            loss = train_batch(online_net, target_net, optimizer, batch, q_cfg, device)
+            train_stats = train_batch(online_net, target_net, optimizer, batch, q_cfg, device)
+            loss = float(train_stats["loss"])
             loss_history.append(loss)
+            value_loss_bin_values.append(loss)
+            td_quantile_bin_values.append([float(x) for x in train_stats["quantile_td_abs"]])
 
-    model_path = os.path.join(out_dir, "final_model.pt")
-    ckpt = {
-        "state_dict": online_net.state_dict(),
-        "obs_dim": obs_dim,
-        "action_dim": action_dim,
-        "hidden_dim": args.hidden_dim,
-        "num_quantiles": args.num_quantiles,
-        "rqrdqn_config": asdict(q_cfg),
-    }
-    torch.save(ckpt, model_path)
+    if value_loss_bin_values:
+        avg_td_quantiles = np.mean(np.asarray(td_quantile_bin_values, dtype=np.float64), axis=0)
+        row = {
+            "episode": episode_count if episode_count > 0 else 0,
+            "global_step_end": global_step,
+            "window_steps": global_step % 300 if global_step % 300 != 0 else 300,
+            "num_updates": len(value_loss_bin_values),
+            "avg_value_loss": float(sum(value_loss_bin_values) / len(value_loss_bin_values)),
+        }
+        row.update({name: float(avg_td_quantiles[i]) for i, name in enumerate(td_quantile_fieldnames)})
+        with open(value_loss_log_path, "a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["episode", "global_step_end", "window_steps", "num_updates", "avg_value_loss", *td_quantile_fieldnames],
+            )
+            writer.writerow(row)
+
+    model_path = save_checkpoint(
+        out_dir,
+        episode_count if episode_count > 0 else 0,
+        online_net,
+        obs_dim,
+        action_dim,
+        args.hidden_dim,
+        args.num_quantiles,
+        q_cfg,
+    )
+    final_model_path = os.path.join(out_dir, "final_model.pt")
+    torch.save(torch.load(model_path, map_location="cpu"), final_model_path)
 
     run_cfg = {
         "backend": args.backend,
@@ -356,15 +496,18 @@ def main():
         "final_train_updates": args.final_train_updates,
         "min_completed_episodes": args.min_completed_episodes,
         "episode_metrics_csv": episode_metrics_path,
-        "step_reward_log_csv": step_reward_log_path,
+        "step_reward_log_csv": step_reward_log_path if not args.disable_step_reward_log else "",
+        "reward_bin_csv": reward_bin_log_path,
+        "value_loss_csv": value_loss_log_path,
         "init_model_path": args.init_model_path,
+        "save_every_episodes": args.save_every_episodes,
         "episodes_finished": episode_count,
         "mean_recent_reward": float(sum(recent_rewards[-200:]) / max(1, len(recent_rewards[-200:]))),
         "mean_recent_loss": float(sum(loss_history[-200:]) / max(1, len(loss_history[-200:]))) if loss_history else 0.0,
     }
     with open(os.path.join(out_dir, "run_config.json"), "w", encoding="utf-8") as f:
         json.dump(run_cfg, f, indent=2)
-    print(f"Saved model: {model_path}")
+    print(f"Saved model: {final_model_path}")
     env.close()
 
 

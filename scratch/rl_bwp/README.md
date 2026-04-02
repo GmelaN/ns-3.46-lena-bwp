@@ -9,9 +9,11 @@ It follows your current assumptions:
 - Fixed UE count (`num_ues`, currently intended as `1`)
 - Step time: `20 ms`
 - BWP switch delay: `5 ms`
-- Goal: minimize system mean AoI (mean over UEs)
+- Goal: minimize AoI increase while penalizing actual BWP switches
+  while preserving throughput
 - Include PRB saturation proxy in state:
-  `prb_utility = allocated_prb / total_prb_current_bwp`
+  `prb_utility = prb_demand / total_prb_current_bwp`,
+  where `prb_demand = dl_rlc_queue_bytes / (c0 + c1 * mcs)`
 
 ## Files
 
@@ -26,13 +28,13 @@ It follows your current assumptions:
 ## Action and Observation
 
 Observation (per UE, flattened):
-- `queue_norm`
-- `cqi_norm`
-- `sinr_norm`
-- `mcs_norm`
+- `mcs`
 - `bwp_mode` (`0` narrow, `1` wide)
 - `prb_utility`
-- `cooldown_norm`
+- `sinr_db`
+- `log(1 + aoi_ms)`
+- `log(1 + throughput_mbps)`
+- `log(1 + dl_queue_bytes)` from the downlink RLC queue
 
 Action (per UE):
 - `bwp_cmd in {0: hold, 1: switch}`
@@ -44,11 +46,9 @@ Action (per UE):
 ## Reward
 
 Default shaped reward:
-- primary: `-mean_aoi_ms`
-- penalties:
-  - switch count penalty
-  - queue overflow ratio penalty
-  - switch delay burden (`delay_ratio = 5/20 = 0.25` with current setup)
+- `-(log(1 + AoI_t) - log(1 + AoI_{t-1}))`
+- `+ log(1 + throughput_mbps_t)`
+- actual BWP switch penalty
 
 ## Quick start (mock backend)
 
@@ -83,4 +83,34 @@ Current integration target:
 - multi-UE per-UE actions are supported (`BWP switch + MCS delta` per UE)
 - per-UE DL MCS is applied through scheduler `RNTI -> MCS override` (not UE0-only)
 
-If you run ns-3 manually, keep `--start-sim` disabled (default) and start ns-3 first.
+Auto-start support:
+- pass `--start-sim` to let Python launch ns-3 automatically.
+- default script is `aoi-prb-urban-onoff` (override with `--ns3-script`).
+- `simTime`, `envStepTime`, `numUes` are passed automatically from RL args.
+- extra ns-3 CLI args can be appended with repeated `--ns3-arg key=value`.
+
+Example (ns-3 eval with auto-start):
+
+```bash
+python3 scratch/rl_bwp/eval_rppo.py \
+  --backend ns3 \
+  --start-sim \
+  --ns3-script aoi-prb-urban-onoff \
+  --model-path scratch/rl_bwp/runs/rppo_bwp_ue1/final_model.zip \
+  --vecnorm-path scratch/rl_bwp/runs/rppo_bwp_ue1/vecnormalize.pkl \
+  --num-ues 1 \
+  --episode-time-s 10 \
+  --episodes 3
+```
+
+python3 scratch/rl_bwp/eval_rppo.py \
+  --backend ns3 \
+  --start-sim \
+  --ns3-script aoi-prb-urban-onoff \
+  --model-path scratch/rl_bwp/runs/rppo_bwp_ue1/final_model.zip \
+  --vecnorm-path scratch/rl_bwp/runs/rppo_bwp_ue1/vecnormalize.pkl \
+  --num-ues 1 \
+  --episode-time-s 1800 \
+  --episodes 3
+
+python3 scratch/rl_bwp/train_rppo.py --backend ns3 --start-sim --ns3-script aoi-prb-urban-onoff --num-ues 5 --episode-time-s 1 --run-name 5ues --n-epochs 1000 --switch-delay-ms 10 --ns3-arg "numUes=5" --ns3-arg "simTime=3600" --n-steps 200 --total-timesteps 200

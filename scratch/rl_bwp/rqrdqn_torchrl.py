@@ -211,7 +211,7 @@ def train_batch(
     batch: TensorDict,
     cfg: RqrdqnConfig,
     device: torch.device,
-) -> float:
+) -> dict[str, float | list[float]]:
     obs = batch["obs"].to(device)
     action = batch["action"].to(device)
     reward = batch["reward"].to(device)
@@ -223,6 +223,8 @@ def train_batch(
     h_online = online_net.zero_hidden(batch_size, device)
     h_target = target_net.zero_hidden(batch_size, device)
     losses: list[torch.Tensor] = []
+    td_abs_quantile_num = torch.zeros(cfg.num_quantiles, device=device)
+    td_abs_quantile_den = torch.zeros((), device=device)
 
     for t in range(seq_len):
         quantiles_t, h_online_next = online_net.forward_step(obs[:, t, :], h_online)
@@ -240,8 +242,11 @@ def train_batch(
                 next_quantiles_target, _ = target_net.forward_step(next_obs[:, t, :], h_target_next)
                 target_quantiles = next_quantiles_target[batch_idx, next_action, :]
                 target = reward[:, t].unsqueeze(1) + cfg.gamma * (1.0 - done[:, t]).unsqueeze(1) * target_quantiles
+                td_abs_quantile = (target.unsqueeze(1) - pred_quantiles.unsqueeze(2)).abs().mean(dim=2)
             td_loss = _quantile_huber_loss(pred_quantiles, target, online_net.taus.to(device), cfg.huber_kappa)
             losses.append(td_loss * mask[:, t])
+            td_abs_quantile_num += torch.sum(td_abs_quantile * mask[:, t].unsqueeze(1), dim=0)
+            td_abs_quantile_den += torch.sum(mask[:, t])
 
         h_online = h_online_next
         h_target = h_target_next
@@ -256,4 +261,10 @@ def train_batch(
     loss.backward()
     torch.nn.utils.clip_grad_norm_(online_net.parameters(), 10.0)
     optimizer.step()
-    return float(loss.item())
+    quantile_td_abs = torch.zeros(cfg.num_quantiles, device=device)
+    if float(td_abs_quantile_den.item()) > 0.0:
+        quantile_td_abs = td_abs_quantile_num / td_abs_quantile_den
+    return {
+        "loss": float(loss.item()),
+        "quantile_td_abs": [float(x) for x in quantile_td_abs.detach().cpu().tolist()],
+    }

@@ -217,6 +217,8 @@ static std::vector<double> g_lastMcsByUe;
 static std::vector<double> g_lastRequestedMcsOffsetByUe;
 static std::vector<double> g_lastBwpSwitchTimeSByUe;
 static std::vector<double> g_rlcDlQueueBytesByUe;
+static std::vector<std::unordered_map<uint8_t, double>> g_rlcDlQueueBytesByUeAndLcid;
+static bool g_rlcTxBufferTraceConnected = false;
 static std::vector<double> g_prevRewardQueueBytesByUe;
 static std::vector<uint8_t> g_currentBwpByUe;
 static std::vector<double> g_switchCooldownUntilSByUe;
@@ -290,6 +292,15 @@ static std::unique_ptr<std::ofstream> g_metricsTraceStream;
 static std::string g_aoiTraceFile = "";
 static std::unique_ptr<std::ofstream> g_aoiTraceStream;
 static int32_t g_aoiTraceUe = 0;
+static std::string g_aoiStateTraceFile = "";
+static std::unique_ptr<std::ofstream> g_aoiStateTraceStream;
+static int32_t g_aoiStateTraceUe = 0;
+static std::string g_queueTraceFile = "";
+static std::unique_ptr<std::ofstream> g_queueTraceStream;
+static int32_t g_queueTraceUe = 0;
+static std::string g_appStateTraceFile = "";
+static std::unique_ptr<std::ofstream> g_appStateTraceStream;
+static int32_t g_appStateTraceUe = 0;
 static std::string g_burstStateTraceFile = "";
 static std::unique_ptr<std::ofstream> g_burstStateTraceStream;
 
@@ -712,6 +723,7 @@ RecordAppRx(uint32_t ueIdx, uint8_t type, Ptr<const Packet> p, Time txTime)
         (*g_aoiTraceStream) << std::fixed << std::setprecision(6) << Simulator::Now().GetSeconds()
                             << "," << ueIdx << "," << static_cast<uint32_t>(type) << ","
                             << p->GetSize() << "," << aoiMs << "\n";
+        g_aoiTraceStream->flush();
     }
 }
 
@@ -726,6 +738,7 @@ TagPacketTx(Ptr<const Packet> p)
     TxTimeTag tag;
     tag.SetTxTime(Simulator::Now());
     mutablePacket->ReplacePacketTag(tag);
+    mutablePacket->AddByteTag(tag, 0, mutablePacket->GetSize());
 }
 
 static void
@@ -744,7 +757,7 @@ static void
 OnPacketSinkRx(uint32_t ueIdx, uint8_t type, Ptr<const Packet> p, const Address&)
 {
     TxTimeTag tag;
-    if (!p->PeekPacketTag(tag))
+    if (!p->PeekPacketTag(tag) && !p->FindFirstMatchingByteTag(tag))
     {
         if (ueIdx < g_rxMissingTagPacketsByType.size() && type < TRAFFIC_TYPES)
         {
@@ -753,6 +766,31 @@ OnPacketSinkRx(uint32_t ueIdx, uint8_t type, Ptr<const Packet> p, const Address&
         return;
     }
     RecordAppRx(ueIdx, type, p, tag.GetTxTime());
+}
+
+static void
+ConnectAoiPacketSinkTrace(Ptr<Application> app, uint32_t ueIdx, uint8_t type)
+{
+    if (!app)
+    {
+        if (Simulator::Now().GetSeconds() + 0.05 < g_simTime)
+        {
+            Simulator::Schedule(MilliSeconds(50), &ConnectAoiPacketSinkTrace, app, ueIdx, type);
+        }
+        return;
+    }
+
+    Ptr<PacketSink> sink = DynamicCast<PacketSink>(app);
+    if (!sink)
+    {
+        if (Simulator::Now().GetSeconds() + 0.05 < g_simTime)
+        {
+            Simulator::Schedule(MilliSeconds(50), &ConnectAoiPacketSinkTrace, app, ueIdx, type);
+        }
+        return;
+    }
+
+    sink->TraceConnectWithoutContext("Rx", MakeBoundCallback(&OnPacketSinkRx, ueIdx, type));
 }
 
 static void
@@ -852,11 +890,8 @@ ComputeDlRlcQueueBytes(uint32_t ueIdx)
 }
 
 static void
-DlBufferReportTrace(uint16_t rnti, uint8_t lcid, uint32_t bytes, uint16_t bwpId)
+RlcTxBufferSizeTrace(uint16_t rnti, uint8_t lcid, uint32_t bytes)
 {
-    (void)lcid;
-    (void)bwpId;
-
     auto it = g_ueIdxByRnti.find(rnti);
     if (it == g_ueIdxByRnti.end())
     {
@@ -868,8 +903,43 @@ DlBufferReportTrace(uint16_t rnti, uint8_t lcid, uint32_t bytes, uint16_t bwpId)
         return;
     }
 
-    // Use the scheduler-observed DL RLC queue size directly as the queue backlog proxy.
-    g_rlcDlQueueBytesByUe[ueIdx] = static_cast<double>(bytes);
+    if (ueIdx >= g_rlcDlQueueBytesByUeAndLcid.size())
+    {
+        return;
+    }
+
+    // Aggregate exact per-LCID RLC Tx buffer sizes across LCIDs for each UE.
+    g_rlcDlQueueBytesByUeAndLcid[ueIdx][lcid] = static_cast<double>(bytes);
+
+    double totalBytes = 0.0;
+    for (const auto& [_, qBytes] : g_rlcDlQueueBytesByUeAndLcid[ueIdx])
+    {
+        totalBytes += std::max(0.0, qBytes);
+    }
+    g_rlcDlQueueBytesByUe[ueIdx] = totalBytes;
+}
+
+static void
+ConnectRlcTxBufferSizeTraces()
+{
+    if (g_rlcTxBufferTraceConnected)
+    {
+        return;
+    }
+
+    bool ok = Config::ConnectWithoutContextFailSafe(
+        "/NodeList/*/DeviceList/*/$ns3::NrGnbNetDevice/NrGnbRrc/UeMap/*/DataRadioBearerMap/*/"
+        "NrRlc/$ns3::NrRlcUm/TxBufferSize",
+        MakeCallback(&RlcTxBufferSizeTrace));
+    if (!ok)
+    {
+        if (Simulator::Now().GetSeconds() + 0.05 < g_simTime)
+        {
+            Simulator::Schedule(MilliSeconds(50), &ConnectRlcTxBufferSizeTraces);
+        }
+        return;
+    }
+    g_rlcTxBufferTraceConnected = true;
 }
 
 static double
@@ -903,6 +973,65 @@ ComputeUeMeanAoiMs(uint32_t ueIdx)
         return std::max(0.0, (nowS - g_appStartTime) * 1000.0);
     }
     return std::max(0.0, g_lastNodeDeliveredAoiMsByUe[ueIdx] + (nowS - lastRxS) * 1000.0);
+}
+
+static void
+RecordAoiStateTrace()
+{
+    if (!g_aoiStateTraceStream || !g_aoiStateTraceStream->is_open())
+    {
+        return;
+    }
+
+    uint32_t ueIdx = static_cast<uint32_t>(std::max<int32_t>(0, g_aoiStateTraceUe));
+    if (ueIdx >= g_ueStats.size())
+    {
+        return;
+    }
+
+    (*g_aoiStateTraceStream) << std::fixed << std::setprecision(6) << Simulator::Now().GetSeconds()
+                             << "," << ueIdx << "," << static_cast<uint32_t>(GetCurrentUeBwp(ueIdx)) << ","
+                             << ComputeDlRlcQueueBytes(ueIdx) << ","
+                             << ComputeUeMeanAoiMs(ueIdx) << ","
+                             << ComputeCurrentAoiMs(ueIdx, LIGHT_HTTP) << ","
+                             << ComputeCurrentAoiMs(ueIdx, MODERATE_GAMING) << ","
+                             << ComputeCurrentAoiMs(ueIdx, HEAVY_VIDEO) << "\n";
+    g_aoiStateTraceStream->flush();
+}
+
+static void
+RecordQueueTrace()
+{
+    if (!g_queueTraceStream || !g_queueTraceStream->is_open())
+    {
+        return;
+    }
+
+    uint32_t ueIdx = static_cast<uint32_t>(std::max<int32_t>(0, g_queueTraceUe));
+    if (ueIdx >= g_ueStats.size())
+    {
+        return;
+    }
+
+    (*g_queueTraceStream) << std::fixed << std::setprecision(6) << Simulator::Now().GetSeconds()
+                          << "," << ueIdx << "," << static_cast<uint32_t>(GetCurrentUeBwp(ueIdx))
+                          << "," << ComputeDlRlcQueueBytes(ueIdx) << "\n";
+    g_queueTraceStream->flush();
+}
+
+static void
+ScheduleStateTraces()
+{
+    if (Simulator::Now().GetSeconds() >= g_simTime)
+    {
+        RecordAoiStateTrace();
+        RecordQueueTrace();
+        return;
+    }
+
+    RecordAoiStateTrace();
+    RecordQueueTrace();
+    Simulator::Schedule(Seconds(g_envStepTime), &ScheduleStateTraces);
 }
 
 static double
@@ -1143,6 +1272,7 @@ RecordIntervalMetrics(uint32_t switchCount)
                                 << "," << g_lastMeanRewardSeTerm << ","
                                 << g_lastMeanRewardSwitchPenalty << "," << g_lastMeanRewardTotal
                                 << "\n";
+        g_metricsTraceStream->flush();
     }
 }
 
@@ -2022,7 +2152,7 @@ main(int argc, char* argv[])
     double simTime = g_simTime;
     double appStart = g_appStartTime;
     double lowFreqHz = 3.5e9;
-    double highFreqHz = 28e9;
+    double highFreqHz = 6e9;
     double lowBandwidthHz = 20e6;
     double highBandwidthHz = 100e6;
     double gnbTxPowerDbm = 40.0;
@@ -2052,6 +2182,8 @@ main(int argc, char* argv[])
     double mixedLightRatio = 0.4;
     double mixedModerateRatio = 0.4;
     double mixedHeavyRatio = 0.2;
+    double segmentDurationS = 0.6;
+    int32_t appmixStateOverride = -1;
 
     // Channel dynamics
     bool enableShadowing = true;
@@ -2060,6 +2192,12 @@ main(int argc, char* argv[])
     std::string metricsTraceFile = "";
     std::string aoiTraceFile = "";
     int32_t aoiTraceUe = 0;
+    std::string aoiStateTraceFile = "";
+    int32_t aoiStateTraceUe = 0;
+    std::string queueTraceFile = "";
+    int32_t queueTraceUe = 0;
+    std::string appStateTraceFile = "";
+    int32_t appStateTraceUe = 0;
     std::string burstStateTraceFile = "";
 
     std::string errorModel = "ns3::NrEesmCcT1";
@@ -2146,6 +2284,12 @@ main(int argc, char* argv[])
     cmd.AddValue("dqnAlpha", "Delay weight for latency-sensitive UEs", g_dqnAlpha);
     cmd.AddValue("dqnBeta", "Throughput weight for latency-sensitive UEs", g_dqnBeta);
     cmd.AddValue("rlDrqnProfile", "Use DRQN state/action/reward profile for OpenGym RL", g_rlDrqnProfile);
+    cmd.AddValue("segmentDurationS",
+                 "Duration of each appmix traffic-state segment in seconds.",
+                 segmentDurationS);
+    cmd.AddValue("appmixStateOverride",
+                 "Override appmix state for all segments: -1=disabled, 0=ftp_only, 1=video_only, 2=ftp_video.",
+                 appmixStateOverride);
     cmd.AddValue("burstRateMbps", "Bursty traffic rate (Mbps) during ON", burstRateMbps);
     cmd.AddValue("burstPktSize", "Bursty packet size (bytes)", burstPktSize);
     cmd.AddValue("burstOnMs", "Bursty ON duration (ms)", burstOnMs);
@@ -2165,6 +2309,18 @@ main(int argc, char* argv[])
                  "Write per-packet AoI trace CSV for the selected UE to this file path.",
                  aoiTraceFile);
     cmd.AddValue("aoiTraceUe", "UE index for per-packet AoI tracing.", aoiTraceUe);
+    cmd.AddValue("aoiStateTraceFile",
+                 "Write fixed-step AoI state trace CSV for the selected UE to this file path.",
+                 aoiStateTraceFile);
+    cmd.AddValue("aoiStateTraceUe", "UE index for fixed-step AoI state tracing.", aoiStateTraceUe);
+    cmd.AddValue("queueTraceFile",
+                 "Write fixed-step total RLC queue trace CSV for the selected UE to this file path.",
+                 queueTraceFile);
+    cmd.AddValue("queueTraceUe", "UE index for fixed-step total RLC queue tracing.", queueTraceUe);
+    cmd.AddValue("appStateTraceFile",
+                 "Write app traffic-state interval trace CSV for the selected UE to this file path.",
+                 appStateTraceFile);
+    cmd.AddValue("appStateTraceUe", "UE index for app traffic-state interval tracing.", appStateTraceUe);
     cmd.AddValue("burstStateTraceFile",
                  "Write burst source-side On/Off state trace CSV for the selected UE to this file path.",
                  burstStateTraceFile);
@@ -2200,6 +2356,10 @@ main(int argc, char* argv[])
         mixedModerateRatio = 0.4;
         mixedHeavyRatio = 0.2;
         mixedRatioSum = 1.0;
+    }
+    if (appmixStateOverride < -1 || appmixStateOverride > 2)
+    {
+        NS_ABORT_MSG("Invalid appmixStateOverride. Supported values: -1|0|1|2");
     }
     g_dqnLatencyUeRatio = std::max(0.0, std::min(1.0, g_dqnLatencyUeRatio));
     g_dtQueueLow = std::max(0.0, std::min(1.0, g_dtQueueLow));
@@ -2242,6 +2402,7 @@ main(int argc, char* argv[])
     g_lastRequestedMcsOffsetByUe.assign(numUes, 0.0);
     g_lastBwpSwitchTimeSByUe.assign(numUes, 0.0);
     g_rlcDlQueueBytesByUe.assign(numUes, 0.0);
+    g_rlcDlQueueBytesByUeAndLcid.assign(numUes, {});
     g_prevRewardQueueBytesByUe.assign(numUes, 0.0);
     g_currentBwpByUe.assign(numUes, g_initialBwpId);
     g_switchCooldownUntilSByUe.assign(numUes, 0.0);
@@ -2310,9 +2471,18 @@ main(int argc, char* argv[])
     g_metricsTraceFile = metricsTraceFile;
     g_aoiTraceFile = aoiTraceFile;
     g_aoiTraceUe = aoiTraceUe;
+    g_aoiStateTraceFile = aoiStateTraceFile;
+    g_aoiStateTraceUe = aoiStateTraceUe;
+    g_queueTraceFile = queueTraceFile;
+    g_queueTraceUe = queueTraceUe;
+    g_appStateTraceFile = appStateTraceFile;
+    g_appStateTraceUe = appStateTraceUe;
     g_burstStateTraceFile = burstStateTraceFile;
     g_metricsTraceStream.reset();
     g_aoiTraceStream.reset();
+    g_aoiStateTraceStream.reset();
+    g_queueTraceStream.reset();
+    g_appStateTraceStream.reset();
     g_burstStateTraceStream.reset();
     if (!g_metricsTraceFile.empty())
     {
@@ -2338,11 +2508,56 @@ main(int argc, char* argv[])
         if (g_aoiTraceStream->is_open())
         {
             (*g_aoiTraceStream) << "time_s,ue_idx,traffic_type,pkt_bytes,aoi_ms\n";
+            g_aoiTraceStream->flush();
         }
         else
         {
             NS_LOG_UNCOND("Failed to open aoiTraceFile: " << g_aoiTraceFile);
             g_aoiTraceStream.reset();
+        }
+    }
+    if (!g_aoiStateTraceFile.empty())
+    {
+        g_aoiStateTraceStream = std::make_unique<std::ofstream>(g_aoiStateTraceFile, std::ios::out);
+        if (g_aoiStateTraceStream->is_open())
+        {
+            (*g_aoiStateTraceStream)
+                << "time_s,ue_idx,current_bwp,queue_bytes,aoi_node_ms,aoi_ftp_ms,aoi_gaming_ms,aoi_video_ms\n";
+            g_aoiStateTraceStream->flush();
+        }
+        else
+        {
+            NS_LOG_UNCOND("Failed to open aoiStateTraceFile: " << g_aoiStateTraceFile);
+            g_aoiStateTraceStream.reset();
+        }
+    }
+    if (!g_queueTraceFile.empty())
+    {
+        g_queueTraceStream = std::make_unique<std::ofstream>(g_queueTraceFile, std::ios::out);
+        if (g_queueTraceStream->is_open())
+        {
+            (*g_queueTraceStream) << "time_s,ue_idx,current_bwp,total_rlc_queue_bytes\n";
+            g_queueTraceStream->flush();
+        }
+        else
+        {
+            NS_LOG_UNCOND("Failed to open queueTraceFile: " << g_queueTraceFile);
+            g_queueTraceStream.reset();
+        }
+    }
+    if (!g_appStateTraceFile.empty())
+    {
+        g_appStateTraceStream = std::make_unique<std::ofstream>(g_appStateTraceFile, std::ios::out);
+        if (g_appStateTraceStream->is_open())
+        {
+            (*g_appStateTraceStream)
+                << "ue_idx,state_code,state_label,start_s,end_s,ftp_on,video_on\n";
+            g_appStateTraceStream->flush();
+        }
+        else
+        {
+            NS_LOG_UNCOND("Failed to open appStateTraceFile: " << g_appStateTraceFile);
+            g_appStateTraceStream.reset();
         }
     }
     if (!g_burstStateTraceFile.empty())
@@ -2439,37 +2654,37 @@ main(int argc, char* argv[])
     building2->SetNRoomsX(1);
     building2->SetNRoomsY(1);
 
-    Ptr<Building> building3 = CreateObject<Building>();
-    building3->SetBoundaries(Box(-8.0, 4.0, 12.0, 24.0, 0.0, 18.0));
-    building3->SetBuildingType(Building::Residential);
-    building3->SetExtWallsType(Building::ConcreteWithWindows);
-    building3->SetNFloors(3);
-    building3->SetNRoomsX(1);
-    building3->SetNRoomsY(1);
+    // Ptr<Building> building3 = CreateObject<Building>();
+    // building3->SetBoundaries(Box(-8.0, 4.0, 12.0, 24.0, 0.0, 18.0));
+    // building3->SetBuildingType(Building::Residential);
+    // building3->SetExtWallsType(Building::ConcreteWithWindows);
+    // building3->SetNFloors(3);
+    // building3->SetNRoomsX(1);
+    // building3->SetNRoomsY(1);
 
-    Ptr<Building> building4 = CreateObject<Building>();
-    building4->SetBoundaries(Box(-6.0, 8.0, -26.0, -14.0, 0.0, 16.0));
-    building4->SetBuildingType(Building::Residential);
-    building4->SetExtWallsType(Building::ConcreteWithWindows);
-    building4->SetNFloors(3);
-    building4->SetNRoomsX(1);
-    building4->SetNRoomsY(1);
+    // Ptr<Building> building4 = CreateObject<Building>();
+    // building4->SetBoundaries(Box(-6.0, 8.0, -26.0, -14.0, 0.0, 16.0));
+    // building4->SetBuildingType(Building::Residential);
+    // building4->SetExtWallsType(Building::ConcreteWithWindows);
+    // building4->SetNFloors(3);
+    // building4->SetNRoomsX(1);
+    // building4->SetNRoomsY(1);
 
-    Ptr<Building> building5 = CreateObject<Building>();
-    building5->SetBoundaries(Box(28.0, 40.0, 10.0, 22.0, 0.0, 20.0));
-    building5->SetBuildingType(Building::Residential);
-    building5->SetExtWallsType(Building::ConcreteWithWindows);
-    building5->SetNFloors(4);
-    building5->SetNRoomsX(1);
-    building5->SetNRoomsY(1);
+    // Ptr<Building> building5 = CreateObject<Building>();
+    // building5->SetBoundaries(Box(28.0, 40.0, 10.0, 22.0, 0.0, 20.0));
+    // building5->SetBuildingType(Building::Residential);
+    // building5->SetExtWallsType(Building::ConcreteWithWindows);
+    // building5->SetNFloors(4);
+    // building5->SetNRoomsX(1);
+    // building5->SetNRoomsY(1);
 
-    Ptr<Building> building6 = CreateObject<Building>();
-    building6->SetBoundaries(Box(-30.0, -18.0, 8.0, 20.0, 0.0, 14.0));
-    building6->SetBuildingType(Building::Residential);
-    building6->SetExtWallsType(Building::ConcreteWithWindows);
-    building6->SetNFloors(2);
-    building6->SetNRoomsX(1);
-    building6->SetNRoomsY(1);
+    // Ptr<Building> building6 = CreateObject<Building>();
+    // building6->SetBoundaries(Box(-30.0, -18.0, 8.0, 20.0, 0.0, 14.0));
+    // building6->SetBuildingType(Building::Residential);
+    // building6->SetExtWallsType(Building::ConcreteWithWindows);
+    // building6->SetNFloors(2);
+    // building6->SetNRoomsX(1);
+    // building6->SetNRoomsY(1);
 
     BuildingsHelper::Install(gnbNodes);
     BuildingsHelper::Install(ueNodes);
@@ -2558,11 +2773,6 @@ main(int argc, char* argv[])
                 DynamicCast<NrMacSchedulerNs3>(gnbNetDev->GetScheduler(bwpId));
             g_dlSchedulers.push_back(sched);
             g_aequitasSchedulers.push_back(DynamicCast<NrMacSchedulerOfdmaAequitas>(sched));
-            if (sched)
-            {
-                sched->TraceConnectWithoutContext("DlBufferReport",
-                                                  MakeCallback(&DlBufferReportTrace));
-            }
             if (g_enableRlMcsControl && sched)
             {
                 sched->SetAttribute("FixedMcsDl", BooleanValue(true));
@@ -2573,6 +2783,8 @@ main(int argc, char* argv[])
             g_totalPrbByBwp.push_back(totalPrb);
         }
     }
+
+    Simulator::Schedule(MilliSeconds(300), &ConnectRlcTxBufferSizeTraces);
 
     for (uint32_t i = 0; i < ueDevs.GetN(); ++i)
     {
@@ -2615,21 +2827,21 @@ main(int argc, char* argv[])
 
     const std::string tgProtocol = "ns3::UdpSocketFactory";
     const uint32_t ftpPacketSize = 1000;
-    const double ftpReadingTimeMeanS = 2.5;
-    const double ftpFileSizeMu = 13.8 + std::log(appLoadScale);
+    const double ftpReadingTimeMeanS = 0.1;
+    // const double effectiveFtpLoadScale = appLoadScale * 0.5;
+    const double ftpFileSizeMu = 12 + std::log(appLoadScale);
     const double ftpFileSizeSigma = 0.3;
     const uint32_t ftpMaxFileSizeBytes =
         static_cast<uint32_t>(std::max(100000.0, 1500000.0 * appLoadScale));
     const uint32_t heavyVideoPacketsPerFrame =
         static_cast<uint32_t>(std::max(1.0, std::round(64.0 * appLoadScale)));
-    const Time heavyVideoInterframe = MilliSeconds(33);
-    const double heavyVideoPacketSizeScale = 700.0 * appLoadScale;
+    const Time heavyVideoInterframe = MilliSeconds(30);
+    const double heavyVideoPacketSizeScale = 1000.0 * appLoadScale;
     const double heavyVideoPacketSizeShape = 1.0;
     const double heavyVideoPacketSizeBound = std::max(200.0, 1600.0 * appLoadScale);
     const double heavyVideoPacketTimeScale = 2.5;
     const double heavyVideoPacketTimeShape = 1.0;
     const double heavyVideoPacketTimeBound = 6.0;
-    const double segmentDurationS = 0.6;
     std::uniform_int_distribution<int> stateDist(0, 2);
     std::uniform_int_distribution<int> phaseDist(0, 2);
 
@@ -2644,21 +2856,13 @@ main(int argc, char* argv[])
         PacketSinkHelper ftpSinkHelper(tgProtocol, InetSocketAddress(Ipv4Address::GetAny(), ftpPort));
         ApplicationContainer ftpSinkApps = ftpSinkHelper.Install(ueNodes.Get(i));
         serverApps.Add(ftpSinkApps);
-        Ptr<PacketSink> ftpSink = DynamicCast<PacketSink>(ftpSinkApps.Get(0));
-        if (ftpSink)
-        {
-            ftpSink->TraceConnectWithoutContext("Rx", MakeBoundCallback(&OnPacketSinkRx, i, LIGHT_HTTP));
-        }
+        ConnectAoiPacketSinkTrace(ftpSinkApps.Get(0), i, LIGHT_HTTP);
 
         const uint16_t videoPort = static_cast<uint16_t>(6000 + i);
         PacketSinkHelper videoSinkHelper(tgProtocol, InetSocketAddress(Ipv4Address::GetAny(), videoPort));
         ApplicationContainer videoSinkApps = videoSinkHelper.Install(ueNodes.Get(i));
         serverApps.Add(videoSinkApps);
-        Ptr<PacketSink> videoSink = DynamicCast<PacketSink>(videoSinkApps.Get(0));
-        if (videoSink)
-        {
-            videoSink->TraceConnectWithoutContext("Rx", MakeBoundCallback(&OnPacketSinkRx, i, HEAVY_VIDEO));
-        }
+        ConnectAoiPacketSinkTrace(videoSinkApps.Get(0), i, HEAVY_VIDEO);
 
         {
             Ptr<NrEpcTft> ftpTft = Create<NrEpcTft>();
@@ -2697,9 +2901,35 @@ main(int argc, char* argv[])
             {
                 continue;
             }
-            const int state = (phase + static_cast<int>(std::floor((segStartS - baseStartS) / segmentDurationS))) % 3;
+            int state = (phase + static_cast<int>(std::floor((segStartS - baseStartS) / segmentDurationS))) % 3;
+            if (appmixStateOverride >= 0)
+            {
+                state = appmixStateOverride;
+            }
             const bool enableFtp = (state == 0 || state == 2);
             const bool enableVideo = (state == 1 || state == 2);
+            if (g_appStateTraceStream && g_appStateTraceStream->is_open() &&
+                i == static_cast<uint32_t>(std::max<int32_t>(0, g_appStateTraceUe)))
+            {
+                std::string stateLabel = "unknown";
+                if (state == 0)
+                {
+                    stateLabel = "ftp_only";
+                }
+                else if (state == 1)
+                {
+                    stateLabel = "video_only";
+                }
+                else if (state == 2)
+                {
+                    stateLabel = "ftp_video";
+                }
+                (*g_appStateTraceStream) << i << "," << state << "," << stateLabel << ","
+                                         << std::fixed << std::setprecision(6) << segStartS << ","
+                                         << segStopS << "," << (enableFtp ? 1 : 0) << ","
+                                         << (enableVideo ? 1 : 0) << "\n";
+                g_appStateTraceStream->flush();
+            }
 
             if (enableFtp)
             {
@@ -2781,6 +3011,11 @@ main(int argc, char* argv[])
             ApplyAequitasInputsToSchedulers();
         }
         Simulator::Schedule(Seconds(g_envStepTime), &ScheduleBaselinePolicyStep);
+    }
+    if ((g_aoiStateTraceStream && g_aoiStateTraceStream->is_open()) ||
+        (g_queueTraceStream && g_queueTraceStream->is_open()))
+    {
+        Simulator::Schedule(Seconds(g_envStepTime), &ScheduleStateTraces);
     }
 
     Simulator::Stop(Seconds(simTime));
@@ -2999,6 +3234,16 @@ main(int argc, char* argv[])
     {
         g_aoiTraceStream->flush();
         g_aoiTraceStream->close();
+    }
+    if (g_aoiStateTraceStream && g_aoiStateTraceStream->is_open())
+    {
+        g_aoiStateTraceStream->flush();
+        g_aoiStateTraceStream->close();
+    }
+    if (g_appStateTraceStream && g_appStateTraceStream->is_open())
+    {
+        g_appStateTraceStream->flush();
+        g_appStateTraceStream->close();
     }
     if (g_burstStateTraceStream && g_burstStateTraceStream->is_open())
     {

@@ -83,7 +83,7 @@ def _per_ue_distribution_summary(metric_values: dict[str, list[float]]) -> dict[
             "min": float(np.min(arr)),
             "p25": float(np.percentile(arr, 25)),
             "p50": float(np.percentile(arr, 50)),
-            "p95": float(np.percentile(arr, 95)),
+            "p75": float(np.percentile(arr, 75)),
             "max": float(np.max(arr)),
         }
     return out
