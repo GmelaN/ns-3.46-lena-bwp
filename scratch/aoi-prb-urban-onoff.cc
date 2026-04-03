@@ -987,6 +987,12 @@ SignedLogScale(double v)
     return 0.0;
 }
 
+static double
+SymmetricUnitNorm(double v)
+{
+    return 2.0 * Clamp01(v) - 1.0;
+}
+
 static void
 RecordIntervalMetrics(uint32_t switchCount)
 {
@@ -1517,10 +1523,14 @@ ScheduleBaselinePolicyStep()
 static Ptr<OpenGymSpace>
 MyGetObservationSpace()
 {
-    const uint32_t featuresPerUe = g_rlDrqnProfile ? 13u : 9u;
+    const uint32_t featuresPerUe = g_rlDrqnProfile ? 13u : 6u;
     uint32_t obsDim = featuresPerUe * static_cast<uint32_t>(g_ueStats.size());
     std::vector<uint32_t> shape = {obsDim};
-    return CreateObject<OpenGymBoxSpace>(-1.0e6f, 1.0e6f, shape, TypeNameGet<float>());
+    if (g_rlDrqnProfile)
+    {
+        return CreateObject<OpenGymBoxSpace>(-1.0e6f, 1.0e6f, shape, TypeNameGet<float>());
+    }
+    return CreateObject<OpenGymBoxSpace>(-2.0f, 2.0f, shape, TypeNameGet<float>());
 }
 
 static Ptr<OpenGymSpace>
@@ -1551,7 +1561,7 @@ MyGetObservation()
 {
     uint32_t numUes = static_cast<uint32_t>(g_ueStats.size());
     RefreshStepSpectralEfficiencyCaches();
-    uint32_t featuresPerUe = g_rlDrqnProfile ? 13u : 9u;
+    uint32_t featuresPerUe = g_rlDrqnProfile ? 13u : 6u;
     std::vector<uint32_t> shape = {featuresPerUe * numUes};
     Ptr<OpenGymBoxContainer<float>> box = CreateObject<OpenGymBoxContainer<float>>(shape);
     auto bwpMetrics = ComputeDrqnLiteBwpMetrics();
@@ -1568,45 +1578,22 @@ MyGetObservation()
             continue;
         }
         double queueBytes = ComputeDlRlcQueueBytes(ueIdx);
-        double prevQueueBytes =
-            (ueIdx < g_prevRewardQueueBytesByUe.size() && g_prevRewardQueueBytesByUe[ueIdx] > 0.0)
-                ? g_prevRewardQueueBytesByUe[ueIdx]
-                : queueBytes;
-        double queueDeltaBytes = queueBytes - prevQueueBytes;
         double cqi = (ueIdx < g_lastCqiByUe.size()) ? g_lastCqiByUe[ueIdx] : 0.0;
         double mcsOffset =
             (ueIdx < g_lastRequestedMcsOffsetByUe.size()) ? g_lastRequestedMcsOffsetByUe[ueIdx] : 0.0;
-        double bwpMode = static_cast<double>(GetCurrentUeBwp(ueIdx) == g_highBwpId ? 1.0 : 0.0);
-        double ueSe =
-            (ueIdx < g_lastStepSpectralEfficiencyByUe.size()) ? g_lastStepSpectralEfficiencyByUe[ueIdx] : 0.0;
-        uint8_t currentBwp = GetCurrentUeBwp(ueIdx);
-        double bwpSe =
-            (currentBwp < g_lastBwpStepSpectralEfficiency.size()) ? g_lastBwpStepSpectralEfficiency[currentBwp] : 0.0;
-        double relSe = ueSe / std::max(1e-6, bwpSe);
-        double recentGoodputMbps =
-            ((ueIdx < g_stepTbBytesByUe.size()) ? static_cast<double>(g_stepTbBytesByUe[ueIdx]) : 0.0) *
-            8.0 / std::max(1e-6, g_envStepTime) / 1.0e6;
-        double dropRate = 0.0;
-        double arrivedBytes = static_cast<double>(ComputeUeStepArrivedBytes(ueIdx));
-        double deliveredBytes = (ueIdx < g_stepTbBytesByUe.size()) ? static_cast<double>(g_stepTbBytesByUe[ueIdx]) : 0.0;
-        if (arrivedBytes > 0.0)
-        {
-            dropRate = Clamp01(std::max(0.0, arrivedBytes - deliveredBytes) / arrivedBytes);
-        }
+        double bwpMode = (GetCurrentUeBwp(ueIdx) == g_highBwpId) ? 1.0 : -1.0;
         double timeSinceLastSwitchMs =
             (ueIdx < g_lastBwpSwitchTimeSByUe.size())
                 ? std::max(0.0, (Simulator::Now().GetSeconds() - g_lastBwpSwitchTimeSByUe[ueIdx]) * 1000.0)
                 : 0.0;
+        double aoiMs = ComputeUeMeanAoiMs(ueIdx);
 
         box->AddValue(static_cast<float>(bwpMode));
-        box->AddValue(static_cast<float>(SignedLogScale(mcsOffset)));
-        box->AddValue(static_cast<float>(LogScaleNonNegative(cqi)));
-        box->AddValue(static_cast<float>(LogScaleNonNegative(queueBytes)));
-        box->AddValue(static_cast<float>(SignedLogScale(queueDeltaBytes)));
-        box->AddValue(static_cast<float>(LogScaleNonNegative(recentGoodputMbps)));
-        box->AddValue(static_cast<float>(LogScaleNonNegative(relSe)));
-        box->AddValue(static_cast<float>(LogScaleNonNegative(dropRate)));
-        box->AddValue(static_cast<float>(LogScaleNonNegative(timeSinceLastSwitchMs)));
+        box->AddValue(static_cast<float>(std::max(-2.0, std::min(2.0, mcsOffset))));
+        box->AddValue(static_cast<float>(SymmetricUnitNorm(cqi / 15.0)));
+        box->AddValue(static_cast<float>(SymmetricUnitNorm(queueBytes / std::max(1.0, g_queueNormBytes))));
+        box->AddValue(static_cast<float>(SymmetricUnitNorm(timeSinceLastSwitchMs / std::max(1.0, g_dqnDelayTargetMs))));
+        box->AddValue(static_cast<float>(SymmetricUnitNorm(aoiMs / std::max(1.0, g_dqnDelayTargetMs))));
     }
     return box;
 }

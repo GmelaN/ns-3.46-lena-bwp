@@ -103,15 +103,14 @@ def _selection_quantiles_from_obs(
         obs_t = obs_t.unsqueeze(0)
 
     # Non-drqn profile state layout:
-    # [current_bwp, signed_log_mcs_offset, log_cqi, log_queue_backlog,
-    #  signed_log_queue_delta, log_recent_goodput, log_rel_se, log_drop_rate,
-    #  log_time_since_last_switch]
-    cqi = torch.expm1(torch.clamp(obs_t[:, 2], min=0.0))
+    # [bwp_mode, mcs_offset, sinr_norm, arrived_bytes_norm, queue_bytes_norm, aoi_norm,
+    #  time_since_last_switch_norm]
+    signal_metric = torch.clamp((obs_t[:, 2] + 1.0) * 0.5 * 15.0, 0.0, 15.0)
 
-    tau = torch.full_like(cqi, float(cfg.risk_quantile_mid))
-    low_mask = cqi < float(cfg.risk_low_cqi_threshold)
+    tau = torch.full_like(signal_metric, float(cfg.risk_quantile_mid))
+    low_mask = signal_metric < float(cfg.risk_low_cqi_threshold)
     tau = torch.where(low_mask, torch.full_like(tau, float(cfg.risk_quantile_low)), tau)
-    high_mask = cqi > float(cfg.risk_mid_cqi_threshold)
+    high_mask = signal_metric > float(cfg.risk_mid_cqi_threshold)
     tau = torch.where(high_mask, torch.full_like(tau, float(cfg.risk_quantile_high)), tau)
     return tau
 

@@ -146,6 +146,7 @@ def main():
     parser.add_argument("--final-train-updates", type=int, default=256)
     parser.add_argument("--min-completed-episodes", type=int, default=1)
     parser.add_argument("--reward-bin-size", type=int, default=300)
+    parser.add_argument("--loss-bin-size", type=int, default=300)
     parser.add_argument("--disable-step-reward-log", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--save-every-episodes", type=int, default=0)
     parser.add_argument("--huber-kappa", type=float, default=1.0)
@@ -170,8 +171,9 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     episode_metrics_path = os.path.join(out_dir, "train_episode_metrics.csv")
     step_reward_log_path = os.path.join(out_dir, "step_reward_log.csv")
-    reward_bin_log_path = os.path.join(out_dir, "train_reward_bins_300.csv")
-    value_loss_log_path = os.path.join(out_dir, "value_loss_300.csv")
+    reward_bin_log_path = os.path.join(out_dir, f"train_reward_bins_{args.reward_bin_size}.csv")
+    value_loss_log_path = os.path.join(out_dir, f"value_loss_{args.loss_bin_size}.csv")
+    gru_loss_log_path = os.path.join(out_dir, f"gru_loss_{args.loss_bin_size}.csv")
     td_quantile_fieldnames = [f"td_abs_q{i:02d}" for i in range(args.num_quantiles)]
     with open(episode_metrics_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
@@ -191,6 +193,12 @@ def main():
             fieldnames=["episode", "global_step_end", "window_steps", "num_updates", "avg_value_loss", *td_quantile_fieldnames],
         )
         writer.writeheader()
+    with open(gru_loss_log_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["episode", "global_step_end", "window_steps", "num_updates", "avg_gru_loss"],
+        )
+        writer.writeheader()
     if not args.disable_step_reward_log:
         with open(step_reward_log_path, "w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(
@@ -204,7 +212,7 @@ def main():
                     "mean_thr_mbps",
                     "mean_aoi_ms",
                     "reward_aoi_penalty_local",
-                    "reward_goodput_term_local",
+                    "reward_service_ratio_local",
                     "reward_aux_term_local",
                     "reward_switch_penalty_local",
                 ],
@@ -265,6 +273,7 @@ def main():
     episode_bin_index = 0
     reward_bin_values: list[float] = []
     value_loss_bin_values: list[float] = []
+    gru_loss_bin_values: list[float] = []
     td_quantile_bin_values: list[list[float]] = []
     recent_rewards: list[float] = []
     loss_history: list[float] = []
@@ -304,7 +313,7 @@ def main():
             "mean_thr_mbps": float(step_info.get("mean_thr_mbps", 0.0)),
             "mean_aoi_ms": float(step_info.get("mean_aoi_ms", 0.0)),
             "reward_aoi_penalty_local": float(step_info.get("reward_aoi_penalty_local", 0.0)),
-            "reward_goodput_term_local": float(step_info.get("reward_goodput_term_local", 0.0)),
+            "reward_service_ratio_local": float(step_info.get("reward_service_ratio_local", 0.0)),
             "reward_aux_term_local": float(step_info.get("reward_aux_term_local", 0.0)),
             "reward_switch_penalty_local": float(step_info.get("reward_switch_penalty_local", 0.0)),
         }
@@ -322,7 +331,7 @@ def main():
                         "mean_thr_mbps",
                         "mean_aoi_ms",
                         "reward_aoi_penalty_local",
-                        "reward_goodput_term_local",
+                        "reward_service_ratio_local",
                         "reward_aux_term_local",
                         "reward_switch_penalty_local",
                     ],
@@ -353,6 +362,8 @@ def main():
                 loss = float(train_stats["loss"])
                 loss_history.append(loss)
                 value_loss_bin_values.append(loss)
+                # RQR-DQN uses a single quantile TD objective; mirror it for GRU loss trend logs.
+                gru_loss_bin_values.append(loss)
                 td_quantile_bin_values.append([float(x) for x in train_stats["quantile_td_abs"]])
 
         if global_step > 0 and global_step % args.target_sync == 0:
@@ -362,12 +373,12 @@ def main():
         hidden = next_hidden.detach()
         global_step += 1
 
-        if global_step % 300 == 0:
+        if global_step % args.loss_bin_size == 0:
             avg_td_quantiles = np.mean(np.asarray(td_quantile_bin_values, dtype=np.float64), axis=0) if td_quantile_bin_values else np.zeros(args.num_quantiles, dtype=np.float64)
             row = {
                 "episode": episode_count + 1,
                 "global_step_end": global_step,
-                "window_steps": 300,
+                "window_steps": args.loss_bin_size,
                 "num_updates": len(value_loss_bin_values),
                 "avg_value_loss": float(sum(value_loss_bin_values) / len(value_loss_bin_values))
                 if value_loss_bin_values
@@ -380,7 +391,24 @@ def main():
                     fieldnames=["episode", "global_step_end", "window_steps", "num_updates", "avg_value_loss", *td_quantile_fieldnames],
                 )
                 writer.writerow(row)
+            with open(gru_loss_log_path, "a", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["episode", "global_step_end", "window_steps", "num_updates", "avg_gru_loss"],
+                )
+                writer.writerow(
+                    {
+                        "episode": episode_count + 1,
+                        "global_step_end": global_step,
+                        "window_steps": args.loss_bin_size,
+                        "num_updates": len(gru_loss_bin_values),
+                        "avg_gru_loss": float(sum(gru_loss_bin_values) / len(gru_loss_bin_values))
+                        if gru_loss_bin_values
+                        else 0.0,
+                    }
+                )
             value_loss_bin_values.clear()
+            gru_loss_bin_values.clear()
             td_quantile_bin_values.clear()
 
         if done:
@@ -446,6 +474,7 @@ def main():
             loss = float(train_stats["loss"])
             loss_history.append(loss)
             value_loss_bin_values.append(loss)
+            gru_loss_bin_values.append(loss)
             td_quantile_bin_values.append([float(x) for x in train_stats["quantile_td_abs"]])
 
     if value_loss_bin_values:
@@ -453,7 +482,7 @@ def main():
         row = {
             "episode": episode_count if episode_count > 0 else 0,
             "global_step_end": global_step,
-            "window_steps": global_step % 300 if global_step % 300 != 0 else 300,
+            "window_steps": global_step % args.loss_bin_size if global_step % args.loss_bin_size != 0 else args.loss_bin_size,
             "num_updates": len(value_loss_bin_values),
             "avg_value_loss": float(sum(value_loss_bin_values) / len(value_loss_bin_values)),
         }
@@ -464,6 +493,20 @@ def main():
                 fieldnames=["episode", "global_step_end", "window_steps", "num_updates", "avg_value_loss", *td_quantile_fieldnames],
             )
             writer.writerow(row)
+        with open(gru_loss_log_path, "a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["episode", "global_step_end", "window_steps", "num_updates", "avg_gru_loss"],
+            )
+            writer.writerow(
+                {
+                    "episode": episode_count if episode_count > 0 else 0,
+                    "global_step_end": global_step,
+                    "window_steps": global_step % args.loss_bin_size if global_step % args.loss_bin_size != 0 else args.loss_bin_size,
+                    "num_updates": len(gru_loss_bin_values),
+                    "avg_gru_loss": float(sum(gru_loss_bin_values) / len(gru_loss_bin_values)),
+                }
+            )
 
     model_path = save_checkpoint(
         out_dir,
@@ -499,6 +542,7 @@ def main():
         "step_reward_log_csv": step_reward_log_path if not args.disable_step_reward_log else "",
         "reward_bin_csv": reward_bin_log_path,
         "value_loss_csv": value_loss_log_path,
+        "gru_loss_csv": gru_loss_log_path,
         "init_model_path": args.init_model_path,
         "save_every_episodes": args.save_every_episodes,
         "episodes_finished": episode_count,

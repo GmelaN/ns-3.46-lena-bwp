@@ -49,6 +49,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -114,6 +115,95 @@ class TxTimeTag : public Tag
     }
 
   private:
+    uint64_t m_txTimeNs{0};
+};
+
+class AoiIdentityTag : public Tag
+{
+  public:
+    static TypeId GetTypeId()
+    {
+        static TypeId tid =
+            TypeId("ns3::AoiIdentityTag").SetParent<Tag>().AddConstructor<AoiIdentityTag>();
+        return tid;
+    }
+
+    TypeId GetInstanceTypeId() const override
+    {
+        return GetTypeId();
+    }
+
+    uint32_t GetSerializedSize() const override
+    {
+        return sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint8_t) + sizeof(uint64_t);
+    }
+
+    void Serialize(TagBuffer i) const override
+    {
+        i.WriteU64(m_packetId);
+        i.WriteU32(m_ueIdx);
+        i.WriteU8(m_trafficType);
+        i.WriteU64(m_txTimeNs);
+    }
+
+    void Deserialize(TagBuffer i) override
+    {
+        m_packetId = i.ReadU64();
+        m_ueIdx = i.ReadU32();
+        m_trafficType = i.ReadU8();
+        m_txTimeNs = i.ReadU64();
+    }
+
+    void Print(std::ostream& os) const override
+    {
+        os << "pkt=" << m_packetId << " ue=" << m_ueIdx << " class="
+           << static_cast<uint32_t>(m_trafficType) << " txNs=" << m_txTimeNs;
+    }
+
+    void SetPacketId(uint64_t packetId)
+    {
+        m_packetId = packetId;
+    }
+
+    uint64_t GetPacketId() const
+    {
+        return m_packetId;
+    }
+
+    void SetUeIdx(uint32_t ueIdx)
+    {
+        m_ueIdx = ueIdx;
+    }
+
+    uint32_t GetUeIdx() const
+    {
+        return m_ueIdx;
+    }
+
+    void SetTrafficType(uint8_t trafficType)
+    {
+        m_trafficType = trafficType;
+    }
+
+    uint8_t GetTrafficType() const
+    {
+        return m_trafficType;
+    }
+
+    void SetTxTime(Time t)
+    {
+        m_txTimeNs = static_cast<uint64_t>(t.GetNanoSeconds());
+    }
+
+    Time GetTxTime() const
+    {
+        return NanoSeconds(m_txTimeNs);
+    }
+
+  private:
+    uint64_t m_packetId{0};
+    uint32_t m_ueIdx{0};
+    uint8_t m_trafficType{0};
     uint64_t m_txTimeNs{0};
 };
 
@@ -220,6 +310,7 @@ static std::vector<double> g_lastBwpSwitchTimeSByUe;
 static std::vector<double> g_rlcDlQueueBytesByUe;
 static std::vector<std::unordered_map<uint8_t, double>> g_rlcDlQueueBytesByUeAndLcid;
 static bool g_rlcTxBufferTraceConnected = false;
+static bool g_rlcAoiLifecycleTraceConnected = false;
 static std::vector<double> g_prevRewardQueueBytesByUe;
 static std::vector<uint8_t> g_currentBwpByUe;
 static std::vector<double> g_switchCooldownUntilSByUe;
@@ -278,6 +369,19 @@ static std::vector<uint64_t> g_prevRewardTxBytesByUe;
 static std::vector<double> g_lastRewardPrevQueueBytesByUe;
 static std::vector<uint64_t> g_lastRewardArrivedBytesByUe;
 static std::vector<uint64_t> g_lastRewardDeliveredBytesByUe;
+static uint64_t g_nextAoiPacketId = 1;
+
+struct OutstandingAoiPacketInfo
+{
+    uint32_t ueIdx{0};
+    uint8_t trafficType{0};
+    uint64_t enqueueTimeNs{0};
+    uint64_t txTimeNs{0};
+};
+
+static std::unordered_map<uint64_t, OutstandingAoiPacketInfo> g_outstandingAoiPacketById;
+static std::vector<std::array<std::multimap<uint64_t, uint64_t>, TRAFFIC_TYPES>> g_outstandingAoiByUeType;
+static std::vector<std::multimap<uint64_t, uint64_t>> g_outstandingAoiByUe;
 static std::vector<uint32_t> g_lastActualSwitchByUe;
 static std::vector<uint32_t> g_nextActualSwitchByUe;
 
@@ -762,7 +866,7 @@ RegisterUeManager(Ptr<NrUeNetDevice> ueDev, uint32_t ueIdx)
 }
 
 static void
-RecordAppRx(uint32_t ueIdx, uint8_t type, Ptr<const Packet> p, Time txTime)
+RecordAppRx(uint32_t ueIdx, uint8_t type, Ptr<const Packet> p, double aoiMs)
 {
     if (ueIdx >= g_ueStats.size() || type >= TRAFFIC_TYPES)
     {
@@ -772,7 +876,6 @@ RecordAppRx(uint32_t ueIdx, uint8_t type, Ptr<const Packet> p, Time txTime)
     st.rxBytes += p->GetSize();
     st.rxPkts++;
     g_rxPacketsByType[ueIdx][type]++;
-    double aoiMs = (Simulator::Now() - txTime).GetMilliSeconds();
     st.aoiSumMs += aoiMs;
     st.aoiSamples++;
     st.lastRxTime = Simulator::Now().GetSeconds();
@@ -812,6 +915,158 @@ TagPacketTx(Ptr<const Packet> p)
 }
 
 static void
+TagAoiIdentity(Ptr<const Packet> p, uint32_t ueIdx, uint8_t type)
+{
+    auto* mutablePacket = const_cast<Packet*>(PeekPointer(p));
+    if (!mutablePacket)
+    {
+        return;
+    }
+    AoiIdentityTag tag;
+    tag.SetPacketId(g_nextAoiPacketId++);
+    tag.SetUeIdx(ueIdx);
+    tag.SetTrafficType(type);
+    tag.SetTxTime(Simulator::Now());
+    mutablePacket->ReplacePacketTag(tag);
+    mutablePacket->AddByteTag(tag, 0, mutablePacket->GetSize());
+}
+
+static bool
+ExtractAoiIdentity(Ptr<const Packet> p,
+                   uint64_t* packetId,
+                   uint32_t* ueIdx,
+                   uint8_t* type,
+                   Time* txTime)
+{
+    if (!p)
+    {
+        return false;
+    }
+    AoiIdentityTag tag;
+    if (!p->PeekPacketTag(tag) && !p->FindFirstMatchingByteTag(tag))
+    {
+        return false;
+    }
+    if (packetId)
+    {
+        *packetId = tag.GetPacketId();
+    }
+    if (ueIdx)
+    {
+        *ueIdx = tag.GetUeIdx();
+    }
+    if (type)
+    {
+        *type = tag.GetTrafficType();
+    }
+    if (txTime)
+    {
+        *txTime = tag.GetTxTime();
+    }
+    return true;
+}
+
+static void
+RegisterOutstandingAoiPacket(uint64_t packetId,
+                             uint32_t ueIdx,
+                             uint8_t type,
+                             Time enqueueTime,
+                             Time txTime)
+{
+    if (type >= TRAFFIC_TYPES || ueIdx >= g_outstandingAoiByUe.size() ||
+        ueIdx >= g_outstandingAoiByUeType.size())
+    {
+        return;
+    }
+    if (g_outstandingAoiPacketById.find(packetId) != g_outstandingAoiPacketById.end())
+    {
+        return;
+    }
+    OutstandingAoiPacketInfo info;
+    info.ueIdx = ueIdx;
+    info.trafficType = type;
+    info.enqueueTimeNs = static_cast<uint64_t>(enqueueTime.GetNanoSeconds());
+    info.txTimeNs = static_cast<uint64_t>(txTime.GetNanoSeconds());
+    g_outstandingAoiPacketById.emplace(packetId, info);
+    g_outstandingAoiByUeType[ueIdx][type].emplace(info.enqueueTimeNs, packetId);
+    g_outstandingAoiByUe[ueIdx].emplace(info.enqueueTimeNs, packetId);
+}
+
+static bool
+UnregisterOutstandingAoiPacket(uint64_t packetId, OutstandingAoiPacketInfo* infoOut = nullptr)
+{
+    auto it = g_outstandingAoiPacketById.find(packetId);
+    if (it == g_outstandingAoiPacketById.end())
+    {
+        return false;
+    }
+    OutstandingAoiPacketInfo info = it->second;
+    if (info.ueIdx < g_outstandingAoiByUeType.size() && info.trafficType < TRAFFIC_TYPES)
+    {
+        auto& byType = g_outstandingAoiByUeType[info.ueIdx][info.trafficType];
+        auto range = byType.equal_range(info.enqueueTimeNs);
+        for (auto rit = range.first; rit != range.second; ++rit)
+        {
+            if (rit->second == packetId)
+            {
+                byType.erase(rit);
+                break;
+            }
+        }
+    }
+    if (info.ueIdx < g_outstandingAoiByUe.size())
+    {
+        auto& byUe = g_outstandingAoiByUe[info.ueIdx];
+        auto range = byUe.equal_range(info.enqueueTimeNs);
+        for (auto rit = range.first; rit != range.second; ++rit)
+        {
+            if (rit->second == packetId)
+            {
+                byUe.erase(rit);
+                break;
+            }
+        }
+    }
+    g_outstandingAoiPacketById.erase(it);
+    if (infoOut)
+    {
+        *infoOut = info;
+    }
+    return true;
+}
+
+static void
+OnRlcEnqueueAoiTrace(Ptr<const Packet> p)
+{
+    uint64_t packetId = 0;
+    uint32_t ueIdx = 0;
+    uint8_t type = 0;
+    Time txTime = Seconds(0);
+    if (!ExtractAoiIdentity(p, &packetId, &ueIdx, &type, &txTime))
+    {
+        return;
+    }
+    RegisterOutstandingAoiPacket(packetId, ueIdx, type, Simulator::Now(), txTime);
+}
+
+static void
+OnRlcFinalDropAoiTrace(Ptr<const Packet> p)
+{
+    uint64_t packetId = 0;
+    if (!ExtractAoiIdentity(p, &packetId, nullptr, nullptr, nullptr))
+    {
+        return;
+    }
+    UnregisterOutstandingAoiPacket(packetId);
+}
+
+static void
+OnDlHarqFinalDropAoiTrace(Ptr<const Packet> p)
+{
+    OnRlcFinalDropAoiTrace(p);
+}
+
+static void
 OnAppTx(uint32_t ueIdx, uint8_t type, Ptr<const Packet> p)
 {
     if (ueIdx >= g_txBytesByType.size() || type >= TRAFFIC_TYPES)
@@ -819,6 +1074,7 @@ OnAppTx(uint32_t ueIdx, uint8_t type, Ptr<const Packet> p)
         return;
     }
     TagPacketTx(p);
+    TagAoiIdentity(p, ueIdx, type);
     g_txBytesByType[ueIdx][type] += p->GetSize();
     g_txPacketsByType[ueIdx][type]++;
 }
@@ -826,16 +1082,39 @@ OnAppTx(uint32_t ueIdx, uint8_t type, Ptr<const Packet> p)
 static void
 OnPacketSinkRx(uint32_t ueIdx, uint8_t type, Ptr<const Packet> p, const Address&)
 {
-    TxTimeTag tag;
-    if (!p->PeekPacketTag(tag) && !p->FindFirstMatchingByteTag(tag))
+    uint64_t packetId = 0;
+    uint32_t taggedUeIdx = ueIdx;
+    uint8_t taggedType = type;
+    Time txTime = Seconds(0);
+    bool haveIdentity = ExtractAoiIdentity(p, &packetId, &taggedUeIdx, &taggedType, &txTime);
+    if (!haveIdentity)
     {
-        if (ueIdx < g_rxMissingTagPacketsByType.size() && type < TRAFFIC_TYPES)
+        TxTimeTag txTag;
+        if (!p->PeekPacketTag(txTag) && !p->FindFirstMatchingByteTag(txTag))
         {
-            g_rxMissingTagPacketsByType[ueIdx][type]++;
+            if (ueIdx < g_rxMissingTagPacketsByType.size() && type < TRAFFIC_TYPES)
+            {
+                g_rxMissingTagPacketsByType[ueIdx][type]++;
+            }
+            return;
         }
+        double aoiMs = (Simulator::Now() - txTag.GetTxTime()).GetMilliSeconds();
+        RecordAppRx(ueIdx, type, p, aoiMs);
         return;
     }
-    RecordAppRx(ueIdx, type, p, tag.GetTxTime());
+    OutstandingAoiPacketInfo info;
+    double aoiMs = 0.0;
+    if (UnregisterOutstandingAoiPacket(packetId, &info))
+    {
+        aoiMs = (Simulator::Now() - NanoSeconds(info.enqueueTimeNs)).GetMilliSeconds();
+        taggedUeIdx = info.ueIdx;
+        taggedType = info.trafficType;
+    }
+    else
+    {
+        aoiMs = (Simulator::Now() - txTime).GetMilliSeconds();
+    }
+    RecordAppRx(taggedUeIdx, taggedType, p, aoiMs);
 }
 
 static void
@@ -939,6 +1218,17 @@ Clamp01(double v)
     return std::max(0.0, std::min(1.0, v));
 }
 
+static double
+GetEffectiveMinSwitchIntervalMs()
+{
+    // If not explicitly configured, derive a practical default from switching delay.
+    if (g_minSwitchIntervalMs > 0.0)
+    {
+        return g_minSwitchIntervalMs;
+    }
+    return std::max(1.0, 10.0 * g_switchDelayMsCfg);
+}
+
 static uint8_t
 GetCurrentUeBwp(uint32_t ueIdx)
 {
@@ -1012,37 +1302,80 @@ ConnectRlcTxBufferSizeTraces()
     g_rlcTxBufferTraceConnected = true;
 }
 
+static void
+ConnectRlcAoiLifecycleTraces()
+{
+    if (g_rlcAoiLifecycleTraceConnected)
+    {
+        return;
+    }
+
+    bool okEnqueue = false;
+    bool okDrop = false;
+    okEnqueue = okEnqueue ||
+                Config::ConnectWithoutContextFailSafe(
+                    "/NodeList/*/DeviceList/*/$ns3::NrGnbNetDevice/NrGnbRrc/UeMap/*/DataRadioBearerMap/*/"
+                    "NrRlc/$ns3::NrRlcUm/TxEnqueue",
+                    MakeCallback(&OnRlcEnqueueAoiTrace));
+    okEnqueue = okEnqueue ||
+                Config::ConnectWithoutContextFailSafe(
+                    "/NodeList/*/DeviceList/*/$ns3::NrGnbNetDevice/NrGnbRrc/UeMap/*/DataRadioBearerMap/*/"
+                    "NrRlc/$ns3::NrRlcAm/TxEnqueue",
+                    MakeCallback(&OnRlcEnqueueAoiTrace));
+    okDrop = okDrop ||
+             Config::ConnectWithoutContextFailSafe(
+                 "/NodeList/*/DeviceList/*/$ns3::NrGnbNetDevice/NrGnbRrc/UeMap/*/DataRadioBearerMap/*/"
+                 "NrRlc/$ns3::NrRlcUm/TxDrop",
+                 MakeCallback(&OnRlcFinalDropAoiTrace));
+    okDrop = okDrop ||
+             Config::ConnectWithoutContextFailSafe(
+                 "/NodeList/*/DeviceList/*/$ns3::NrGnbNetDevice/NrGnbRrc/UeMap/*/DataRadioBearerMap/*/"
+                 "NrRlc/$ns3::NrRlcAm/TxDrop",
+                 MakeCallback(&OnRlcFinalDropAoiTrace));
+
+    if (!(okEnqueue && okDrop))
+    {
+        if (Simulator::Now().GetSeconds() + 0.05 < g_simTime)
+        {
+            Simulator::Schedule(MilliSeconds(50), &ConnectRlcAoiLifecycleTraces);
+        }
+        return;
+    }
+    g_rlcAoiLifecycleTraceConnected = true;
+}
+
 static double
 ComputeCurrentAoiMs(uint32_t ueIdx, uint8_t type)
 {
-    if (ueIdx >= g_lastDeliveredAoiMs.size() || type >= TRAFFIC_TYPES)
+    if (ueIdx >= g_outstandingAoiByUeType.size() || type >= TRAFFIC_TYPES)
     {
         return 0.0;
     }
-    double nowS = Simulator::Now().GetSeconds();
-    double lastRxS = g_lastRxTimeByType[ueIdx][type];
-    if (lastRxS <= 0.0)
+    const auto& outstanding = g_outstandingAoiByUeType[ueIdx][type];
+    if (outstanding.empty())
     {
-        return std::max(0.0, (nowS - g_appStartTime) * 1000.0);
+        return 0.0;
     }
-    double deliveredAoiMs = g_lastDeliveredAoiMs[ueIdx][type];
-    return std::max(0.0, deliveredAoiMs + (nowS - lastRxS) * 1000.0);
+    return std::max(
+        0.0,
+        static_cast<double>((Simulator::Now() - NanoSeconds(outstanding.begin()->first)).GetMilliSeconds()));
 }
 
 static double
 ComputeUeMeanAoiMs(uint32_t ueIdx)
 {
-    if (ueIdx >= g_lastNodeDeliveredAoiMsByUe.size() || ueIdx >= g_lastNodeRxTimeByUe.size())
+    if (ueIdx >= g_outstandingAoiByUe.size())
     {
         return 0.0;
     }
-    double nowS = Simulator::Now().GetSeconds();
-    double lastRxS = g_lastNodeRxTimeByUe[ueIdx];
-    if (lastRxS <= 0.0)
+    const auto& outstanding = g_outstandingAoiByUe[ueIdx];
+    if (outstanding.empty())
     {
-        return std::max(0.0, (nowS - g_appStartTime) * 1000.0);
+        return 0.0;
     }
-    return std::max(0.0, g_lastNodeDeliveredAoiMsByUe[ueIdx] + (nowS - lastRxS) * 1000.0);
+    return std::max(
+        0.0,
+        static_cast<double>((Simulator::Now() - NanoSeconds(outstanding.begin()->first)).GetMilliSeconds()));
 }
 
 static void
@@ -1242,6 +1575,12 @@ SignedLogScale(double v)
         return -std::log1p(-v);
     }
     return 0.0;
+}
+
+static double
+SymmetricUnitNorm(double v)
+{
+    return 2.0 * Clamp01(v) - 1.0;
 }
 
 static void
@@ -1755,10 +2094,14 @@ ScheduleBaselinePolicyStep()
 static Ptr<OpenGymSpace>
 MyGetObservationSpace()
 {
-    const uint32_t featuresPerUe = g_rlDrqnProfile ? 13u : 9u;
+    const uint32_t featuresPerUe = g_rlDrqnProfile ? 13u : 7u;
     uint32_t obsDim = featuresPerUe * static_cast<uint32_t>(g_ueStats.size());
     std::vector<uint32_t> shape = {obsDim};
-    return CreateObject<OpenGymBoxSpace>(-1.0e6f, 1.0e6f, shape, TypeNameGet<float>());
+    if (g_rlDrqnProfile)
+    {
+        return CreateObject<OpenGymBoxSpace>(-1.0e6f, 1.0e6f, shape, TypeNameGet<float>());
+    }
+    return CreateObject<OpenGymBoxSpace>(-2.0f, 2.0f, shape, TypeNameGet<float>());
 }
 
 static Ptr<OpenGymSpace>
@@ -1789,7 +2132,7 @@ MyGetObservation()
 {
     uint32_t numUes = static_cast<uint32_t>(g_ueStats.size());
     RefreshStepSpectralEfficiencyCaches();
-    uint32_t featuresPerUe = g_rlDrqnProfile ? 13u : 9u;
+    uint32_t featuresPerUe = g_rlDrqnProfile ? 13u : 7u;
     std::vector<uint32_t> shape = {featuresPerUe * numUes};
     Ptr<OpenGymBoxContainer<float>> box = CreateObject<OpenGymBoxContainer<float>>(shape);
     auto bwpMetrics = ComputeDrqnLiteBwpMetrics();
@@ -1806,42 +2149,29 @@ MyGetObservation()
             continue;
         }
         double queueBytes = ComputeDlRlcQueueBytes(ueIdx);
-        double cqi = (ueIdx < g_lastCqiByUe.size()) ? g_lastCqiByUe[ueIdx] : 0.0;
+        double arrivedBytes = static_cast<double>(ComputeUeStepArrivedBytes(ueIdx));
         double mcsOffset =
             (ueIdx < g_lastRequestedMcsOffsetByUe.size()) ? g_lastRequestedMcsOffsetByUe[ueIdx] : 0.0;
-        double bwpMode = static_cast<double>(GetCurrentUeBwp(ueIdx) == g_highBwpId ? 1.0 : 0.0);
-        double prevQueueBytes =
-            (ueIdx < g_prevRewardQueueBytesByUe.size()) ? g_prevRewardQueueBytesByUe[ueIdx] : 0.0;
-        double queueDeltaBytes = queueBytes - prevQueueBytes;
-        double deliveredBytes = (ueIdx < g_stepTbBytesByUe.size()) ? static_cast<double>(g_stepTbBytesByUe[ueIdx]) : 0.0;
-        double recentGoodputMbps =
-            deliveredBytes * 8.0 / std::max(1e-6, g_envStepTime) / 1.0e6;
-        double arrivedBytes = static_cast<double>(ComputeUeStepArrivedBytes(ueIdx));
-        double dropRate = 0.0;
-        if (arrivedBytes > 0.0)
-        {
-            dropRate = Clamp01(std::max(0.0, arrivedBytes - deliveredBytes) / arrivedBytes);
-        }
-        double ueSe =
-            (ueIdx < g_lastStepSpectralEfficiencyByUe.size()) ? g_lastStepSpectralEfficiencyByUe[ueIdx] : 0.0;
-        uint8_t currentBwp = GetCurrentUeBwp(ueIdx);
-        double bwpSe =
-            (currentBwp < g_lastBwpStepSpectralEfficiency.size()) ? g_lastBwpStepSpectralEfficiency[currentBwp] : 0.0;
-        double relSe = ueSe / std::max(1e-6, bwpSe);
+        double bwpMode = (GetCurrentUeBwp(ueIdx) == g_highBwpId) ? 1.0 : -1.0;
         double timeSinceLastSwitchMs =
             (ueIdx < g_lastBwpSwitchTimeSByUe.size())
                 ? std::max(0.0, (Simulator::Now().GetSeconds() - g_lastBwpSwitchTimeSByUe[ueIdx]) * 1000.0)
                 : 0.0;
+        double aoiMs = ComputeUeMeanAoiMs(ueIdx);
+        double sinrNorm = 0.0;
+        if (ueIdx < g_lastSinrDbByUe.size())
+        {
+            sinrNorm = Clamp01((g_lastSinrDbByUe[ueIdx] + 10.0) / 40.0);
+        }
 
-        box->AddValue(static_cast<float>(LogScaleNonNegative(bwpMode)));
-        box->AddValue(static_cast<float>(SignedLogScale(mcsOffset)));
-        box->AddValue(static_cast<float>(LogScaleNonNegative(cqi)));
-        box->AddValue(static_cast<float>(LogScaleNonNegative(queueBytes)));
-        box->AddValue(static_cast<float>(SignedLogScale(queueDeltaBytes)));
-        box->AddValue(static_cast<float>(LogScaleNonNegative(recentGoodputMbps)));
-        box->AddValue(static_cast<float>(LogScaleNonNegative(relSe)));
-        box->AddValue(static_cast<float>(LogScaleNonNegative(dropRate)));
-        box->AddValue(static_cast<float>(LogScaleNonNegative(timeSinceLastSwitchMs)));
+        box->AddValue(static_cast<float>(bwpMode));
+        box->AddValue(static_cast<float>(std::max(-2.0, std::min(2.0, mcsOffset))));
+        box->AddValue(static_cast<float>(SymmetricUnitNorm(sinrNorm)));
+        box->AddValue(static_cast<float>(SymmetricUnitNorm(arrivedBytes / std::max(1.0, g_queueNormBytes))));
+        box->AddValue(static_cast<float>(SymmetricUnitNorm(queueBytes / std::max(1.0, g_queueNormBytes))));
+        box->AddValue(static_cast<float>(SymmetricUnitNorm(aoiMs / std::max(1.0, g_dqnDelayTargetMs))));
+        box->AddValue(static_cast<float>(
+            SymmetricUnitNorm(timeSinceLastSwitchMs / GetEffectiveMinSwitchIntervalMs())));
     }
     return box;
 }
@@ -1934,8 +2264,13 @@ MyGetReward()
         uint64_t prevTxBytes = (ueIdx < g_prevRewardTxBytesByUe.size()) ? g_prevRewardTxBytesByUe[ueIdx] : 0u;
         uint64_t arrivedBytesRaw = (currentTxBytes >= prevTxBytes) ? (currentTxBytes - prevTxBytes) : 0u;
         uint64_t deliveredBytesRaw = (ueIdx < g_stepTbBytesByUe.size()) ? g_stepTbBytesByUe[ueIdx] : 0u;
-        double aoiPenalty = -std::log1p(currentAoiMs);
-        double goodputTerm = std::log1p(static_cast<double>(deliveredBytesRaw));
+        double requestedBytes = std::max(0.0, prevQueueBytes) + static_cast<double>(arrivedBytesRaw);
+        double serviceRatio =
+            (requestedBytes > 0.0)
+                ? Clamp01(static_cast<double>(deliveredBytesRaw) / requestedBytes)
+                : 0.0;
+        double aoiPenalty = -Clamp01(currentAoiMs / std::max(1.0, g_dqnDelayTargetMs));
+        double goodputTerm = serviceRatio;
         double auxTerm = 0.0;
         double seReward = 0.0;
         double switchPenalty = 0.0;
@@ -2012,7 +2347,7 @@ MyGetExtraInfo()
         << "switch_reject_uemgr_missing=" << g_lastSwitchRejectUeMgrMissingCount << "|"
         << "mean_thr_mbps=" << meanThrMbps << "|"
         << "reward_aoi_penalty=" << g_lastMeanRewardAoiTerm << "|"
-        << "reward_goodput_term=" << g_lastMeanRewardThrTerm << "|"
+        << "reward_service_ratio_term=" << g_lastMeanRewardThrTerm << "|"
         << "reward_aux_term=" << g_lastMeanRewardPdrTerm << "|"
         << "reward_se_term=" << g_lastMeanRewardSeTerm << "|"
         << "reward_switch_penalty=" << g_lastMeanRewardSwitchPenalty << "|"
@@ -2035,6 +2370,7 @@ MyGetExtraInfo()
         oss << "|ue" << ueIdx << "_thr_mbps=" << ComputeUeThroughputMbps(ueIdx) << "|ue" << ueIdx
             << "_goodput_mbps=" << stepGoodputMbps << "|ue" << ueIdx
             << "_aoi_ms=" << ComputeUeMeanAoiMs(ueIdx) << "|ue" << ueIdx
+            << "_bler=" << ComputeUeStepBler(ueIdx) << "|ue" << ueIdx
             << "_aoi_ftp_ms=" << aoiFtpMs << "|ue" << ueIdx
             << "_aoi_gaming_ms=" << aoiGamingMs << "|ue" << ueIdx
             << "_aoi_video_ms=" << aoiVideoMs << "|ue" << ueIdx
@@ -2449,6 +2785,10 @@ main(int argc, char* argv[])
     g_simTime = simTime;
     g_appStartTime = appStart;
     g_switchDelayMsCfg = switchDelayMs;
+    if (g_minSwitchIntervalMs <= 0.0)
+    {
+        g_minSwitchIntervalMs = std::max(1.0, 10.0 * g_switchDelayMsCfg);
+    }
     g_bwpBaseline = ToLower(g_bwpBaseline);
     g_schedulerPolicy = ToLower(g_schedulerPolicy);
     trafficModel = ToLower(trafficModel);
@@ -2523,6 +2863,10 @@ main(int argc, char* argv[])
     g_lastBwpSwitchTimeSByUe.assign(numUes, 0.0);
     g_rlcDlQueueBytesByUe.assign(numUes, 0.0);
     g_rlcDlQueueBytesByUeAndLcid.assign(numUes, {});
+    g_outstandingAoiByUeType.assign(numUes, {});
+    g_outstandingAoiByUe.assign(numUes, {});
+    g_outstandingAoiPacketById.clear();
+    g_nextAoiPacketId = 1;
     g_prevRewardQueueBytesByUe.assign(numUes, 0.0);
     g_currentBwpByUe.assign(numUes, g_initialBwpId);
     g_switchCooldownUntilSByUe.assign(numUes, 0.0);
@@ -2571,6 +2915,8 @@ main(int argc, char* argv[])
     g_gnbMacs.clear();
     g_pendingBwpSwitchByRnti.clear();
     g_totalPrbByBwp.clear();
+    g_rlcTxBufferTraceConnected = false;
+    g_rlcAoiLifecycleTraceConnected = false;
     g_lastIntervalSwitchCount = 0;
     g_nextIntervalSwitchCount = 0;
     g_lastRequestedBwp0Count = 0;
@@ -2874,6 +3220,8 @@ main(int argc, char* argv[])
             {
                 gnbMac->TraceConnectWithoutContext("DlScheduling",
                                                    MakeCallback(&DlSchedulingTrace));
+                gnbMac->TraceConnectWithoutContext("DlHarqFinalDrop",
+                                                   MakeCallback(&OnDlHarqFinalDropAoiTrace));
             }
             Ptr<NrMacSchedulerNs3> sched =
                 DynamicCast<NrMacSchedulerNs3>(gnbNetDev->GetScheduler(bwpId));
@@ -2891,6 +3239,7 @@ main(int argc, char* argv[])
     }
 
     Simulator::Schedule(MilliSeconds(300), &ConnectRlcTxBufferSizeTraces);
+    Simulator::Schedule(MilliSeconds(300), &ConnectRlcAoiLifecycleTraces);
 
     for (uint32_t i = 0; i < ueDevs.GetN(); ++i)
     {
