@@ -89,17 +89,28 @@ struct PrbStats
 
 struct PerUeTrafficProfile
 {
-    double burstRateMbps{100.0};
-    uint32_t burstPktSize{1200};
-    bool burstRandomize{true};
-    double burstOnMs{180.0};
-    double burstOffMs{120.0};
-    double burstOnMinMs{140.0};
-    double burstOnMaxMs{260.0};
-    double burstOffMinMs{80.0};
-    double burstOffMaxMs{220.0};
-    double backgroundRateKbps{500.0};
-    uint32_t backgroundPktSize{400};
+    // Background (VoIP-like superposition)
+    double backgroundRateKbps{1800.0};
+    uint32_t backgroundPktSize{160};
+    // Bursty classes: HTTP / real-time video / real-time gaming
+    double httpRateMbps{6.0};
+    uint32_t httpPktSize{1000};
+    double httpOnMinMs{40.0};
+    double httpOnMaxMs{120.0};
+    double httpOffMinMs{300.0};
+    double httpOffMaxMs{800.0};
+    double videoRateMbps{4.0};
+    uint32_t videoPktSize{1100};
+    double videoOnMinMs{120.0};
+    double videoOnMaxMs{300.0};
+    double videoOffMinMs{120.0};
+    double videoOffMaxMs{260.0};
+    double gamingRateMbps{1.5};
+    uint32_t gamingPktSize{180};
+    double gamingOnMinMs{20.0};
+    double gamingOnMaxMs{60.0};
+    double gamingOffMinMs{40.0};
+    double gamingOffMaxMs{120.0};
     std::string trafficClass{"legacy"};
 };
 
@@ -122,6 +133,7 @@ static uint8_t g_mcsHighThreshold = 12;
 static uint32_t g_mcsSwitchCount = 5;
 static double g_minSwitchIntervalMs = 0.0;
 static bool g_enableMcsSwitch = false;
+static bool g_enableHarqReTx = true;
 
 struct McsSwitchState
 {
@@ -144,7 +156,7 @@ static uint32_t g_openGymPort = 5555;
 static double g_envStepTime = 0.02; // 20 ms
 static double g_simTime = 2.0;
 static double g_appStartTime = 0.3;
-static double g_switchDelayMsCfg = 0.1;
+static double g_switchDelayMsCfg = 10.0;
 static double g_queueNormBytes = 200000.0;
 static double g_rewardLambdaSwitch = 0.0001;
 static double g_rewardLambdaQueue = 0.20;
@@ -1987,7 +1999,7 @@ main(int argc, char* argv[])
     double simTime = g_simTime;
     double appStart = g_appStartTime;
     double lowFreqHz = 3.5e9;
-    double highFreqHz = 28e9;
+    double highFreqHz = 6e9;
     double lowBandwidthHz = 20e6;
     double highBandwidthHz = 100e6;
     double gnbTxPowerDbm = 40.0;
@@ -1998,20 +2010,27 @@ main(int argc, char* argv[])
     bool enableMobility = true;
     double switchDelayMs = g_switchDelayMsCfg;
 
-    // Bursty traffic
-    double burstRateMbps = 8.0;
-    uint32_t burstPktSize = 1200;
-    double burstOnMs = 180.0;
-    double burstOffMs = 120.0;
-    bool burstRandomize = true;
-    double burstOnMinMs = 140.0;
-    double burstOnMaxMs = 260.0;
-    double burstOffMinMs = 80.0;
-    double burstOffMaxMs = 220.0;
-
-    // Background traffic
-    double backgroundRateKbps = 500.0;
-    uint32_t backgroundPktSize = 500;
+    // Background + burst traffic
+    double backgroundRateKbps = 1800.0;
+    uint32_t backgroundPktSize = 160;
+    double httpRateMbps = 6.0;
+    uint32_t httpPktSize = 1000;
+    double httpOnMinMs = 40.0;
+    double httpOnMaxMs = 120.0;
+    double httpOffMinMs = 300.0;
+    double httpOffMaxMs = 800.0;
+    double videoRateMbps = 4.0;
+    uint32_t videoPktSize = 1100;
+    double videoOnMinMs = 120.0;
+    double videoOnMaxMs = 300.0;
+    double videoOffMinMs = 120.0;
+    double videoOffMaxMs = 260.0;
+    double gamingRateMbps = 1.5;
+    uint32_t gamingPktSize = 180;
+    double gamingOnMinMs = 20.0;
+    double gamingOnMaxMs = 60.0;
+    double gamingOffMinMs = 40.0;
+    double gamingOffMaxMs = 120.0;
     std::string trafficModel = "legacy"; // legacy|mixed
     double mixedLightRatio = 0.4;
     double mixedModerateRatio = 0.4;
@@ -2052,6 +2071,7 @@ main(int argc, char* argv[])
     cmd.AddValue("mcsSwitchCount", "Consecutive MCS samples required to switch", g_mcsSwitchCount);
     cmd.AddValue("minSwitchIntervalMs", "Minimum time between switches (ms)", g_minSwitchIntervalMs);
     cmd.AddValue("enableMcsSwitch", "Enable MCS-based BWP switching", g_enableMcsSwitch);
+    cmd.AddValue("enableHarqReTx", "Enable HARQ retransmissions in the NR scheduler", g_enableHarqReTx);
     cmd.AddValue("switchDelayMs", "BWP switching delay (ms)", switchDelayMs);
     cmd.AddValue("enableOpenGym", "Enable OpenGym interface (ns3-gym)", g_enableOpenGym);
     cmd.AddValue("openGymPort", "OpenGym TCP port", g_openGymPort);
@@ -2106,17 +2126,26 @@ main(int argc, char* argv[])
     cmd.AddValue("dqnAlpha", "Delay weight for latency-sensitive UEs", g_dqnAlpha);
     cmd.AddValue("dqnBeta", "Throughput weight for latency-sensitive UEs", g_dqnBeta);
     cmd.AddValue("rlDrqnProfile", "Use DRQN state/action/reward profile for OpenGym RL", g_rlDrqnProfile);
-    cmd.AddValue("burstRateMbps", "Bursty traffic rate (Mbps) during ON", burstRateMbps);
-    cmd.AddValue("burstPktSize", "Bursty packet size (bytes)", burstPktSize);
-    cmd.AddValue("burstOnMs", "Bursty ON duration (ms)", burstOnMs);
-    cmd.AddValue("burstOffMs", "Bursty OFF duration (ms)", burstOffMs);
-    cmd.AddValue("burstRandomize", "Use randomized burst On/Off durations", burstRandomize);
-    cmd.AddValue("burstOnMinMs", "Random burst ON minimum duration (ms)", burstOnMinMs);
-    cmd.AddValue("burstOnMaxMs", "Random burst ON maximum duration (ms)", burstOnMaxMs);
-    cmd.AddValue("burstOffMinMs", "Random burst OFF minimum duration (ms)", burstOffMinMs);
-    cmd.AddValue("burstOffMaxMs", "Random burst OFF maximum duration (ms)", burstOffMaxMs);
     cmd.AddValue("backgroundRateKbps", "Background traffic rate (Kbps)", backgroundRateKbps);
     cmd.AddValue("backgroundPktSize", "Background packet size (bytes)", backgroundPktSize);
+    cmd.AddValue("httpRateMbps", "HTTP-like burst ON rate (Mbps)", httpRateMbps);
+    cmd.AddValue("httpPktSize", "HTTP-like burst packet size (bytes)", httpPktSize);
+    cmd.AddValue("httpOnMinMs", "HTTP-like burst ON minimum duration (ms)", httpOnMinMs);
+    cmd.AddValue("httpOnMaxMs", "HTTP-like burst ON maximum duration (ms)", httpOnMaxMs);
+    cmd.AddValue("httpOffMinMs", "HTTP-like burst OFF minimum duration (ms)", httpOffMinMs);
+    cmd.AddValue("httpOffMaxMs", "HTTP-like burst OFF maximum duration (ms)", httpOffMaxMs);
+    cmd.AddValue("videoRateMbps", "Video-like burst ON rate (Mbps)", videoRateMbps);
+    cmd.AddValue("videoPktSize", "Video-like burst packet size (bytes)", videoPktSize);
+    cmd.AddValue("videoOnMinMs", "Video-like burst ON minimum duration (ms)", videoOnMinMs);
+    cmd.AddValue("videoOnMaxMs", "Video-like burst ON maximum duration (ms)", videoOnMaxMs);
+    cmd.AddValue("videoOffMinMs", "Video-like burst OFF minimum duration (ms)", videoOffMinMs);
+    cmd.AddValue("videoOffMaxMs", "Video-like burst OFF maximum duration (ms)", videoOffMaxMs);
+    cmd.AddValue("gamingRateMbps", "Gaming-like burst ON rate (Mbps)", gamingRateMbps);
+    cmd.AddValue("gamingPktSize", "Gaming-like burst packet size (bytes)", gamingPktSize);
+    cmd.AddValue("gamingOnMinMs", "Gaming-like burst ON minimum duration (ms)", gamingOnMinMs);
+    cmd.AddValue("gamingOnMaxMs", "Gaming-like burst ON maximum duration (ms)", gamingOnMaxMs);
+    cmd.AddValue("gamingOffMinMs", "Gaming-like burst OFF minimum duration (ms)", gamingOffMinMs);
+    cmd.AddValue("gamingOffMaxMs", "Gaming-like burst OFF maximum duration (ms)", gamingOffMaxMs);
     cmd.AddValue("enableShadowing", "Enable shadowing in pathloss", enableShadowing);
     cmd.AddValue("channelUpdateMs", "3GPP channel model update period (ms)", channelUpdateMs);
     cmd.AddValue("summaryFile", "Append run summary to this file path", summaryFile);
@@ -2466,7 +2495,7 @@ main(int argc, char* argv[])
     {
         nrHelper->SetSchedulerTypeId(NrMacSchedulerOfdmaRR::GetTypeId());
     }
-    nrHelper->SetSchedulerAttribute("EnableHarqReTx", BooleanValue(false));
+    nrHelper->SetSchedulerAttribute("EnableHarqReTx", BooleanValue(g_enableHarqReTx));
     if (g_schedulerPolicy == "aequitas" || g_bwpBaseline == "aequitas")
     {
         nrHelper->SetSchedulerAttribute("EnableMcsSelection",
@@ -2551,9 +2580,11 @@ main(int argc, char* argv[])
         }
     }
 
-    // Application setup: bursty + background per UE
+    // Application setup: background + (HTTP/video/gaming)-like bursts per UE
     ApplicationContainer serverApps;
-    ApplicationContainer burstApps;
+    ApplicationContainer httpApps;
+    ApplicationContainer videoApps;
+    ApplicationContainer gamingApps;
     ApplicationContainer backgroundApps;
 
     Ptr<UniformRandomVariable> startJitter = CreateObject<UniformRandomVariable>();
@@ -2563,17 +2594,26 @@ main(int argc, char* argv[])
     {
         for (uint32_t i = 0; i < numUes; ++i)
         {
-            ueTrafficProfiles[i].burstRateMbps = burstRateMbps;
-            ueTrafficProfiles[i].burstPktSize = burstPktSize;
-            ueTrafficProfiles[i].burstRandomize = burstRandomize;
-            ueTrafficProfiles[i].burstOnMs = burstOnMs;
-            ueTrafficProfiles[i].burstOffMs = burstOffMs;
-            ueTrafficProfiles[i].burstOnMinMs = burstOnMinMs;
-            ueTrafficProfiles[i].burstOnMaxMs = burstOnMaxMs;
-            ueTrafficProfiles[i].burstOffMinMs = burstOffMinMs;
-            ueTrafficProfiles[i].burstOffMaxMs = burstOffMaxMs;
             ueTrafficProfiles[i].backgroundRateKbps = backgroundRateKbps;
             ueTrafficProfiles[i].backgroundPktSize = backgroundPktSize;
+            ueTrafficProfiles[i].httpRateMbps = httpRateMbps;
+            ueTrafficProfiles[i].httpPktSize = httpPktSize;
+            ueTrafficProfiles[i].httpOnMinMs = httpOnMinMs;
+            ueTrafficProfiles[i].httpOnMaxMs = httpOnMaxMs;
+            ueTrafficProfiles[i].httpOffMinMs = httpOffMinMs;
+            ueTrafficProfiles[i].httpOffMaxMs = httpOffMaxMs;
+            ueTrafficProfiles[i].videoRateMbps = videoRateMbps;
+            ueTrafficProfiles[i].videoPktSize = videoPktSize;
+            ueTrafficProfiles[i].videoOnMinMs = videoOnMinMs;
+            ueTrafficProfiles[i].videoOnMaxMs = videoOnMaxMs;
+            ueTrafficProfiles[i].videoOffMinMs = videoOffMinMs;
+            ueTrafficProfiles[i].videoOffMaxMs = videoOffMaxMs;
+            ueTrafficProfiles[i].gamingRateMbps = gamingRateMbps;
+            ueTrafficProfiles[i].gamingPktSize = gamingPktSize;
+            ueTrafficProfiles[i].gamingOnMinMs = gamingOnMinMs;
+            ueTrafficProfiles[i].gamingOnMaxMs = gamingOnMaxMs;
+            ueTrafficProfiles[i].gamingOffMinMs = gamingOffMinMs;
+            ueTrafficProfiles[i].gamingOffMaxMs = gamingOffMaxMs;
             ueTrafficProfiles[i].trafficClass = "legacy";
         }
     }
@@ -2601,58 +2641,101 @@ main(int argc, char* argv[])
             if (rank < numLight)
             {
                 p.trafficClass = "light";
-                p.burstRateMbps = burstRateMbps * 0.6;
-                p.burstPktSize = burstPktSize;
-                p.burstRandomize = true;
-                p.burstOnMinMs = 60.0;
-                p.burstOnMaxMs = 140.0;
-                p.burstOffMinMs = 180.0;
-                p.burstOffMaxMs = 420.0;
-                p.backgroundRateKbps = backgroundRateKbps * 0.4;
+                p.backgroundRateKbps = backgroundRateKbps * 0.8;
                 p.backgroundPktSize = backgroundPktSize;
+                p.httpRateMbps = httpRateMbps * 0.7;
+                p.httpPktSize = httpPktSize;
+                p.httpOnMinMs = 30.0;
+                p.httpOnMaxMs = 90.0;
+                p.httpOffMinMs = 420.0;
+                p.httpOffMaxMs = 1000.0;
+                p.videoRateMbps = videoRateMbps * 0.7;
+                p.videoPktSize = videoPktSize;
+                p.videoOnMinMs = 90.0;
+                p.videoOnMaxMs = 220.0;
+                p.videoOffMinMs = 180.0;
+                p.videoOffMaxMs = 340.0;
+                p.gamingRateMbps = gamingRateMbps * 0.8;
+                p.gamingPktSize = gamingPktSize;
+                p.gamingOnMinMs = 15.0;
+                p.gamingOnMaxMs = 45.0;
+                p.gamingOffMinMs = 60.0;
+                p.gamingOffMaxMs = 150.0;
             }
             else if (rank < numLight + numModerate)
             {
                 p.trafficClass = "moderate";
-                p.burstRateMbps = burstRateMbps;
-                p.burstPktSize = burstPktSize;
-                p.burstRandomize = true;
-                p.burstOnMinMs = burstOnMinMs;
-                p.burstOnMaxMs = burstOnMaxMs;
-                p.burstOffMinMs = burstOffMinMs;
-                p.burstOffMaxMs = burstOffMaxMs;
                 p.backgroundRateKbps = backgroundRateKbps;
                 p.backgroundPktSize = backgroundPktSize;
+                p.httpRateMbps = httpRateMbps;
+                p.httpPktSize = httpPktSize;
+                p.httpOnMinMs = httpOnMinMs;
+                p.httpOnMaxMs = httpOnMaxMs;
+                p.httpOffMinMs = httpOffMinMs;
+                p.httpOffMaxMs = httpOffMaxMs;
+                p.videoRateMbps = videoRateMbps;
+                p.videoPktSize = videoPktSize;
+                p.videoOnMinMs = videoOnMinMs;
+                p.videoOnMaxMs = videoOnMaxMs;
+                p.videoOffMinMs = videoOffMinMs;
+                p.videoOffMaxMs = videoOffMaxMs;
+                p.gamingRateMbps = gamingRateMbps;
+                p.gamingPktSize = gamingPktSize;
+                p.gamingOnMinMs = gamingOnMinMs;
+                p.gamingOnMaxMs = gamingOnMaxMs;
+                p.gamingOffMinMs = gamingOffMinMs;
+                p.gamingOffMaxMs = gamingOffMaxMs;
             }
             else
             {
                 p.trafficClass = "heavy";
-                p.burstRateMbps = burstRateMbps * 1.6;
-                p.burstPktSize = burstPktSize;
-                p.burstRandomize = true;
-                p.burstOnMinMs = 180.0;
-                p.burstOnMaxMs = 340.0;
-                p.burstOffMinMs = 60.0;
-                p.burstOffMaxMs = 180.0;
-                p.backgroundRateKbps = backgroundRateKbps * 1.6;
+                p.backgroundRateKbps = backgroundRateKbps * 1.15;
                 p.backgroundPktSize = backgroundPktSize;
+                p.httpRateMbps = httpRateMbps * 1.25;
+                p.httpPktSize = httpPktSize;
+                p.httpOnMinMs = 40.0;
+                p.httpOnMaxMs = 130.0;
+                p.httpOffMinMs = 220.0;
+                p.httpOffMaxMs = 650.0;
+                p.videoRateMbps = videoRateMbps * 1.25;
+                p.videoPktSize = videoPktSize;
+                p.videoOnMinMs = 140.0;
+                p.videoOnMaxMs = 330.0;
+                p.videoOffMinMs = 90.0;
+                p.videoOffMaxMs = 220.0;
+                p.gamingRateMbps = gamingRateMbps * 1.2;
+                p.gamingPktSize = gamingPktSize;
+                p.gamingOnMinMs = 25.0;
+                p.gamingOnMaxMs = 70.0;
+                p.gamingOffMinMs = 35.0;
+                p.gamingOffMaxMs = 100.0;
             }
-            p.burstOnMs = 0.5 * (p.burstOnMinMs + p.burstOnMaxMs);
-            p.burstOffMs = 0.5 * (p.burstOffMinMs + p.burstOffMaxMs);
         }
     }
 
     for (uint32_t i = 0; i < numUes; ++i)
     {
         const auto& traffic = ueTrafficProfiles[i];
-        uint16_t burstPort = 5000 + i;
-        uint16_t bgPort = 6000 + i;
+        uint16_t httpPort = 5000 + i;
+        uint16_t videoPort = 6000 + i;
+        uint16_t gamingPort = 7000 + i;
+        uint16_t bgPort = 8000 + i;
 
-        PacketSinkHelper burstSinkHelper("ns3::UdpSocketFactory",
-                                         InetSocketAddress(Ipv4Address::GetAny(), burstPort));
-        burstSinkHelper.SetAttribute("EnableSeqTsSizeHeader", BooleanValue(true));
-        ApplicationContainer burstSinkApp = burstSinkHelper.Install(ueNodes.Get(i));
-        serverApps.Add(burstSinkApp);
+        PacketSinkHelper httpSinkHelper("ns3::UdpSocketFactory",
+                                        InetSocketAddress(Ipv4Address::GetAny(), httpPort));
+        httpSinkHelper.SetAttribute("EnableSeqTsSizeHeader", BooleanValue(true));
+        ApplicationContainer httpSinkApp = httpSinkHelper.Install(ueNodes.Get(i));
+        serverApps.Add(httpSinkApp);
+        PacketSinkHelper videoSinkHelper("ns3::UdpSocketFactory",
+                                         InetSocketAddress(Ipv4Address::GetAny(), videoPort));
+        videoSinkHelper.SetAttribute("EnableSeqTsSizeHeader", BooleanValue(true));
+        ApplicationContainer videoSinkApp = videoSinkHelper.Install(ueNodes.Get(i));
+        serverApps.Add(videoSinkApp);
+        PacketSinkHelper gamingSinkHelper("ns3::UdpSocketFactory",
+                                          InetSocketAddress(Ipv4Address::GetAny(), gamingPort));
+        gamingSinkHelper.SetAttribute("EnableSeqTsSizeHeader", BooleanValue(true));
+        ApplicationContainer gamingSinkApp = gamingSinkHelper.Install(ueNodes.Get(i));
+        serverApps.Add(gamingSinkApp);
 
         PacketSinkHelper bgSinkHelper("ns3::UdpSocketFactory",
                                       InetSocketAddress(Ipv4Address::GetAny(), bgPort));
@@ -2660,13 +2743,27 @@ main(int argc, char* argv[])
         ApplicationContainer bgSinkApp = bgSinkHelper.Install(ueNodes.Get(i));
         serverApps.Add(bgSinkApp);
 
-        Ptr<NrEpcTft> burstTft = Create<NrEpcTft>();
-        NrEpcTft::PacketFilter burstPf;
-        burstPf.localPortStart = burstPort;
-        burstPf.localPortEnd = burstPort;
-        burstTft->Add(burstPf);
-        NrEpsBearer burstBearer(NrEpsBearer::NGBR_LOW_LAT_EMBB);
-        nrHelper->ActivateDedicatedEpsBearer(ueDevs.Get(i), burstBearer, burstTft);
+        Ptr<NrEpcTft> httpTft = Create<NrEpcTft>();
+        NrEpcTft::PacketFilter httpPf;
+        httpPf.localPortStart = httpPort;
+        httpPf.localPortEnd = httpPort;
+        httpTft->Add(httpPf);
+        NrEpsBearer httpBearer(NrEpsBearer::NGBR_LOW_LAT_EMBB);
+        nrHelper->ActivateDedicatedEpsBearer(ueDevs.Get(i), httpBearer, httpTft);
+        Ptr<NrEpcTft> videoTft = Create<NrEpcTft>();
+        NrEpcTft::PacketFilter videoPf;
+        videoPf.localPortStart = videoPort;
+        videoPf.localPortEnd = videoPort;
+        videoTft->Add(videoPf);
+        NrEpsBearer videoBearer(NrEpsBearer::NGBR_LOW_LAT_EMBB);
+        nrHelper->ActivateDedicatedEpsBearer(ueDevs.Get(i), videoBearer, videoTft);
+        Ptr<NrEpcTft> gamingTft = Create<NrEpcTft>();
+        NrEpcTft::PacketFilter gamingPf;
+        gamingPf.localPortStart = gamingPort;
+        gamingPf.localPortEnd = gamingPort;
+        gamingTft->Add(gamingPf);
+        NrEpsBearer gamingBearer(NrEpsBearer::NGBR_LOW_LAT_EMBB);
+        nrHelper->ActivateDedicatedEpsBearer(ueDevs.Get(i), gamingBearer, gamingTft);
 
         Ptr<NrEpcTft> bgTft = Create<NrEpcTft>();
         NrEpcTft::PacketFilter bgPf;
@@ -2676,37 +2773,51 @@ main(int argc, char* argv[])
         NrEpsBearer bgBearer(NrEpsBearer::NGBR_LOW_LAT_EMBB);
         nrHelper->ActivateDedicatedEpsBearer(ueDevs.Get(i), bgBearer, bgTft);
 
-        OnOffHelper burst("ns3::UdpSocketFactory",
-                          InetSocketAddress(ueIfaces.GetAddress(i), burstPort));
-        burst.SetAttribute("DataRate", DataRateValue(DataRate(traffic.burstRateMbps * 1e6)));
-        burst.SetAttribute("PacketSize", UintegerValue(traffic.burstPktSize));
-        if (traffic.burstRandomize)
-        {
-            double onMinS = std::max(1e-3, traffic.burstOnMinMs / 1000.0);
-            double onMaxS = std::max(onMinS, traffic.burstOnMaxMs / 1000.0);
-            double offMinS = std::max(1e-3, traffic.burstOffMinMs / 1000.0);
-            double offMaxS = std::max(offMinS, traffic.burstOffMaxMs / 1000.0);
-            burst.SetAttribute("OnTime",
-                               StringValue("ns3::UniformRandomVariable[Min=" +
-                                           std::to_string(onMinS) + "|Max=" +
-                                           std::to_string(onMaxS) + "]"));
-            burst.SetAttribute("OffTime",
-                               StringValue("ns3::UniformRandomVariable[Min=" +
-                                           std::to_string(offMinS) + "|Max=" +
-                                           std::to_string(offMaxS) + "]"));
-        }
-        else
-        {
-            burst.SetAttribute("OnTime",
-                               StringValue("ns3::ConstantRandomVariable[Constant=" +
-                                           std::to_string(traffic.burstOnMs / 1000.0) + "]"));
-            burst.SetAttribute("OffTime",
-                               StringValue("ns3::ConstantRandomVariable[Constant=" +
-                                           std::to_string(traffic.burstOffMs / 1000.0) + "]"));
-        }
-        burst.SetAttribute("EnableSeqTsSizeHeader", BooleanValue(true));
-        ApplicationContainer burstApp = burst.Install(remoteHost);
-        burstApps.Add(burstApp);
+        auto makeBurstApp = [&](uint16_t port,
+                                double rateMbps,
+                                uint32_t pktSize,
+                                double onMinMs,
+                                double onMaxMs,
+                                double offMinMs,
+                                double offMaxMs) {
+            OnOffHelper app("ns3::UdpSocketFactory", InetSocketAddress(ueIfaces.GetAddress(i), port));
+            app.SetAttribute("DataRate", DataRateValue(DataRate(rateMbps * 1e6)));
+            app.SetAttribute("PacketSize", UintegerValue(pktSize));
+            app.SetAttribute("OnTime",
+                             StringValue("ns3::UniformRandomVariable[Min=" +
+                                         std::to_string(std::max(1e-3, onMinMs / 1000.0)) + "|Max=" +
+                                         std::to_string(std::max(onMinMs, onMaxMs) / 1000.0) + "]"));
+            app.SetAttribute("OffTime",
+                             StringValue("ns3::UniformRandomVariable[Min=" +
+                                         std::to_string(std::max(1e-3, offMinMs / 1000.0)) + "|Max=" +
+                                         std::to_string(std::max(offMinMs, offMaxMs) / 1000.0) + "]"));
+            app.SetAttribute("EnableSeqTsSizeHeader", BooleanValue(true));
+            return app.Install(remoteHost);
+        };
+        ApplicationContainer httpApp = makeBurstApp(httpPort,
+                                                    traffic.httpRateMbps,
+                                                    traffic.httpPktSize,
+                                                    traffic.httpOnMinMs,
+                                                    traffic.httpOnMaxMs,
+                                                    traffic.httpOffMinMs,
+                                                    traffic.httpOffMaxMs);
+        ApplicationContainer videoApp = makeBurstApp(videoPort,
+                                                     traffic.videoRateMbps,
+                                                     traffic.videoPktSize,
+                                                     traffic.videoOnMinMs,
+                                                     traffic.videoOnMaxMs,
+                                                     traffic.videoOffMinMs,
+                                                     traffic.videoOffMaxMs);
+        ApplicationContainer gamingApp = makeBurstApp(gamingPort,
+                                                      traffic.gamingRateMbps,
+                                                      traffic.gamingPktSize,
+                                                      traffic.gamingOnMinMs,
+                                                      traffic.gamingOnMaxMs,
+                                                      traffic.gamingOffMinMs,
+                                                      traffic.gamingOffMaxMs);
+        httpApps.Add(httpApp);
+        videoApps.Add(videoApp);
+        gamingApps.Add(gamingApp);
 
         OnOffHelper bg("ns3::UdpSocketFactory",
                        InetSocketAddress(ueIfaces.GetAddress(i), bgPort));
@@ -2720,14 +2831,26 @@ main(int argc, char* argv[])
         ApplicationContainer bgApp = bg.Install(remoteHost);
         backgroundApps.Add(bgApp);
 
-        Ptr<Application> burstSrc = burstApp.Get(0);
+        Ptr<Application> httpSrc = httpApp.Get(0);
+        Ptr<Application> videoSrc = videoApp.Get(0);
+        Ptr<Application> gamingSrc = gamingApp.Get(0);
         Ptr<Application> bgSrc = bgApp.Get(0);
-        if (burstSrc)
+        if (httpSrc)
         {
-            burstSrc->TraceConnectWithoutContext("TxWithSeqTsSize",
+            httpSrc->TraceConnectWithoutContext("TxWithSeqTsSize",
+                                                MakeBoundCallback(&TxWithSeqTsSize, i, BURST));
+        }
+        if (videoSrc)
+        {
+            videoSrc->TraceConnectWithoutContext("TxWithSeqTsSize",
                                                  MakeBoundCallback(&TxWithSeqTsSize, i, BURST));
-            burstSrc->TraceConnectWithoutContext("OnOffState",
+            videoSrc->TraceConnectWithoutContext("OnOffState",
                                                  MakeBoundCallback(&BurstOnOffStateTrace, i));
+        }
+        if (gamingSrc)
+        {
+            gamingSrc->TraceConnectWithoutContext("TxWithSeqTsSize",
+                                                  MakeBoundCallback(&TxWithSeqTsSize, i, BURST));
         }
         if (bgSrc)
         {
@@ -2735,12 +2858,24 @@ main(int argc, char* argv[])
                                               MakeBoundCallback(&TxWithSeqTsSize, i, BACKGROUND));
         }
 
-        Ptr<PacketSink> burstSink = DynamicCast<PacketSink>(burstSinkApp.Get(0));
+        Ptr<PacketSink> httpSink = DynamicCast<PacketSink>(httpSinkApp.Get(0));
+        Ptr<PacketSink> videoSink = DynamicCast<PacketSink>(videoSinkApp.Get(0));
+        Ptr<PacketSink> gamingSink = DynamicCast<PacketSink>(gamingSinkApp.Get(0));
         Ptr<PacketSink> bgSink = DynamicCast<PacketSink>(bgSinkApp.Get(0));
-        if (burstSink)
+        if (httpSink)
         {
-            burstSink->TraceConnectWithoutContext("RxWithSeqTsSize",
+            httpSink->TraceConnectWithoutContext("RxWithSeqTsSize",
+                                                 MakeBoundCallback(&RxWithSeqTsSize, i, BURST));
+        }
+        if (videoSink)
+        {
+            videoSink->TraceConnectWithoutContext("RxWithSeqTsSize",
                                                   MakeBoundCallback(&RxWithSeqTsSize, i, BURST));
+        }
+        if (gamingSink)
+        {
+            gamingSink->TraceConnectWithoutContext("RxWithSeqTsSize",
+                                                   MakeBoundCallback(&RxWithSeqTsSize, i, BURST));
         }
         if (bgSink)
         {
@@ -2751,13 +2886,21 @@ main(int argc, char* argv[])
         double jitter = startJitter->GetInteger(0, startJitterMs) / 1000.0;
         Time startTime = Seconds(appStart + jitter);
         Time stopTime = Seconds(simTime);
-        burstApp.Start(startTime);
-        burstApp.Stop(stopTime);
+        httpApp.Start(startTime);
+        httpApp.Stop(stopTime);
+        videoApp.Start(startTime);
+        videoApp.Stop(stopTime);
+        gamingApp.Start(startTime);
+        gamingApp.Stop(stopTime);
         bgApp.Start(startTime);
         bgApp.Stop(stopTime);
 
-        burstSinkApp.Start(Seconds(appStart * 0.5));
-        burstSinkApp.Stop(stopTime);
+        httpSinkApp.Start(Seconds(appStart * 0.5));
+        httpSinkApp.Stop(stopTime);
+        videoSinkApp.Start(Seconds(appStart * 0.5));
+        videoSinkApp.Stop(stopTime);
+        gamingSinkApp.Start(Seconds(appStart * 0.5));
+        gamingSinkApp.Stop(stopTime);
         bgSinkApp.Start(Seconds(appStart * 0.5));
         bgSinkApp.Stop(stopTime);
     }
@@ -2921,8 +3064,10 @@ main(int argc, char* argv[])
             out << std::fixed << std::setprecision(6);
             out << "simTime=" << simTime << ",appStart=" << appStart << ",numUes=" << numUes
                 << ",bwpBaseline=" << g_bwpBaseline << ",trafficModel=" << trafficModel
-                << ",burstRateMbps=" << burstRateMbps
                 << ",backgroundRateKbps=" << backgroundRateKbps
+                << ",httpRateMbps=" << httpRateMbps
+                << ",videoRateMbps=" << videoRateMbps
+                << ",gamingRateMbps=" << gamingRateMbps
                 << ",duration=" << duration << ",avgMcs=" << avgMcsAll << ",bler=" << blerAll
                 << ",avgTbler=" << avgTblerAll << ",runMeanThrMbps=" << runMeanThrMbps
                 << ",runMeanAoiMs=" << runMeanAoiMs

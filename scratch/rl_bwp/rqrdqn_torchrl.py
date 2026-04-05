@@ -104,7 +104,7 @@ def _selection_quantiles_from_obs(
 
     # Non-drqn profile state layout:
     # [bwp_mode, mcs_offset, sinr_norm, arrived_bytes_norm, queue_bytes_norm, aoi_norm,
-    #  time_since_last_switch_norm]
+    #  in_flight_bytes_norm, time_since_last_delivery_norm]
     signal_metric = torch.clamp((obs_t[:, 2] + 1.0) * 0.5 * 15.0, 0.0, 15.0)
 
     tau = torch.full_like(signal_metric, float(cfg.risk_quantile_mid))
@@ -135,8 +135,7 @@ def select_action(
     obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
     with torch.no_grad():
         quantiles, next_hidden = net.forward_step(obs_t, hidden)
-        selection_quantile = _selection_quantiles_from_obs(obs_t, cfg, device)
-        q = net.lower_quantile_values(quantiles, selection_quantile)
+        q = net.q_values(quantiles)
     if np.random.random() < epsilon:
         action = int(np.random.randint(0, net.action_dim))
     else:
@@ -235,8 +234,7 @@ def train_batch(
             pred_quantiles = quantiles_t[batch_idx, action[:, t], :]
             with torch.no_grad():
                 next_quantiles_online, _ = online_net.forward_step(next_obs[:, t, :], h_online_next)
-                next_selection_quantile = _selection_quantiles_from_obs(next_obs[:, t, :], cfg, device)
-                next_q_online = online_net.lower_quantile_values(next_quantiles_online, next_selection_quantile)
+                next_q_online = online_net.q_values(next_quantiles_online)
                 next_action = torch.argmax(next_q_online, dim=-1)
                 next_quantiles_target, _ = target_net.forward_step(next_obs[:, t, :], h_target_next)
                 target_quantiles = next_quantiles_target[batch_idx, next_action, :]

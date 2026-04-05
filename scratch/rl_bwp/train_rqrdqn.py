@@ -265,7 +265,11 @@ def main():
     optimizer = torch.optim.Adam(online_net.parameters(), lr=args.learning_rate)
     replay = make_replay_buffer(args.replay_capacity)
 
-    hidden = online_net.zero_hidden(1, device)
+    if args.shared_per_ue:
+        hidden_bank = online_net.zero_hidden(cfg.num_ues, device)
+        current_ue_idx = 0
+    else:
+        hidden = online_net.zero_hidden(1, device)
     episode_transitions: list[dict] = []
     global_step = 0
     episode_count = 0
@@ -281,10 +285,14 @@ def main():
 
     while global_step < effective_total_env_steps:
         epsilon = epsilon_by_step(q_cfg, global_step)
+        if args.shared_per_ue:
+            hidden_in = hidden_bank[current_ue_idx : current_ue_idx + 1]
+        else:
+            hidden_in = hidden
         action, next_hidden = select_action(
             online_net,
             obs,
-            hidden,
+            hidden_in,
             epsilon,
             device,
             q_cfg,
@@ -292,6 +300,8 @@ def main():
         next_obs, reward, terminated, truncated, step_info = env.step(action)
         last_step_info = dict(step_info)
         done = bool(terminated or truncated)
+        forced_episode_end = bool(episode_step_budget > 0 and episode_step + 1 >= episode_step_budget)
+        episode_end = bool(done or forced_episode_end)
         next_obs = next_obs.astype("float32")
         episode_transitions.append(
             {
@@ -299,7 +309,7 @@ def main():
                 "action": int(action),
                 "reward": float(reward),
                 "next_obs": next_obs.copy(),
-                "done": done,
+                "done": episode_end,
             }
         )
         recent_rewards.append(float(reward))
@@ -370,7 +380,14 @@ def main():
             target_net.load_state_dict(online_net.state_dict())
 
         obs = next_obs
-        hidden = next_hidden.detach()
+        if args.shared_per_ue:
+            acted_ue_idx = int(step_info.get("ue_index", current_ue_idx))
+            if acted_ue_idx < 0 or acted_ue_idx >= cfg.num_ues:
+                acted_ue_idx = current_ue_idx
+            hidden_bank[acted_ue_idx] = next_hidden.detach().squeeze(0)
+            current_ue_idx = (acted_ue_idx + 1) % cfg.num_ues
+        else:
+            hidden = next_hidden.detach()
         global_step += 1
 
         if global_step % args.loss_bin_size == 0:
@@ -411,7 +428,7 @@ def main():
             gru_loss_bin_values.clear()
             td_quantile_bin_values.clear()
 
-        if done:
+        if episode_end:
             for seq_td in episode_to_sequences(episode_transitions, args.seq_len):
                 replay.add(seq_td)
             episode_transitions.clear()
@@ -448,7 +465,11 @@ def main():
                 reward_bin_values.clear()
             obs, _ = env.reset()
             obs = obs.astype("float32")
-            hidden = online_net.zero_hidden(1, device)
+            if args.shared_per_ue:
+                hidden_bank = online_net.zero_hidden(cfg.num_ues, device)
+                current_ue_idx = 0
+            else:
+                hidden = online_net.zero_hidden(1, device)
             episode_step = 0
             episode_bin_index = 0
             if args.save_every_episodes > 0 and episode_count % args.save_every_episodes == 0:

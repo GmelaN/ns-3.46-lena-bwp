@@ -318,6 +318,8 @@ static std::vector<uint64_t> g_stepAssignedPrbByUe;
 static std::vector<uint64_t> g_stepTbBytesByUe;
 static std::vector<uint64_t> g_stepTbCountByUe;
 static std::vector<uint64_t> g_stepTbErrorByUe;
+static std::vector<uint64_t> g_outstandingAoiBytesByUe;
+static std::vector<uint64_t> g_lastDeliveryTimeNsByUe;
 static std::vector<uint64_t> g_lastStepAssignedPrbByUe;
 static std::vector<double> g_lastStepSpectralEfficiencyByUe;
 static std::vector<double> g_lastBwpStepSpectralEfficiency;
@@ -377,6 +379,7 @@ struct OutstandingAoiPacketInfo
     uint8_t trafficType{0};
     uint64_t enqueueTimeNs{0};
     uint64_t txTimeNs{0};
+    uint32_t packetBytes{0};
 };
 
 static std::unordered_map<uint64_t, OutstandingAoiPacketInfo> g_outstandingAoiPacketById;
@@ -971,7 +974,8 @@ RegisterOutstandingAoiPacket(uint64_t packetId,
                              uint32_t ueIdx,
                              uint8_t type,
                              Time enqueueTime,
-                             Time txTime)
+                             Time txTime,
+                             uint32_t packetBytes)
 {
     if (type >= TRAFFIC_TYPES || ueIdx >= g_outstandingAoiByUe.size() ||
         ueIdx >= g_outstandingAoiByUeType.size())
@@ -987,9 +991,14 @@ RegisterOutstandingAoiPacket(uint64_t packetId,
     info.trafficType = type;
     info.enqueueTimeNs = static_cast<uint64_t>(enqueueTime.GetNanoSeconds());
     info.txTimeNs = static_cast<uint64_t>(txTime.GetNanoSeconds());
+    info.packetBytes = packetBytes;
     g_outstandingAoiPacketById.emplace(packetId, info);
     g_outstandingAoiByUeType[ueIdx][type].emplace(info.enqueueTimeNs, packetId);
     g_outstandingAoiByUe[ueIdx].emplace(info.enqueueTimeNs, packetId);
+    if (ueIdx < g_outstandingAoiBytesByUe.size())
+    {
+        g_outstandingAoiBytesByUe[ueIdx] += static_cast<uint64_t>(packetBytes);
+    }
 }
 
 static bool
@@ -1027,6 +1036,18 @@ UnregisterOutstandingAoiPacket(uint64_t packetId, OutstandingAoiPacketInfo* info
             }
         }
     }
+    if (info.ueIdx < g_outstandingAoiBytesByUe.size())
+    {
+        uint64_t bytes = static_cast<uint64_t>(info.packetBytes);
+        if (g_outstandingAoiBytesByUe[info.ueIdx] >= bytes)
+        {
+            g_outstandingAoiBytesByUe[info.ueIdx] -= bytes;
+        }
+        else
+        {
+            g_outstandingAoiBytesByUe[info.ueIdx] = 0u;
+        }
+    }
     g_outstandingAoiPacketById.erase(it);
     if (infoOut)
     {
@@ -1046,7 +1067,13 @@ OnRlcEnqueueAoiTrace(Ptr<const Packet> p)
     {
         return;
     }
-    RegisterOutstandingAoiPacket(packetId, ueIdx, type, Simulator::Now(), txTime);
+    RegisterOutstandingAoiPacket(
+        packetId,
+        ueIdx,
+        type,
+        Simulator::Now(),
+        txTime,
+        p ? static_cast<uint32_t>(p->GetSize()) : 0u);
 }
 
 static void
@@ -1099,6 +1126,10 @@ OnPacketSinkRx(uint32_t ueIdx, uint8_t type, Ptr<const Packet> p, const Address&
             return;
         }
         double aoiMs = (Simulator::Now() - txTag.GetTxTime()).GetMilliSeconds();
+        if (ueIdx < g_lastDeliveryTimeNsByUe.size())
+        {
+            g_lastDeliveryTimeNsByUe[ueIdx] = static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
+        }
         RecordAppRx(ueIdx, type, p, aoiMs);
         return;
     }
@@ -1113,6 +1144,10 @@ OnPacketSinkRx(uint32_t ueIdx, uint8_t type, Ptr<const Packet> p, const Address&
     else
     {
         aoiMs = (Simulator::Now() - txTime).GetMilliSeconds();
+    }
+    if (taggedUeIdx < g_lastDeliveryTimeNsByUe.size())
+    {
+        g_lastDeliveryTimeNsByUe[taggedUeIdx] = static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
     }
     RecordAppRx(taggedUeIdx, taggedType, p, aoiMs);
 }
@@ -1376,6 +1411,32 @@ ComputeUeMeanAoiMs(uint32_t ueIdx)
     return std::max(
         0.0,
         static_cast<double>((Simulator::Now() - NanoSeconds(outstanding.begin()->first)).GetMilliSeconds()));
+}
+
+static double
+ComputeOutstandingAoiBytes(uint32_t ueIdx)
+{
+    if (ueIdx >= g_outstandingAoiBytesByUe.size())
+    {
+        return 0.0;
+    }
+    return static_cast<double>(g_outstandingAoiBytesByUe[ueIdx]);
+}
+
+static double
+ComputeTimeSinceLastDeliveryMs(uint32_t ueIdx)
+{
+    if (ueIdx >= g_lastDeliveryTimeNsByUe.size())
+    {
+        return 0.0;
+    }
+    uint64_t nowNs = static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
+    uint64_t lastNs = g_lastDeliveryTimeNsByUe[ueIdx];
+    if (nowNs <= lastNs)
+    {
+        return 0.0;
+    }
+    return static_cast<double>((nowNs - lastNs) / 1000000.0);
 }
 
 static void
@@ -1948,7 +2009,8 @@ BuildDqnStateFromHistory(uint32_t ueIdx)
 static double
 ComputeDrqnLiteReward(uint32_t ueIdx)
 {
-    double delayNorm = Clamp01(ComputeUeMeanAoiMs(ueIdx) / std::max(1.0, g_dqnDelayTargetMs));
+    double delayNorm =
+        std::log1p(std::max(0.0, ComputeUeMeanAoiMs(ueIdx))) / std::log1p(std::max(1.0, g_dqnDelayTargetMs));
     double thrNorm = Clamp01(ComputeUeThroughputMbps(ueIdx) / std::max(1e-6, g_dqnThrTargetMbps));
 
     uint32_t numUes = static_cast<uint32_t>(g_ueStats.size());
@@ -1962,7 +2024,8 @@ ComputeDrqnLiteReward(uint32_t ueIdx)
 static double
 ComputeDqnReward(uint32_t ueIdx)
 {
-    double delayNorm = Clamp01(ComputeUeMeanAoiMs(ueIdx) / std::max(1.0, g_dqnDelayTargetMs));
+    double delayNorm =
+        std::log1p(std::max(0.0, ComputeUeMeanAoiMs(ueIdx))) / std::log1p(std::max(1.0, g_dqnDelayTargetMs));
     double thrNorm = Clamp01(ComputeUeThroughputMbps(ueIdx) / std::max(1e-6, g_dqnThrTargetMbps));
 
     uint32_t numUes = static_cast<uint32_t>(g_ueStats.size());
@@ -2094,7 +2157,7 @@ ScheduleBaselinePolicyStep()
 static Ptr<OpenGymSpace>
 MyGetObservationSpace()
 {
-    const uint32_t featuresPerUe = g_rlDrqnProfile ? 13u : 7u;
+    const uint32_t featuresPerUe = g_rlDrqnProfile ? 13u : 8u;
     uint32_t obsDim = featuresPerUe * static_cast<uint32_t>(g_ueStats.size());
     std::vector<uint32_t> shape = {obsDim};
     if (g_rlDrqnProfile)
@@ -2132,7 +2195,7 @@ MyGetObservation()
 {
     uint32_t numUes = static_cast<uint32_t>(g_ueStats.size());
     RefreshStepSpectralEfficiencyCaches();
-    uint32_t featuresPerUe = g_rlDrqnProfile ? 13u : 7u;
+    uint32_t featuresPerUe = g_rlDrqnProfile ? 13u : 8u;
     std::vector<uint32_t> shape = {featuresPerUe * numUes};
     Ptr<OpenGymBoxContainer<float>> box = CreateObject<OpenGymBoxContainer<float>>(shape);
     auto bwpMetrics = ComputeDrqnLiteBwpMetrics();
@@ -2153,11 +2216,9 @@ MyGetObservation()
         double mcsOffset =
             (ueIdx < g_lastRequestedMcsOffsetByUe.size()) ? g_lastRequestedMcsOffsetByUe[ueIdx] : 0.0;
         double bwpMode = (GetCurrentUeBwp(ueIdx) == g_highBwpId) ? 1.0 : -1.0;
-        double timeSinceLastSwitchMs =
-            (ueIdx < g_lastBwpSwitchTimeSByUe.size())
-                ? std::max(0.0, (Simulator::Now().GetSeconds() - g_lastBwpSwitchTimeSByUe[ueIdx]) * 1000.0)
-                : 0.0;
         double aoiMs = ComputeUeMeanAoiMs(ueIdx);
+        double inFlightBytes = ComputeOutstandingAoiBytes(ueIdx);
+        double timeSinceLastDeliveryMs = ComputeTimeSinceLastDeliveryMs(ueIdx);
         double sinrNorm = 0.0;
         if (ueIdx < g_lastSinrDbByUe.size())
         {
@@ -2171,7 +2232,9 @@ MyGetObservation()
         box->AddValue(static_cast<float>(SymmetricUnitNorm(queueBytes / std::max(1.0, g_queueNormBytes))));
         box->AddValue(static_cast<float>(SymmetricUnitNorm(aoiMs / std::max(1.0, g_dqnDelayTargetMs))));
         box->AddValue(static_cast<float>(
-            SymmetricUnitNorm(timeSinceLastSwitchMs / GetEffectiveMinSwitchIntervalMs())));
+            SymmetricUnitNorm(inFlightBytes / std::max(1.0, g_queueNormBytes))));
+        box->AddValue(static_cast<float>(
+            SymmetricUnitNorm(timeSinceLastDeliveryMs / std::max(1.0, g_dqnDelayTargetMs))));
     }
     return box;
 }
@@ -2209,7 +2272,8 @@ MyGetReward()
             uint64_t deliveredBytesRaw = (ueIdx < g_stepTbBytesByUe.size()) ? g_stepTbBytesByUe[ueIdx] : 0u;
             double reward = ComputeDrqnLiteReward(ueIdx);
             rewardSum += reward;
-            aoiPenaltySum += -Clamp01(currentAoiMs / std::max(1.0, g_dqnDelayTargetMs));
+            aoiPenaltySum +=
+                -std::log1p(std::max(0.0, currentAoiMs)) / std::log1p(std::max(1.0, g_dqnDelayTargetMs));
             goodputTermSum += deliveredBytesRaw > 0u ? std::log1p(static_cast<double>(deliveredBytesRaw)) : 0.0;
             if (ueIdx < g_lastRewardPrevQueueBytesByUe.size())
             {
@@ -2269,7 +2333,8 @@ MyGetReward()
             (requestedBytes > 0.0)
                 ? Clamp01(static_cast<double>(deliveredBytesRaw) / requestedBytes)
                 : 0.0;
-        double aoiPenalty = -Clamp01(currentAoiMs / std::max(1.0, g_dqnDelayTargetMs));
+        double aoiPenalty =
+            -std::log1p(std::max(0.0, currentAoiMs)) / std::log1p(std::max(1.0, g_dqnDelayTargetMs));
         double goodputTerm = serviceRatio;
         double auxTerm = 0.0;
         double seReward = 0.0;
@@ -2643,6 +2708,7 @@ main(int argc, char* argv[])
     // Channel dynamics
     bool enableShadowing = true;
     double channelUpdateMs = 50.0;
+    uint32_t extraBuildings = 0;
     std::string summaryFile = "";
     std::string metricsTraceFile = "";
     std::string aoiTraceFile = "";
@@ -2759,6 +2825,9 @@ main(int argc, char* argv[])
     cmd.AddValue("backgroundPktSize", "Background packet size (bytes)", backgroundPktSize);
     cmd.AddValue("enableShadowing", "Enable shadowing in pathloss", enableShadowing);
     cmd.AddValue("channelUpdateMs", "3GPP channel model update period (ms)", channelUpdateMs);
+    cmd.AddValue("extraBuildings",
+                 "Number of additional obstruction layers (0=off, 1=medium, 2=dense, 3=urban-core, 4=urban-mega).",
+                 extraBuildings);
     cmd.AddValue("summaryFile", "Append run summary to this file path", summaryFile);
     cmd.AddValue("metricsTraceFile", "Write interval metrics CSV to this file path", metricsTraceFile);
     cmd.AddValue("aoiTraceFile",
@@ -2866,6 +2935,8 @@ main(int argc, char* argv[])
     g_outstandingAoiByUeType.assign(numUes, {});
     g_outstandingAoiByUe.assign(numUes, {});
     g_outstandingAoiPacketById.clear();
+    g_outstandingAoiBytesByUe.assign(numUes, 0u);
+    g_lastDeliveryTimeNsByUe.assign(numUes, static_cast<uint64_t>(Simulator::Now().GetNanoSeconds()));
     g_nextAoiPacketId = 1;
     g_prevRewardQueueBytesByUe.assign(numUes, 0.0);
     g_currentBwpByUe.assign(numUes, g_initialBwpId);
@@ -3096,45 +3167,80 @@ main(int argc, char* argv[])
     ueMobility.SetPositionAllocator(uePos);
     ueMobility.Install(ueNodes);
 
-    // Keep only a light set of obstructions so FR2 remains usable under load
-    // while still seeing occasional blockage events across the whole UE cloud.
-    Ptr<Building> building0 = CreateObject<Building>();
-    building0->SetBoundaries(Box(-18.0, -6.0, -7.0, 9.0, 0.0, 18.0));
-    building0->SetBuildingType(Building::Residential);
-    building0->SetExtWallsType(Building::ConcreteWithWindows);
-    building0->SetNFloors(4);
-    building0->SetNRoomsX(1);
-    building0->SetNRoomsY(1);
+    // Keep default obstructions light for backward compatibility.
+    // Additional layers can be enabled via --extraBuildings to amplify blockage diversity.
+    auto addBuilding = [](double x1,
+                          double x2,
+                          double y1,
+                          double y2,
+                          double z2,
+                          uint32_t floors,
+                          Building::ExtWallsType_t wall = Building::ConcreteWithWindows) {
+        Ptr<Building> b = CreateObject<Building>();
+        b->SetBoundaries(Box(x1, x2, y1, y2, 0.0, z2));
+        b->SetBuildingType(Building::Residential);
+        b->SetExtWallsType(wall);
+        b->SetNFloors(floors);
+        b->SetNRoomsX(1);
+        b->SetNRoomsY(1);
+    };
 
-    Ptr<Building> building1 = CreateObject<Building>();
-    building1->SetBoundaries(Box(12.0, 24.0, 10.0, 22.0, 0.0, 18.0));
-    building1->SetBuildingType(Building::Residential);
-    building1->SetExtWallsType(Building::ConcreteWithWindows);
-    building1->SetNFloors(3);
-    building1->SetNRoomsX(1);
-    building1->SetNRoomsY(1);
+    addBuilding(-18.0, -6.0, -7.0, 9.0, 18.0, 4);
+    addBuilding(12.0, 24.0, 10.0, 22.0, 18.0, 3);
+    addBuilding(14.0, 30.0, -22.0, -10.0, 16.0, 3);
+    addBuilding(-4.0, 6.0, 16.0, 30.0, 20.0, 4);
+    addBuilding(-2.0, 8.0, -30.0, -16.0, 18.0, 3);
 
-    Ptr<Building> building2 = CreateObject<Building>();
-    building2->SetBoundaries(Box(14.0, 30.0, -22.0, -10.0, 0.0, 16.0));
-    building2->SetBuildingType(Building::Residential);
-    building2->SetExtWallsType(Building::ConcreteWithWindows);
-    building2->SetNFloors(3);
-    building2->SetNRoomsX(1);
-    building2->SetNRoomsY(1);
+    if (extraBuildings >= 1)
+    {
+        addBuilding(-18.0, -10.0, 12.0, 18.0, 16.0, 3);
+        addBuilding(-10.0, -2.0, -16.0, -10.0, 15.0, 3);
+        addBuilding(2.0, 10.0, -6.0, 2.0, 14.0, 2);
+        addBuilding(10.0, 18.0, 2.0, 8.0, 18.0, 3);
+    }
+    if (extraBuildings >= 2)
+    {
+        addBuilding(-6.0, 2.0, 8.0, 14.0, 16.0, 3);
+        addBuilding(4.0, 12.0, -14.0, -8.0, 16.0, 3);
+        addBuilding(-20.0, -12.0, -18.0, -12.0, 18.0, 4);
+        addBuilding(14.0, 20.0, -9.0, -3.0, 18.0, 4);
+    }
+    if (extraBuildings >= 3)
+    {
+        // Urban-core dense blockers near gNB/UE cloud center to bias high-frequency NLOS penalty.
+        addBuilding(-1.5, 1.5, 3.0, 7.0, 24.0, 6);
+        addBuilding(-1.5, 1.5, -7.0, -3.0, 24.0, 6);
+        addBuilding(6.0, 9.0, 3.0, 7.0, 22.0, 5);
+        addBuilding(6.0, 9.0, -7.0, -3.0, 22.0, 5);
+        addBuilding(-9.0, -6.0, 10.0, 14.0, 20.0, 5);
+        addBuilding(-9.0, -6.0, -22.0, -18.0, 20.0, 5);
+        addBuilding(12.0, 15.0, -1.5, 1.5, 20.0, 5);
+        addBuilding(-26.0, -22.0, 3.0, 7.0, 18.0, 4);
+    }
+    if (extraBuildings >= 4)
+    {
+        // Urban-mega ring: many tall peripheral blocks to increase NLOS prevalence while
+        // preserving some LOS windows near the street canyons.
+        addBuilding(-42.0, -36.0, -30.0, -22.0, 26.0, 8);
+        addBuilding(-42.0, -36.0, -18.0, -10.0, 24.0, 7);
+        addBuilding(-42.0, -36.0, -6.0, 2.0, 24.0, 7);
+        addBuilding(-42.0, -36.0, 6.0, 14.0, 24.0, 7);
+        addBuilding(-42.0, -36.0, 18.0, 26.0, 26.0, 8);
 
-    Ptr<Building> building3 = CreateObject<Building>();
-    building3->SetBoundaries(Box(-4.0, 6.0, 16.0, 30.0, 0.0, 20.0));
-    building3->SetBuildingType(Building::Residential);
-    building3->SetNFloors(4);
-    building3->SetNRoomsX(1);
-    building3->SetNRoomsY(1);
+        addBuilding(36.0, 42.0, -30.0, -22.0, 26.0, 8);
+        addBuilding(36.0, 42.0, -18.0, -10.0, 24.0, 7);
+        addBuilding(36.0, 42.0, -6.0, 2.0, 24.0, 7);
+        addBuilding(36.0, 42.0, 6.0, 14.0, 24.0, 7);
+        addBuilding(36.0, 42.0, 18.0, 26.0, 26.0, 8);
 
-    Ptr<Building> building4 = CreateObject<Building>();
-    building4->SetBoundaries(Box(-2.0, 8.0, -30.0, -16.0, 0.0, 18.0));
-    building4->SetBuildingType(Building::Residential);
-    building4->SetNFloors(3);
-    building4->SetNRoomsX(1);
-    building4->SetNRoomsY(1);
+        addBuilding(-18.0, -10.0, 34.0, 40.0, 22.0, 6);
+        addBuilding(-4.0, 4.0, 34.0, 40.0, 22.0, 6);
+        addBuilding(10.0, 18.0, 34.0, 40.0, 22.0, 6);
+
+        addBuilding(-18.0, -10.0, -40.0, -34.0, 22.0, 6);
+        addBuilding(-4.0, 4.0, -40.0, -34.0, 22.0, 6);
+        addBuilding(10.0, 18.0, -40.0, -34.0, 22.0, 6);
+    }
 
     BuildingsHelper::Install(gnbNodes);
     BuildingsHelper::Install(ueNodes);

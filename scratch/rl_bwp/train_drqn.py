@@ -250,6 +250,9 @@ def main():
     recent_rewards: list[float] = []
     loss_history: list[float] = []
     last_step_info: dict[str, float] = {}
+    episode_reward_values: list[float] = []
+    episode_thr_values: list[float] = []
+    episode_aoi_values: list[float] = []
 
     while global_step < effective_total_env_steps:
         epsilon = epsilon_by_step(drqn_cfg, global_step)
@@ -257,6 +260,8 @@ def main():
         next_obs, reward, terminated, truncated, step_info = env.step([action])
         last_step_info = dict(step_info)
         done = bool(terminated or truncated)
+        forced_episode_end = bool(episode_step_budget > 0 and episode_step + 1 >= episode_step_budget)
+        episode_end = bool(done or forced_episode_end)
         next_obs = next_obs.astype("float32")
         episode_transitions.append(
             {
@@ -264,10 +269,15 @@ def main():
                 "action": int(action),
                 "reward": float(reward),
                 "next_obs": next_obs.copy(),
-                "done": done,
+                "done": episode_end,
             }
         )
         recent_rewards.append(float(reward))
+        episode_reward_values.append(float(reward))
+        metric_valid = float(step_info.get("metric_valid", 1.0)) > 0.5
+        if metric_valid:
+            episode_thr_values.append(float(step_info.get("mean_thr_mbps", 0.0)))
+            episode_aoi_values.append(float(step_info.get("mean_aoi_ms", 0.0)))
         episode_step += 1
         step_row = {
             "episode": episode_count + 1,
@@ -372,18 +382,17 @@ def main():
             value_loss_bin_values.clear()
             gru_loss_bin_values.clear()
 
-        if done:
+        if episode_end:
             for seq_td in episode_to_sequences(episode_transitions, args.seq_len):
                 replay.add(seq_td)
             episode_transitions.clear()
             episode_count += 1
-            episode_reward_window = recent_rewards[-episode_step_budget:] if episode_step_budget > 0 else recent_rewards
             episode_row = {
                 "episode": episode_count,
                 "global_step": global_step,
-                "mean_reward": float(sum(episode_reward_window) / max(1, len(episode_reward_window))),
-                "mean_thr_mbps": float(last_step_info.get("mean_thr_mbps", 0.0)),
-                "mean_aoi_ms": float(last_step_info.get("mean_aoi_ms", 0.0)),
+                "mean_reward": float(sum(episode_reward_values) / max(1, len(episode_reward_values))),
+                "mean_thr_mbps": float(sum(episode_thr_values) / max(1, len(episode_thr_values))),
+                "mean_aoi_ms": float(sum(episode_aoi_values) / max(1, len(episode_aoi_values))),
             }
             with open(episode_metrics_path, "a", encoding="utf-8", newline="") as f:
                 writer = csv.DictWriter(
@@ -412,6 +421,9 @@ def main():
             hidden = online_net.zero_hidden(1, device)
             episode_step = 0
             episode_bin_index = 0
+            episode_reward_values.clear()
+            episode_thr_values.clear()
+            episode_aoi_values.clear()
             if args.save_every_episodes > 0 and episode_count % args.save_every_episodes == 0:
                 save_checkpoint(out_dir, episode_count, online_net, obs_dim, action_dim, args.hidden_dim, drqn_cfg)
 

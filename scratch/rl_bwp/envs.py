@@ -81,7 +81,7 @@ class BaseBwpEnv(gym.Env):
         super().__init__()
         self.cfg = cfg
         self.num_ues = cfg.num_ues
-        self.features_per_ue = 13 if cfg.drqn_profile else 7
+        self.features_per_ue = 13 if cfg.drqn_profile else 8
         self.obs_size = self.features_per_ue * self.num_ues
 
         if cfg.bwp_only_actions:
@@ -333,6 +333,7 @@ class MockBwpEnv(BaseBwpEnv):
         self.last_served_bytes = np.zeros(self.num_ues, dtype=np.float32)
         self.last_prev_queue_bytes = np.zeros(self.num_ues, dtype=np.float32)
         self.time_since_last_switch_ms = np.zeros(self.num_ues, dtype=np.float32)
+        self.time_since_last_delivery_ms = np.zeros(self.num_ues, dtype=np.float32)
         self.recent_bler = np.zeros(self.num_ues, dtype=np.float32)
         self.hol_age_ms = np.zeros(self.num_ues, dtype=np.float32)
         self.last_switch_action = np.zeros(self.num_ues, dtype=np.int32)
@@ -386,12 +387,16 @@ class MockBwpEnv(BaseBwpEnv):
             return stacked.reshape(-1).astype(np.float32)
         current_bwp = np.where(self.bwp_mode > 0, 1.0, -1.0).astype(np.float32)
         mcs_offset = np.clip(self.last_requested_mcs_offset.astype(np.float32), -2.0, 2.0)
-        cqi_norm = (2.0 * np.clip(self.cqi.astype(np.float32) / 15.0, 0.0, 1.0)) - 1.0
+        sinr_norm = (2.0 * np.clip((self.sinr_db.astype(np.float32) + 10.0) / 40.0, 0.0, 1.0)) - 1.0
+        arrived_norm = (2.0 * np.clip(
+            self.last_arrival_bytes.astype(np.float32) / max(1.0, self.cfg.queue_max_bytes), 0.0, 1.0
+        )) - 1.0
         queue_norm = (2.0 * np.clip(
             self.queue_bytes.astype(np.float32) / max(1.0, self.cfg.queue_max_bytes), 0.0, 1.0
         )) - 1.0
-        time_since_last_switch_norm = (2.0 * np.clip(
-            self.time_since_last_switch_ms.astype(np.float32) / max(1.0, self.cfg.dqn_delay_target_ms),
+        in_flight_norm = queue_norm
+        time_since_last_delivery_norm = (2.0 * np.clip(
+            self.time_since_last_delivery_ms.astype(np.float32) / max(1.0, self.cfg.dqn_delay_target_ms),
             0.0,
             1.0,
         )) - 1.0
@@ -402,10 +407,12 @@ class MockBwpEnv(BaseBwpEnv):
             [
                 current_bwp,
                 mcs_offset,
-                cqi_norm,
+                sinr_norm,
+                arrived_norm,
                 queue_norm,
-                time_since_last_switch_norm,
                 aoi_norm,
+                in_flight_norm,
+                time_since_last_delivery_norm,
             ],
             axis=1,
         )
@@ -431,6 +438,7 @@ class MockBwpEnv(BaseBwpEnv):
         self.last_served_bytes.fill(0.0)
         self.last_prev_queue_bytes.fill(0.0)
         self.time_since_last_switch_ms.fill(0.0)
+        self.time_since_last_delivery_ms.fill(0.0)
         self.recent_bler.fill(0.0)
         self.hol_age_ms.fill(0.0)
         self.last_switch_action.fill(0)
@@ -517,6 +525,11 @@ class MockBwpEnv(BaseBwpEnv):
         self.prev_aoi_ms = self.aoi_ms.copy()
         delivered = served > 0.0
         self.aoi_ms = np.where(delivered, np.maximum(self.aoi_ms * 0.7, 1.0), self.aoi_ms + step_ms)
+        self.time_since_last_delivery_ms = np.where(
+            delivered,
+            0.0,
+            self.time_since_last_delivery_ms + step_ms,
+        ).astype(np.float32)
         self.throughput_mbps = (served * 8.0 / max(self.cfg.step_time_s, 1e-6) / 1e6).astype(np.float32)
         self.recent_bler = np.clip((1.0 - sinr_eff) * (0.25 + 0.75 * mcs_eff), 0.0, 1.0).astype(np.float32)
 
