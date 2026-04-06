@@ -31,8 +31,12 @@ LOG_DIR="$ROOT_DIR/scratch/rl_bwp/runs/monitor_logs"
 mkdir -p "$LOG_DIR"
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
-LOG_FILE="$LOG_DIR/monitor_port${PORT}_${STAMP}.log"
-RUN_LOG="$LOG_DIR/ns3_run_port${PORT}_${STAMP}.log"
+LOG_PREFIX=""
+if [[ -n "${MONITOR_TAG:-}" ]]; then
+  LOG_PREFIX="${MONITOR_TAG}_"
+fi
+LOG_FILE="$LOG_DIR/${LOG_PREFIX}monitor_port${PORT}_${STAMP}.log"
+RUN_LOG="$LOG_DIR/${LOG_PREFIX}ns3_run_port${PORT}_${STAMP}.log"
 
 missing_count=0
 launch_count=0
