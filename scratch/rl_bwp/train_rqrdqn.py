@@ -463,7 +463,8 @@ def main():
                         }
                     )
                 reward_bin_values.clear()
-            obs, _ = env.reset()
+            next_episode_seed = args.seed + episode_count
+            obs, _ = env.reset(seed=next_episode_seed)
             obs = obs.astype("float32")
             if args.shared_per_ue:
                 hidden_bank = online_net.zero_hidden(cfg.num_ues, device)

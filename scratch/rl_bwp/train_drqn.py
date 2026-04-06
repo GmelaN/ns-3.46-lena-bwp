@@ -416,7 +416,8 @@ def main():
                         }
                     )
                 reward_bin_values.clear()
-            obs, _ = env.reset()
+            next_episode_seed = args.seed + episode_count
+            obs, _ = env.reset(seed=next_episode_seed)
             obs = obs.astype("float32")
             hidden = online_net.zero_hidden(1, device)
             episode_step = 0

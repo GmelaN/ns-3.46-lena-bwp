@@ -2339,7 +2339,7 @@ MyGetReward()
         double auxTerm = 0.0;
         double seReward = 0.0;
         double switchPenalty = 0.0;
-        double reward = aoiPenalty + goodputTerm;
+        double reward = goodputTerm;
         rewardSum += reward;
         aoiPenaltySum += aoiPenalty;
         goodputTermSum += goodputTerm;
