@@ -81,15 +81,19 @@ class BaseBwpEnv(gym.Env):
         super().__init__()
         self.cfg = cfg
         self.num_ues = cfg.num_ues
-        self.features_per_ue = 13 if cfg.drqn_profile else 9
+        self.features_per_ue = 13 if cfg.drqn_profile else 8
         self.obs_size = self.features_per_ue * self.num_ues
 
         if cfg.bwp_only_actions:
             action_nvec = np.array(([2] * self.num_ues), dtype=np.int64)
         else:
             action_nvec = np.array(([2, 5] * self.num_ues), dtype=np.int64)
-        obs_low = -max(float(cfg.queue_max_bytes) * 2.0, 1.0e6)
-        obs_high = max(float(cfg.queue_max_bytes) * 2.0, 1.0e6)
+        if cfg.drqn_profile:
+            obs_low = -max(float(cfg.queue_max_bytes) * 2.0, 1.0e6)
+            obs_high = max(float(cfg.queue_max_bytes) * 2.0, 1.0e6)
+        else:
+            obs_low = -2.0
+            obs_high = 2.0
         self.action_space = spaces.MultiDiscrete(action_nvec)
         self.observation_space = spaces.Box(
             low=obs_low,
@@ -130,9 +134,10 @@ class SharedPerUeAdapter(gym.Env):
             self.action_space = spaces.MultiDiscrete(np.array([2], dtype=np.int64))
         else:
             self.action_space = spaces.MultiDiscrete(np.array([2, 5], dtype=np.int64))
+        obs_bound = 100.0 if self.cfg.drqn_profile else 2.0
         self.observation_space = spaces.Box(
-            low=-100.0,
-            high=100.0,
+            low=-obs_bound,
+            high=obs_bound,
             shape=(self.features_per_ue,),
             dtype=np.float32,
         )
@@ -197,9 +202,16 @@ class SharedPerUeAdapter(gym.Env):
                 reward = -(lam * delay_norm + mu * (1.0 - thr_norm))
             else:
                 current_aoi_ms = float(info.get(f"ue{ue}_aoi_ms", 0.0))
-                aoi_penalty = -float(np.log1p(max(0.0, current_aoi_ms)))
+                aoi_penalty = -float(np.clip(current_aoi_ms / max(1.0, self.cfg.dqn_delay_target_ms), 0.0, 1.0))
                 delivered_bytes = float(info.get(f"ue{ue}_delivered_bytes", 0.0))
-                goodput_term = float(np.log1p(max(0.0, delivered_bytes)))
+                arrived_bytes = float(info.get(f"ue{ue}_arrived_bytes", 0.0))
+                prev_queue_bytes = float(info.get(f"ue{ue}_prev_queue_bytes", 0.0))
+                requested_bytes = max(0.0, prev_queue_bytes) + max(0.0, arrived_bytes)
+                goodput_term = (
+                    float(np.clip(delivered_bytes / requested_bytes, 0.0, 1.0))
+                    if requested_bytes > 0.0
+                    else 0.0
+                )
                 aux_term = 0.0
                 se_term = 0.0
                 switch_penalty = 0.0
@@ -209,7 +221,7 @@ class SharedPerUeAdapter(gym.Env):
             ue_info["ue_index"] = ue
             ue_info["metric_valid"] = 1.0
             ue_info["reward_aoi_penalty_local"] = aoi_penalty
-            ue_info["reward_goodput_term_local"] = goodput_term
+            ue_info["reward_service_ratio_local"] = goodput_term
             ue_info["reward_aux_term_local"] = aux_term
             ue_info["reward_se_term_local"] = se_term
             ue_info["reward_bwp_se_local"] = 0.0
@@ -338,6 +350,7 @@ class MockBwpEnv(BaseBwpEnv):
         self.last_served_bytes = np.zeros(self.num_ues, dtype=np.float32)
         self.last_prev_queue_bytes = np.zeros(self.num_ues, dtype=np.float32)
         self.time_since_last_switch_ms = np.zeros(self.num_ues, dtype=np.float32)
+        self.time_since_last_delivery_ms = np.zeros(self.num_ues, dtype=np.float32)
         self.recent_bler = np.zeros(self.num_ues, dtype=np.float32)
         self.hol_age_ms = np.zeros(self.num_ues, dtype=np.float32)
         self.last_switch_action = np.zeros(self.num_ues, dtype=np.int32)
@@ -389,48 +402,34 @@ class MockBwpEnv(BaseBwpEnv):
                 axis=1,
             )
             return stacked.reshape(-1).astype(np.float32)
-        total_prb = np.where(self.bwp_mode == 1, 100.0, 40.0).astype(np.float32)
-        step_se = (self.last_served_bytes * 8.0) / np.maximum(total_prb, 1e-6)
-        bwp_avg_se = np.zeros(2, dtype=np.float32)
-        for bwp in (0, 1):
-            mask = self.bwp_mode == bwp
-            if np.any(mask):
-                bwp_avg_se[bwp] = float(np.mean(step_se[mask]))
-        rel_se = np.zeros(self.num_ues, dtype=np.float32)
-        for ue in range(self.num_ues):
-            rel_se[ue] = float(step_se[ue] / max(1e-6, bwp_avg_se[int(self.bwp_mode[ue])]))
-        log_rel_se = np.log1p(np.maximum(rel_se, 0.0))
-        current_bwp = self.bwp_mode.astype(np.float32)
-        signed_log_mcs_offset = np.sign(self.last_requested_mcs_offset) * np.log1p(
-            np.abs(self.last_requested_mcs_offset).astype(np.float32)
-        )
-        log_cqi = np.log1p(np.maximum(self.cqi.astype(np.float32), 0.0))
-        log_queue_backlog = np.log1p(np.maximum(self.queue_bytes.astype(np.float32), 0.0))
-        queue_delta = self.queue_bytes - self.last_prev_queue_bytes
-        signed_log_queue_delta = np.sign(queue_delta) * np.log1p(
-            np.abs(queue_delta).astype(np.float32)
-        )
-        log_recent_goodput = np.log1p(np.maximum(self.throughput_mbps.astype(np.float32), 0.0))
-        log_drop_rate = np.log1p(
-            np.clip(
-                np.maximum(self.last_arrival_bytes - self.last_served_bytes, 0.0)
-                / np.maximum(self.last_arrival_bytes, 1e-6),
-                0.0,
-                1.0,
-            ).astype(np.float32)
-        )
-        log_time_since_last_switch = np.log1p(np.maximum(self.time_since_last_switch_ms.astype(np.float32), 0.0))
+        current_bwp = np.where(self.bwp_mode > 0, 1.0, -1.0).astype(np.float32)
+        mcs_offset = np.clip(self.last_requested_mcs_offset.astype(np.float32), -2.0, 2.0)
+        sinr_norm = (2.0 * np.clip((self.sinr_db.astype(np.float32) + 10.0) / 40.0, 0.0, 1.0)) - 1.0
+        arrived_norm = (2.0 * np.clip(
+            self.last_arrival_bytes.astype(np.float32) / max(1.0, self.cfg.queue_max_bytes), 0.0, 1.0
+        )) - 1.0
+        queue_norm = (2.0 * np.clip(
+            self.queue_bytes.astype(np.float32) / max(1.0, self.cfg.queue_max_bytes), 0.0, 1.0
+        )) - 1.0
+        in_flight_norm = queue_norm
+        time_since_last_delivery_norm = (2.0 * np.clip(
+            self.time_since_last_delivery_ms.astype(np.float32) / max(1.0, self.cfg.dqn_delay_target_ms),
+            0.0,
+            1.0,
+        )) - 1.0
+        aoi_norm = (2.0 * np.clip(
+            self.aoi_ms.astype(np.float32) / max(1.0, self.cfg.dqn_delay_target_ms), 0.0, 1.0
+        )) - 1.0
         stacked = np.stack(
             [
                 current_bwp,
-                signed_log_mcs_offset,
-                log_cqi,
-                log_queue_backlog,
-                signed_log_queue_delta,
-                log_recent_goodput,
-                log_rel_se,
-                log_drop_rate,
-                log_time_since_last_switch,
+                mcs_offset,
+                sinr_norm,
+                arrived_norm,
+                queue_norm,
+                aoi_norm,
+                in_flight_norm,
+                time_since_last_delivery_norm,
             ],
             axis=1,
         )
@@ -456,6 +455,7 @@ class MockBwpEnv(BaseBwpEnv):
         self.last_served_bytes.fill(0.0)
         self.last_prev_queue_bytes.fill(0.0)
         self.time_since_last_switch_ms.fill(0.0)
+        self.time_since_last_delivery_ms.fill(0.0)
         self.recent_bler.fill(0.0)
         self.hol_age_ms.fill(0.0)
         self.last_switch_action.fill(0)
@@ -542,6 +542,11 @@ class MockBwpEnv(BaseBwpEnv):
         self.prev_aoi_ms = self.aoi_ms.copy()
         delivered = served > 0.0
         self.aoi_ms = np.where(delivered, np.maximum(self.aoi_ms * 0.7, 1.0), self.aoi_ms + step_ms)
+        self.time_since_last_delivery_ms = np.where(
+            delivered,
+            0.0,
+            self.time_since_last_delivery_ms + step_ms,
+        ).astype(np.float32)
         self.throughput_mbps = (served * 8.0 / max(self.cfg.step_time_s, 1e-6) / 1e6).astype(np.float32)
         self.recent_bler = np.clip((1.0 - sinr_eff) * (0.25 + 0.75 * mcs_eff), 0.0, 1.0).astype(np.float32)
 
@@ -724,14 +729,15 @@ class Ns3BwpEnv(BaseBwpEnv):
 
     def _obs_to_fixed(self, raw_obs: Any) -> np.ndarray:
         arr = np.asarray(raw_obs, dtype=np.float32).reshape(-1)
+        clip_bound = 100.0 if self.cfg.drqn_profile else 2.0
         if arr.size >= self.obs_size:
             out = arr[: self.obs_size]
-            out = np.nan_to_num(out, nan=0.0, posinf=100.0, neginf=-100.0)
-            return np.clip(out, -100.0, 100.0)
+            out = np.nan_to_num(out, nan=0.0, posinf=clip_bound, neginf=-clip_bound)
+            return np.clip(out, -clip_bound, clip_bound)
         out = np.zeros(self.obs_size, dtype=np.float32)
         out[: arr.size] = arr
-        out = np.nan_to_num(out, nan=0.0, posinf=100.0, neginf=-100.0)
-        return np.clip(out, -100.0, 100.0)
+        out = np.nan_to_num(out, nan=0.0, posinf=clip_bound, neginf=-clip_bound)
+        return np.clip(out, -clip_bound, clip_bound)
 
     def _parse_info(self, info: Any) -> dict[str, Any]:
         if isinstance(info, dict):

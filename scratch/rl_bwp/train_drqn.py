@@ -138,6 +138,7 @@ def main():
     parser.add_argument("--final-train-updates", type=int, default=256)
     parser.add_argument("--min-completed-episodes", type=int, default=1)
     parser.add_argument("--reward-bin-size", type=int, default=300)
+    parser.add_argument("--loss-bin-size", type=int, default=300)
     parser.add_argument("--disable-step-reward-log", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--save-every-episodes", type=int, default=0)
     parser.add_argument("--device", type=str, default="cpu")
@@ -154,7 +155,9 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     episode_metrics_path = os.path.join(out_dir, "train_episode_metrics.csv")
     step_reward_log_path = os.path.join(out_dir, "step_reward_log.csv")
-    reward_bin_log_path = os.path.join(out_dir, "train_reward_bins_300.csv")
+    reward_bin_log_path = os.path.join(out_dir, f"train_reward_bins_{args.reward_bin_size}.csv")
+    value_loss_log_path = os.path.join(out_dir, f"value_loss_{args.loss_bin_size}.csv")
+    gru_loss_log_path = os.path.join(out_dir, f"gru_loss_{args.loss_bin_size}.csv")
     with open(episode_metrics_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
@@ -165,6 +168,18 @@ def main():
         writer = csv.DictWriter(
             f,
             fieldnames=["episode", "bin_index", "bin_size", "global_step_end", "avg_reward"],
+        )
+        writer.writeheader()
+    with open(value_loss_log_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["episode", "global_step_end", "window_steps", "num_updates", "avg_value_loss"],
+        )
+        writer.writeheader()
+    with open(gru_loss_log_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["episode", "global_step_end", "window_steps", "num_updates", "avg_gru_loss"],
         )
         writer.writeheader()
     if not args.disable_step_reward_log:
@@ -180,7 +195,7 @@ def main():
                     "mean_thr_mbps",
                     "mean_aoi_ms",
                     "reward_aoi_penalty_local",
-                    "reward_goodput_term_local",
+                    "reward_service_ratio_local",
                     "reward_aux_term_local",
                     "reward_switch_penalty_local",
                 ],
@@ -230,9 +245,14 @@ def main():
     episode_step = 0
     episode_bin_index = 0
     reward_bin_values: list[float] = []
+    value_loss_bin_values: list[float] = []
+    gru_loss_bin_values: list[float] = []
     recent_rewards: list[float] = []
     loss_history: list[float] = []
     last_step_info: dict[str, float] = {}
+    episode_reward_values: list[float] = []
+    episode_thr_values: list[float] = []
+    episode_aoi_values: list[float] = []
 
     while global_step < effective_total_env_steps:
         epsilon = epsilon_by_step(drqn_cfg, global_step)
@@ -240,6 +260,8 @@ def main():
         next_obs, reward, terminated, truncated, step_info = env.step([action])
         last_step_info = dict(step_info)
         done = bool(terminated or truncated)
+        forced_episode_end = bool(episode_step_budget > 0 and episode_step + 1 >= episode_step_budget)
+        episode_end = bool(done or forced_episode_end)
         next_obs = next_obs.astype("float32")
         episode_transitions.append(
             {
@@ -247,10 +269,15 @@ def main():
                 "action": int(action),
                 "reward": float(reward),
                 "next_obs": next_obs.copy(),
-                "done": done,
+                "done": episode_end,
             }
         )
         recent_rewards.append(float(reward))
+        episode_reward_values.append(float(reward))
+        metric_valid = float(step_info.get("metric_valid", 1.0)) > 0.5
+        if metric_valid:
+            episode_thr_values.append(float(step_info.get("mean_thr_mbps", 0.0)))
+            episode_aoi_values.append(float(step_info.get("mean_aoi_ms", 0.0)))
         episode_step += 1
         step_row = {
             "episode": episode_count + 1,
@@ -261,7 +288,7 @@ def main():
             "mean_thr_mbps": float(step_info.get("mean_thr_mbps", 0.0)),
             "mean_aoi_ms": float(step_info.get("mean_aoi_ms", 0.0)),
             "reward_aoi_penalty_local": float(step_info.get("reward_aoi_penalty_local", 0.0)),
-            "reward_goodput_term_local": float(step_info.get("reward_goodput_term_local", 0.0)),
+            "reward_service_ratio_local": float(step_info.get("reward_service_ratio_local", 0.0)),
             "reward_aux_term_local": float(step_info.get("reward_aux_term_local", 0.0)),
             "reward_switch_penalty_local": float(step_info.get("reward_switch_penalty_local", 0.0)),
         }
@@ -279,7 +306,7 @@ def main():
                         "mean_thr_mbps",
                         "mean_aoi_ms",
                         "reward_aoi_penalty_local",
-                        "reward_goodput_term_local",
+                        "reward_service_ratio_local",
                         "reward_aux_term_local",
                         "reward_switch_penalty_local",
                     ],
@@ -308,6 +335,9 @@ def main():
                 batch = replay.sample(args.batch_size)
                 loss = train_batch(online_net, target_net, optimizer, batch, drqn_cfg, device)
                 loss_history.append(loss)
+                value_loss_bin_values.append(float(loss))
+                # DRQN has a single TD objective; log the same scalar for GRU loss trend tracking.
+                gru_loss_bin_values.append(float(loss))
 
         if global_step > 0 and global_step % args.target_sync == 0:
             target_net.load_state_dict(online_net.state_dict())
@@ -316,18 +346,53 @@ def main():
         hidden = next_hidden.detach()
         global_step += 1
 
-        if done:
+        if global_step % args.loss_bin_size == 0:
+            with open(value_loss_log_path, "a", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["episode", "global_step_end", "window_steps", "num_updates", "avg_value_loss"],
+                )
+                writer.writerow(
+                    {
+                        "episode": episode_count + 1,
+                        "global_step_end": global_step,
+                        "window_steps": args.loss_bin_size,
+                        "num_updates": len(value_loss_bin_values),
+                        "avg_value_loss": float(sum(value_loss_bin_values) / len(value_loss_bin_values))
+                        if value_loss_bin_values
+                        else 0.0,
+                    }
+                )
+            with open(gru_loss_log_path, "a", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["episode", "global_step_end", "window_steps", "num_updates", "avg_gru_loss"],
+                )
+                writer.writerow(
+                    {
+                        "episode": episode_count + 1,
+                        "global_step_end": global_step,
+                        "window_steps": args.loss_bin_size,
+                        "num_updates": len(gru_loss_bin_values),
+                        "avg_gru_loss": float(sum(gru_loss_bin_values) / len(gru_loss_bin_values))
+                        if gru_loss_bin_values
+                        else 0.0,
+                    }
+                )
+            value_loss_bin_values.clear()
+            gru_loss_bin_values.clear()
+
+        if episode_end:
             for seq_td in episode_to_sequences(episode_transitions, args.seq_len):
                 replay.add(seq_td)
             episode_transitions.clear()
             episode_count += 1
-            episode_reward_window = recent_rewards[-episode_step_budget:] if episode_step_budget > 0 else recent_rewards
             episode_row = {
                 "episode": episode_count,
                 "global_step": global_step,
-                "mean_reward": float(sum(episode_reward_window) / max(1, len(episode_reward_window))),
-                "mean_thr_mbps": float(last_step_info.get("mean_thr_mbps", 0.0)),
-                "mean_aoi_ms": float(last_step_info.get("mean_aoi_ms", 0.0)),
+                "mean_reward": float(sum(episode_reward_values) / max(1, len(episode_reward_values))),
+                "mean_thr_mbps": float(sum(episode_thr_values) / max(1, len(episode_thr_values))),
+                "mean_aoi_ms": float(sum(episode_aoi_values) / max(1, len(episode_aoi_values))),
             }
             with open(episode_metrics_path, "a", encoding="utf-8", newline="") as f:
                 writer = csv.DictWriter(
@@ -356,6 +421,9 @@ def main():
             hidden = online_net.zero_hidden(1, device)
             episode_step = 0
             episode_bin_index = 0
+            episode_reward_values.clear()
+            episode_thr_values.clear()
+            episode_aoi_values.clear()
             if args.save_every_episodes > 0 and episode_count % args.save_every_episodes == 0:
                 save_checkpoint(out_dir, episode_count, online_net, obs_dim, action_dim, args.hidden_dim, drqn_cfg)
 
@@ -368,6 +436,39 @@ def main():
             batch = replay.sample(args.batch_size)
             loss = train_batch(online_net, target_net, optimizer, batch, drqn_cfg, device)
             loss_history.append(loss)
+            value_loss_bin_values.append(float(loss))
+            gru_loss_bin_values.append(float(loss))
+
+    if value_loss_bin_values:
+        with open(value_loss_log_path, "a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["episode", "global_step_end", "window_steps", "num_updates", "avg_value_loss"],
+            )
+            writer.writerow(
+                {
+                    "episode": episode_count if episode_count > 0 else 0,
+                    "global_step_end": global_step,
+                    "window_steps": global_step % args.loss_bin_size if global_step % args.loss_bin_size != 0 else args.loss_bin_size,
+                    "num_updates": len(value_loss_bin_values),
+                    "avg_value_loss": float(sum(value_loss_bin_values) / len(value_loss_bin_values)),
+                }
+            )
+    if gru_loss_bin_values:
+        with open(gru_loss_log_path, "a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["episode", "global_step_end", "window_steps", "num_updates", "avg_gru_loss"],
+            )
+            writer.writerow(
+                {
+                    "episode": episode_count if episode_count > 0 else 0,
+                    "global_step_end": global_step,
+                    "window_steps": global_step % args.loss_bin_size if global_step % args.loss_bin_size != 0 else args.loss_bin_size,
+                    "num_updates": len(gru_loss_bin_values),
+                    "avg_gru_loss": float(sum(gru_loss_bin_values) / len(gru_loss_bin_values)),
+                }
+            )
 
     model_path = save_checkpoint(out_dir, episode_count if episode_count > 0 else 0, online_net, obs_dim, action_dim, args.hidden_dim, drqn_cfg)
     final_model_path = os.path.join(out_dir, "final_model.pt")
@@ -388,6 +489,8 @@ def main():
         "episode_metrics_csv": episode_metrics_path,
         "step_reward_log_csv": step_reward_log_path if not args.disable_step_reward_log else "",
         "reward_bin_csv": reward_bin_log_path,
+        "value_loss_csv": value_loss_log_path,
+        "gru_loss_csv": gru_loss_log_path,
         "init_model_path": args.init_model_path,
         "save_every_episodes": args.save_every_episodes,
         "episodes_finished": episode_count,

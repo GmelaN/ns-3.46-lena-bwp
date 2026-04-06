@@ -146,6 +146,7 @@ def main():
     parser.add_argument("--final-train-updates", type=int, default=256)
     parser.add_argument("--min-completed-episodes", type=int, default=1)
     parser.add_argument("--reward-bin-size", type=int, default=300)
+    parser.add_argument("--loss-bin-size", type=int, default=300)
     parser.add_argument("--disable-step-reward-log", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--save-every-episodes", type=int, default=0)
     parser.add_argument("--huber-kappa", type=float, default=1.0)
@@ -170,8 +171,9 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     episode_metrics_path = os.path.join(out_dir, "train_episode_metrics.csv")
     step_reward_log_path = os.path.join(out_dir, "step_reward_log.csv")
-    reward_bin_log_path = os.path.join(out_dir, "train_reward_bins_300.csv")
-    value_loss_log_path = os.path.join(out_dir, "value_loss_300.csv")
+    reward_bin_log_path = os.path.join(out_dir, f"train_reward_bins_{args.reward_bin_size}.csv")
+    value_loss_log_path = os.path.join(out_dir, f"value_loss_{args.loss_bin_size}.csv")
+    gru_loss_log_path = os.path.join(out_dir, f"gru_loss_{args.loss_bin_size}.csv")
     td_quantile_fieldnames = [f"td_abs_q{i:02d}" for i in range(args.num_quantiles)]
     with open(episode_metrics_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
@@ -191,6 +193,12 @@ def main():
             fieldnames=["episode", "global_step_end", "window_steps", "num_updates", "avg_value_loss", *td_quantile_fieldnames],
         )
         writer.writeheader()
+    with open(gru_loss_log_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["episode", "global_step_end", "window_steps", "num_updates", "avg_gru_loss"],
+        )
+        writer.writeheader()
     if not args.disable_step_reward_log:
         with open(step_reward_log_path, "w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(
@@ -204,7 +212,7 @@ def main():
                     "mean_thr_mbps",
                     "mean_aoi_ms",
                     "reward_aoi_penalty_local",
-                    "reward_goodput_term_local",
+                    "reward_service_ratio_local",
                     "reward_aux_term_local",
                     "reward_switch_penalty_local",
                 ],
@@ -257,7 +265,11 @@ def main():
     optimizer = torch.optim.Adam(online_net.parameters(), lr=args.learning_rate)
     replay = make_replay_buffer(args.replay_capacity)
 
-    hidden = online_net.zero_hidden(1, device)
+    if args.shared_per_ue:
+        hidden_bank = online_net.zero_hidden(cfg.num_ues, device)
+        current_ue_idx = 0
+    else:
+        hidden = online_net.zero_hidden(1, device)
     episode_transitions: list[dict] = []
     global_step = 0
     episode_count = 0
@@ -265,6 +277,7 @@ def main():
     episode_bin_index = 0
     reward_bin_values: list[float] = []
     value_loss_bin_values: list[float] = []
+    gru_loss_bin_values: list[float] = []
     td_quantile_bin_values: list[list[float]] = []
     recent_rewards: list[float] = []
     loss_history: list[float] = []
@@ -272,10 +285,14 @@ def main():
 
     while global_step < effective_total_env_steps:
         epsilon = epsilon_by_step(q_cfg, global_step)
+        if args.shared_per_ue:
+            hidden_in = hidden_bank[current_ue_idx : current_ue_idx + 1]
+        else:
+            hidden_in = hidden
         action, next_hidden = select_action(
             online_net,
             obs,
-            hidden,
+            hidden_in,
             epsilon,
             device,
             q_cfg,
@@ -283,6 +300,8 @@ def main():
         next_obs, reward, terminated, truncated, step_info = env.step(action)
         last_step_info = dict(step_info)
         done = bool(terminated or truncated)
+        forced_episode_end = bool(episode_step_budget > 0 and episode_step + 1 >= episode_step_budget)
+        episode_end = bool(done or forced_episode_end)
         next_obs = next_obs.astype("float32")
         episode_transitions.append(
             {
@@ -290,7 +309,7 @@ def main():
                 "action": int(action),
                 "reward": float(reward),
                 "next_obs": next_obs.copy(),
-                "done": done,
+                "done": episode_end,
             }
         )
         recent_rewards.append(float(reward))
@@ -304,7 +323,7 @@ def main():
             "mean_thr_mbps": float(step_info.get("mean_thr_mbps", 0.0)),
             "mean_aoi_ms": float(step_info.get("mean_aoi_ms", 0.0)),
             "reward_aoi_penalty_local": float(step_info.get("reward_aoi_penalty_local", 0.0)),
-            "reward_goodput_term_local": float(step_info.get("reward_goodput_term_local", 0.0)),
+            "reward_service_ratio_local": float(step_info.get("reward_service_ratio_local", 0.0)),
             "reward_aux_term_local": float(step_info.get("reward_aux_term_local", 0.0)),
             "reward_switch_penalty_local": float(step_info.get("reward_switch_penalty_local", 0.0)),
         }
@@ -322,7 +341,7 @@ def main():
                         "mean_thr_mbps",
                         "mean_aoi_ms",
                         "reward_aoi_penalty_local",
-                        "reward_goodput_term_local",
+                        "reward_service_ratio_local",
                         "reward_aux_term_local",
                         "reward_switch_penalty_local",
                     ],
@@ -353,21 +372,30 @@ def main():
                 loss = float(train_stats["loss"])
                 loss_history.append(loss)
                 value_loss_bin_values.append(loss)
+                # RQR-DQN uses a single quantile TD objective; mirror it for GRU loss trend logs.
+                gru_loss_bin_values.append(loss)
                 td_quantile_bin_values.append([float(x) for x in train_stats["quantile_td_abs"]])
 
         if global_step > 0 and global_step % args.target_sync == 0:
             target_net.load_state_dict(online_net.state_dict())
 
         obs = next_obs
-        hidden = next_hidden.detach()
+        if args.shared_per_ue:
+            acted_ue_idx = int(step_info.get("ue_index", current_ue_idx))
+            if acted_ue_idx < 0 or acted_ue_idx >= cfg.num_ues:
+                acted_ue_idx = current_ue_idx
+            hidden_bank[acted_ue_idx] = next_hidden.detach().squeeze(0)
+            current_ue_idx = (acted_ue_idx + 1) % cfg.num_ues
+        else:
+            hidden = next_hidden.detach()
         global_step += 1
 
-        if global_step % 300 == 0:
+        if global_step % args.loss_bin_size == 0:
             avg_td_quantiles = np.mean(np.asarray(td_quantile_bin_values, dtype=np.float64), axis=0) if td_quantile_bin_values else np.zeros(args.num_quantiles, dtype=np.float64)
             row = {
                 "episode": episode_count + 1,
                 "global_step_end": global_step,
-                "window_steps": 300,
+                "window_steps": args.loss_bin_size,
                 "num_updates": len(value_loss_bin_values),
                 "avg_value_loss": float(sum(value_loss_bin_values) / len(value_loss_bin_values))
                 if value_loss_bin_values
@@ -380,10 +408,27 @@ def main():
                     fieldnames=["episode", "global_step_end", "window_steps", "num_updates", "avg_value_loss", *td_quantile_fieldnames],
                 )
                 writer.writerow(row)
+            with open(gru_loss_log_path, "a", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["episode", "global_step_end", "window_steps", "num_updates", "avg_gru_loss"],
+                )
+                writer.writerow(
+                    {
+                        "episode": episode_count + 1,
+                        "global_step_end": global_step,
+                        "window_steps": args.loss_bin_size,
+                        "num_updates": len(gru_loss_bin_values),
+                        "avg_gru_loss": float(sum(gru_loss_bin_values) / len(gru_loss_bin_values))
+                        if gru_loss_bin_values
+                        else 0.0,
+                    }
+                )
             value_loss_bin_values.clear()
+            gru_loss_bin_values.clear()
             td_quantile_bin_values.clear()
 
-        if done:
+        if episode_end:
             for seq_td in episode_to_sequences(episode_transitions, args.seq_len):
                 replay.add(seq_td)
             episode_transitions.clear()
@@ -420,7 +465,11 @@ def main():
                 reward_bin_values.clear()
             obs, _ = env.reset()
             obs = obs.astype("float32")
-            hidden = online_net.zero_hidden(1, device)
+            if args.shared_per_ue:
+                hidden_bank = online_net.zero_hidden(cfg.num_ues, device)
+                current_ue_idx = 0
+            else:
+                hidden = online_net.zero_hidden(1, device)
             episode_step = 0
             episode_bin_index = 0
             if args.save_every_episodes > 0 and episode_count % args.save_every_episodes == 0:
@@ -446,6 +495,7 @@ def main():
             loss = float(train_stats["loss"])
             loss_history.append(loss)
             value_loss_bin_values.append(loss)
+            gru_loss_bin_values.append(loss)
             td_quantile_bin_values.append([float(x) for x in train_stats["quantile_td_abs"]])
 
     if value_loss_bin_values:
@@ -453,7 +503,7 @@ def main():
         row = {
             "episode": episode_count if episode_count > 0 else 0,
             "global_step_end": global_step,
-            "window_steps": global_step % 300 if global_step % 300 != 0 else 300,
+            "window_steps": global_step % args.loss_bin_size if global_step % args.loss_bin_size != 0 else args.loss_bin_size,
             "num_updates": len(value_loss_bin_values),
             "avg_value_loss": float(sum(value_loss_bin_values) / len(value_loss_bin_values)),
         }
@@ -464,6 +514,20 @@ def main():
                 fieldnames=["episode", "global_step_end", "window_steps", "num_updates", "avg_value_loss", *td_quantile_fieldnames],
             )
             writer.writerow(row)
+        with open(gru_loss_log_path, "a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["episode", "global_step_end", "window_steps", "num_updates", "avg_gru_loss"],
+            )
+            writer.writerow(
+                {
+                    "episode": episode_count if episode_count > 0 else 0,
+                    "global_step_end": global_step,
+                    "window_steps": global_step % args.loss_bin_size if global_step % args.loss_bin_size != 0 else args.loss_bin_size,
+                    "num_updates": len(gru_loss_bin_values),
+                    "avg_gru_loss": float(sum(gru_loss_bin_values) / len(gru_loss_bin_values)),
+                }
+            )
 
     model_path = save_checkpoint(
         out_dir,
@@ -499,6 +563,7 @@ def main():
         "step_reward_log_csv": step_reward_log_path if not args.disable_step_reward_log else "",
         "reward_bin_csv": reward_bin_log_path,
         "value_loss_csv": value_loss_log_path,
+        "gru_loss_csv": gru_loss_log_path,
         "init_model_path": args.init_model_path,
         "save_every_episodes": args.save_every_episodes,
         "episodes_finished": episode_count,

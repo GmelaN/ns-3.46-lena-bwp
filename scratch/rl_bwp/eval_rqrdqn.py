@@ -13,14 +13,14 @@ import numpy as np
 import torch
 
 from envs import DiscretePerUeActionAdapter, EnvConfig, MockBwpEnv, Ns3BwpEnv, SharedPerUeAdapter
-from rqrdqn_torchrl import RqrdqnNet, _selection_quantiles_from_obs
+from rqrdqn_torchrl import RqrdqnNet
 
 
 STALE_GLOBAL_REWARD_KEYS = {
     "reward_aoi_term",
     "reward_aoi_penalty",
     "reward_thr_term",
-    "reward_goodput_term",
+    "reward_service_ratio_term",
     "reward_service_term",
     "reward_aux_term",
     "reward_se_term",
@@ -178,22 +178,13 @@ def main():
     net.load_state_dict(ckpt["state_dict"])
     net.to(args.device)
     net.eval()
-    model_cfg = ckpt.get("rqrdqn_config", {})
-    conditional_risk_selection = bool(model_cfg.get("conditional_risk_selection", False) or args.conditional_risk_selection)
-    drqn_profile = bool(args.drqn_profile or model_cfg.get("drqn_profile", False))
-    selection_cfg = argparse.Namespace(
-        conditional_risk_selection=conditional_risk_selection,
-        drqn_profile=drqn_profile,
-        action_selection_quantile=float(model_cfg.get("action_selection_quantile", args.action_selection_quantile)),
-        risk_low_cqi_threshold=float(model_cfg.get("risk_low_cqi_threshold", args.risk_low_cqi_threshold)),
-        risk_mid_cqi_threshold=float(model_cfg.get("risk_mid_cqi_threshold", args.risk_mid_cqi_threshold)),
-        risk_quantile_low=float(model_cfg.get("risk_quantile_low", args.risk_quantile_low)),
-        risk_quantile_mid=float(model_cfg.get("risk_quantile_mid", args.risk_quantile_mid)),
-        risk_quantile_high=float(model_cfg.get("risk_quantile_high", args.risk_quantile_high)),
-    )
     env = build_env(args)
     obs, _ = env.reset(seed=args.seed)
-    hidden = net.zero_hidden(1, torch.device(args.device))
+    if args.shared_per_ue:
+        hidden_bank = net.zero_hidden(args.num_ues, torch.device(args.device))
+        current_ue_idx = 0
+    else:
+        hidden = net.zero_hidden(1, torch.device(args.device))
 
     episode_rewards = []
     episode_metric_means: dict[str, list[float]] = defaultdict(list)
@@ -222,7 +213,7 @@ def main():
                 "action_mcs_idx",
                 "reward",
                 "reward_aoi_penalty_local",
-                "reward_goodput_term_local",
+                "reward_service_ratio_local",
                 "reward_aux_term_local",
                 "reward_se_term_local",
                 "reward_switch_penalty_local",
@@ -241,12 +232,12 @@ def main():
         while finished < args.episodes:
             obs_used = np.asarray(obs).reshape(-1).copy()
             obs_t = torch.as_tensor(obs_used, dtype=torch.float32, device=args.device).unsqueeze(0)
-            quantiles, next_hidden = net.forward_step(obs_t, hidden)
-            if conditional_risk_selection and not drqn_profile:
-                selection_quantile = _selection_quantiles_from_obs(obs_t, selection_cfg, None)
+            if args.shared_per_ue:
+                hidden_in = hidden_bank[current_ue_idx : current_ue_idx + 1]
             else:
-                selection_quantile = selection_cfg.action_selection_quantile
-            q = net.lower_quantile_values(quantiles, selection_quantile)
+                hidden_in = hidden
+            quantiles, next_hidden = net.forward_step(obs_t, hidden_in)
+            q = net.q_values(quantiles)
             action = int(torch.argmax(q, dim=-1).item())
             obs, reward, terminated, truncated, info = env.step(action)
             done = bool(terminated or truncated)
@@ -270,7 +261,7 @@ def main():
                         0 if args.drqn_profile else action % 5,
                         float(reward),
                         step_metrics.get("reward_aoi_penalty_local", 0.0),
-                        step_metrics.get("reward_goodput_term_local", 0.0),
+                        step_metrics.get("reward_service_ratio_local", 0.0),
                         step_metrics.get("reward_aux_term_local", 0.0),
                         step_metrics.get("reward_se_term_local", 0.0),
                         step_metrics.get("reward_switch_penalty_local", 0.0),
@@ -286,7 +277,16 @@ def main():
                 )
             step_index += 1
             obs = np.asarray(obs, dtype=np.float32)
-            hidden = next_hidden.detach() if not done else net.zero_hidden(1, torch.device(args.device))
+            if args.shared_per_ue:
+                acted_ue_idx = int(step_metrics.get("ue_index", current_ue_idx))
+                if acted_ue_idx < 0 or acted_ue_idx >= args.num_ues:
+                    acted_ue_idx = current_ue_idx
+                hidden_bank[acted_ue_idx] = next_hidden.detach().squeeze(0)
+                current_ue_idx = 0 if done else (acted_ue_idx + 1) % args.num_ues
+                if done:
+                    hidden_bank = net.zero_hidden(args.num_ues, torch.device(args.device))
+            else:
+                hidden = next_hidden.detach() if not done else net.zero_hidden(1, torch.device(args.device))
             if done:
                 episode_rewards.append(running_reward)
                 running_reward = 0.0
