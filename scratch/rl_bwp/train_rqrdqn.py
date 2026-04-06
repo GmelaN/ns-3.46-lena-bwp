@@ -6,6 +6,7 @@ import csv
 import json
 import os
 import random
+from collections import defaultdict, deque
 from dataclasses import asdict
 
 import numpy as np
@@ -92,11 +93,13 @@ def save_checkpoint(
     action_dim: int,
     hidden_dim: int,
     num_quantiles: int,
+    optimizer: torch.optim.Optimizer,
     q_cfg: RqrdqnConfig,
 ) -> str:
     ckpt_path = os.path.join(out_dir, f"checkpoint_ep{episode_count:04d}.pt")
     ckpt = {
         "state_dict": online_net.state_dict(),
+        "optimizer": optimizer.state_dict(),
         "obs_dim": obs_dim,
         "action_dim": action_dim,
         "hidden_dim": hidden_dim,
@@ -113,18 +116,18 @@ def main():
     parser.add_argument("--backend", choices=["mock", "ns3"], default="mock")
     parser.add_argument("--run-name", type=str, default="rqrdqn_bwp_mcs_ue1")
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--num-ues", type=int, default=1)
-    parser.add_argument("--step-time-s", type=float, default=0.02)
-    parser.add_argument("--episode-time-s", type=float, default=10.0)
+    parser.add_argument("--num-ues", type=int, default=20)
+    parser.add_argument("--step-time-s", type=float, default=0.01)
+    parser.add_argument("--episode-time-s", type=float, default=5.0)
     parser.add_argument("--switch-delay-ms", type=float, default=5.0)
     parser.add_argument("--queue-max-bytes", type=float, default=200000.0)
     parser.add_argument("--reward-lambda-switch", type=float, default=0.0001)
     parser.add_argument("--reward-lambda-queue", type=float, default=0.20)
     parser.add_argument("--reward-lambda-delay", type=float, default=0.10)
-    parser.add_argument("--port", type=int, default=5555)
-    parser.add_argument("--start-sim", action="store_true", default=False)
+    parser.add_argument("--port", type=int, default=6555)
+    parser.add_argument("--start-sim", action="store_true", default=True)
     parser.add_argument("--debug-ns3", action="store_true", default=False)
-    parser.add_argument("--ns3-script", type=str, default="aoi-prb-urban-onoff")
+    parser.add_argument("--ns3-script", type=str, default="aoi-prb-urban-appmix")
     parser.add_argument("--ns3-arg", action="append", default=[])
     parser.add_argument("--shared-per-ue", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--drqn-profile", action=argparse.BooleanOptionalAction, default=False)
@@ -134,9 +137,9 @@ def main():
     parser.add_argument("--seq-len", type=int, default=8)
     parser.add_argument("--burn-in", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--replay-capacity", type=int, default=5000)
-    parser.add_argument("--warmup-sequences", type=int, default=64)
-    parser.add_argument("--target-sync", type=int, default=100)
+    parser.add_argument("--replay-capacity", type=int, default=20000)
+    parser.add_argument("--warmup-sequences", type=int, default=1500)
+    parser.add_argument("--target-sync", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--gamma", type=float, default=0.98)
     parser.add_argument("--eps-start", type=float, default=1.0)
@@ -157,7 +160,7 @@ def main():
     parser.add_argument("--risk-quantile-low", type=float, default=0.2)
     parser.add_argument("--risk-quantile-mid", type=float, default=0.5)
     parser.add_argument("--risk-quantile-high", type=float, default=0.8)
-    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--init-model-path", type=str, default="")
     args = parser.parse_args()
 
@@ -167,8 +170,9 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    out_dir = os.path.join("scratch", "rl_bwp", "runs", args.run_name)
+    out_dir = os.path.join("/home/jshyeon/ns-3.46-bwp/scratch/rl_bwp/runs", args.run_name, "rqrdqn")
     os.makedirs(out_dir, exist_ok=True)
+    print(out_dir)
     episode_metrics_path = os.path.join(out_dir, "train_episode_metrics.csv")
     step_reward_log_path = os.path.join(out_dir, "step_reward_log.csv")
     reward_bin_log_path = os.path.join(out_dir, f"train_reward_bins_{args.reward_bin_size}.csv")
@@ -258,11 +262,15 @@ def main():
     device = torch.device(args.device)
     online_net = RqrdqnNet(obs_dim, args.hidden_dim, action_dim, args.num_quantiles).to(device)
     target_net = RqrdqnNet(obs_dim, args.hidden_dim, action_dim, args.num_quantiles).to(device)
+    optimizer = torch.optim.Adam(online_net.parameters(), lr=args.learning_rate)
+
     if args.init_model_path:
         ckpt = torch.load(args.init_model_path, map_location=device)
         online_net.load_state_dict(ckpt["state_dict"])
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
     target_net.load_state_dict(online_net.state_dict())
-    optimizer = torch.optim.Adam(online_net.parameters(), lr=args.learning_rate)
+    
     replay = make_replay_buffer(args.replay_capacity)
 
     if args.shared_per_ue:
@@ -270,7 +278,36 @@ def main():
         current_ue_idx = 0
     else:
         hidden = online_net.zero_hidden(1, device)
-    episode_transitions: list[dict] = []
+    replay = make_replay_buffer(args.replay_capacity)
+
+    if args.shared_per_ue:
+        hidden_bank = online_net.zero_hidden(cfg.num_ues, device)
+        current_ue_idx = 0
+    else:
+        hidden = online_net.zero_hidden(1, device)
+
+    # UE별 transition 버퍼
+    episode_transitions_by_ue: dict[int, list[dict]] = defaultdict(list)
+    recent_transitions_by_ue: dict[int, deque] = {
+        ue: deque(maxlen=args.seq_len) for ue in range(cfg.num_ues)
+    }
+
+    global_step = 0
+    episode_count = 0
+    episode_step = 0
+    episode_bin_index = 0
+    reward_bin_values: list[float] = []
+    value_loss_bin_values: list[float] = []
+    gru_loss_bin_values: list[float] = []
+    td_quantile_bin_values: list[list[float]] = []
+    recent_rewards: list[float] = []
+    loss_history: list[float] = []
+    last_step_info: dict[str, float] = {}
+
+    # 실제 episode 평균 기록용
+    episode_reward_values: list[float] = []
+    episode_thr_values: list[float] = []
+    episode_aoi_values: list[float] = []
     global_step = 0
     episode_count = 0
     episode_step = 0
@@ -303,16 +340,25 @@ def main():
         forced_episode_end = bool(episode_step_budget > 0 and episode_step + 1 >= episode_step_budget)
         episode_end = bool(done or forced_episode_end)
         next_obs = next_obs.astype("float32")
-        episode_transitions.append(
-            {
-                "obs": obs.copy(),
-                "action": int(action),
-                "reward": float(reward),
-                "next_obs": next_obs.copy(),
-                "done": episode_end,
-            }
-        )
+        acted_ue_idx = int(step_info.get("ue_index", current_ue_idx if args.shared_per_ue else 0))
+        if acted_ue_idx < 0 or acted_ue_idx >= cfg.num_ues:
+            acted_ue_idx = current_ue_idx if args.shared_per_ue else 0
+
+        transition = {
+            "obs": obs.copy(),
+            "action": int(action),
+            "reward": float(reward),
+            "next_obs": next_obs.copy(),
+            "done": episode_end,
+        }
+
+        episode_transitions_by_ue[acted_ue_idx].append(transition)
+        recent_transitions_by_ue[acted_ue_idx].append(transition)
+
         recent_rewards.append(float(reward))
+        episode_reward_values.append(float(reward))
+        episode_thr_values.append(float(step_info.get("mean_thr_mbps", 0.0)))
+        episode_aoi_values.append(float(step_info.get("mean_aoi_ms", 0.0)))
         episode_step += 1
         step_row = {
             "episode": episode_count + 1,
@@ -428,25 +474,42 @@ def main():
             gru_loss_bin_values.clear()
             td_quantile_bin_values.clear()
 
+        stride = max(1, args.seq_len // 2)
+        ue_recent = recent_transitions_by_ue[acted_ue_idx]
+
+        if len(ue_recent) >= args.seq_len:
+            ue_episode_len = len(episode_transitions_by_ue[acted_ue_idx])
+            if ue_episode_len % stride == 0:
+                latest_window = list(ue_recent)
+                seqs = episode_to_sequences(latest_window, args.seq_len)
+                if seqs:
+                    replay.add(seqs[0])
+
         if episode_end:
-            for seq_td in episode_to_sequences(episode_transitions, args.seq_len):
-                replay.add(seq_td)
-            episode_transitions.clear()
+            # 각 UE의 남은 transition들을 sequence로 변환해 replay에 적재
+            for ue_idx in range(cfg.num_ues):
+                ue_transitions = episode_transitions_by_ue.get(ue_idx, [])
+                if ue_transitions:
+                    for seq_td in episode_to_sequences(ue_transitions, args.seq_len):
+                        replay.add(seq_td)
+
             episode_count += 1
-            episode_reward_window = recent_rewards[-episode_step_budget:] if episode_step_budget > 0 else recent_rewards
+
             episode_row = {
                 "episode": episode_count,
                 "global_step": global_step,
-                "mean_reward": float(sum(episode_reward_window) / max(1, len(episode_reward_window))),
-                "mean_thr_mbps": float(last_step_info.get("mean_thr_mbps", 0.0)),
-                "mean_aoi_ms": float(last_step_info.get("mean_aoi_ms", 0.0)),
+                "mean_reward": float(sum(episode_reward_values) / max(1, len(episode_reward_values))),
+                "mean_thr_mbps": float(sum(episode_thr_values) / max(1, len(episode_thr_values))),
+                "mean_aoi_ms": float(sum(episode_aoi_values) / max(1, len(episode_aoi_values))),
             }
+
             with open(episode_metrics_path, "a", encoding="utf-8", newline="") as f:
                 writer = csv.DictWriter(
                     f,
                     fieldnames=["episode", "global_step", "mean_reward", "mean_thr_mbps", "mean_aoi_ms"],
                 )
                 writer.writerow(episode_row)
+
             if reward_bin_values:
                 with open(reward_bin_log_path, "a", encoding="utf-8", newline="") as f:
                     writer = csv.DictWriter(
@@ -463,16 +526,30 @@ def main():
                         }
                     )
                 reward_bin_values.clear()
+
             next_episode_seed = args.seed + episode_count
             obs, _ = env.reset(seed=next_episode_seed)
             obs = obs.astype("float32")
+
             if args.shared_per_ue:
                 hidden_bank = online_net.zero_hidden(cfg.num_ues, device)
                 current_ue_idx = 0
             else:
                 hidden = online_net.zero_hidden(1, device)
+
+            # episode 버퍼 초기화
+            episode_transitions_by_ue.clear()
+            recent_transitions_by_ue = {
+                ue: deque(maxlen=args.seq_len) for ue in range(cfg.num_ues)
+            }
+
+            episode_reward_values.clear()
+            episode_thr_values.clear()
+            episode_aoi_values.clear()
+
             episode_step = 0
             episode_bin_index = 0
+
             if args.save_every_episodes > 0 and episode_count % args.save_every_episodes == 0:
                 save_checkpoint(
                     out_dir,
@@ -482,12 +559,15 @@ def main():
                     action_dim,
                     args.hidden_dim,
                     args.num_quantiles,
+                    optimizer,
                     q_cfg,
                 )
 
-    if episode_transitions:
-        for seq_td in episode_to_sequences(episode_transitions, args.seq_len):
-            replay.add(seq_td)
+    for ue_idx in range(cfg.num_ues):
+        ue_transitions = episode_transitions_by_ue.get(ue_idx, [])
+        if ue_transitions:
+            for seq_td in episode_to_sequences(ue_transitions, args.seq_len):
+                replay.add(seq_td)
 
     if len(replay) >= args.warmup_sequences:
         for _ in range(args.final_train_updates):
@@ -538,6 +618,7 @@ def main():
         action_dim,
         args.hidden_dim,
         args.num_quantiles,
+        optimizer,
         q_cfg,
     )
     final_model_path = os.path.join(out_dir, "final_model.pt")

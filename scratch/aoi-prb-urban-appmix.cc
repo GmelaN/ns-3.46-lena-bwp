@@ -24,6 +24,8 @@
 #include "ns3/nr-gnb-mac.h"
 #include "ns3/nr-gnb-net-device.h"
 #include "ns3/nr-mac-scheduler-ofdma-aequitas.h"
+#include "ns3/nr-mac-scheduler-ofdma-aequitas.h"
+#include "ns3/nr-mac-scheduler-ofdma-baseline.h"
 #include "ns3/nr-mac-scheduler-ofdma-pf.h"
 #include "ns3/nr-mac-scheduler-ofdma-rr.h"
 #include "ns3/nr-mac-scheduler-ns3.h"
@@ -283,9 +285,9 @@ static bool g_enableRlMcsControl = true;
 static bool g_rlDebug = false;
 static uint32_t g_openGymPort = 5555;
 static double g_envStepTime = 0.02; // 20 ms
-static double g_simTime = 2.0;
+static double g_simTime = 5.0;
 static double g_appStartTime = 0.3;
-static double g_switchDelayMsCfg = 10.0;
+static double g_switchDelayMsCfg = 5.0;
 static double g_queueNormBytes = 200000.0;
 static double g_rewardLambdaSwitch = 0.0001;
 static double g_rewardLambdaQueue = 0.20;
@@ -329,6 +331,7 @@ static std::vector<uint8_t> g_targetMcsByUe;
 static std::vector<Ptr<NrMacSchedulerNs3>> g_dlSchedulers;
 static std::vector<Ptr<NrGnbMac>> g_gnbMacs;
 static std::vector<Ptr<NrMacSchedulerOfdmaAequitas>> g_aequitasSchedulers;
+static std::vector<Ptr<NrMacSchedulerOfdmaBaseline>> g_baselineSchedulers;
 
 struct PendingBwpSwitch
 {
@@ -421,14 +424,28 @@ static int32_t g_appStateTraceUe = 0;
 static std::string g_burstStateTraceFile = "";
 static std::unique_ptr<std::ofstream> g_burstStateTraceStream;
 
-static std::string g_schedulerPolicy = "rr"; // rr|pf|aequitas
+static std::string g_schedulerPolicy = "rr"; // rr|pf|aequitas|age_optimal|lyapunov|drqn
 
 // Baseline policy configuration
-static std::string g_bwpBaseline = "none"; // none|dt|dqn|aequitas
+static std::string g_bwpBaseline = "none"; // none|dt|dqn|aequitas|queue
+static std::string g_mcsBaseline = "cqi"; // cqi|aams
 static double g_aequitasDeadlineMs = 100.0;
 static bool g_aequitasEnableMcsSelection = true;
 static uint32_t g_policySwitchCooldownSteps = 2;
 static std::vector<uint32_t> g_policyCooldownStepsByUe;
+
+// Queue-Threshold BWP baseline parameters (Device_Power_Saving paper)
+static uint32_t g_bwpQueueThreshold = 600; // threshold in bytes
+
+// AAMS MCS baseline parameters
+static double g_aamsTargetBler = 0.10; // 10% target BLER
+static uint8_t g_aamsMcsOffset = 2;
+
+// Lyapunov scheduling parameters
+static double g_lyapunovV = 10.0;
+
+// Age-Optimal scheduling parameters
+static double g_ageOptimalAoiThresholdMs = 20.0;
 
 // DT-like predictive baseline parameters
 static double g_dtDelayTargetMs = 80.0;
@@ -676,6 +693,7 @@ class SimpleDqnAgent
 };
 
 static std::unique_ptr<SimpleDqnAgent> g_dqnAgent;
+static std::unique_ptr<SimpleDqnAgent> g_schedDqnAgent;
 
 static bool
 HasPendingBwpSwitch(uint16_t rnti)
@@ -1802,6 +1820,13 @@ ToLower(std::string s)
     return s;
 }
 
+static std::string
+ToUpper(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::toupper(c); });
+    return s;
+}
+
 static bool
 CanSwitchByCooldown(uint32_t ueIdx)
 {
@@ -2113,6 +2138,150 @@ RunDqnPolicyStep()
     return switchCount;
 }
 
+static uint32_t
+RunQueueThresholdPolicyStep()
+{
+    uint32_t switchCount = 0;
+    for (uint32_t ueIdx = 0; ueIdx < g_rlcDlQueueBytesByUe.size(); ++ueIdx)
+    {
+        if (g_policyCooldownStepsByUe[ueIdx] > 0)
+        {
+            continue;
+        }
+
+        uint32_t queueSize = static_cast<uint32_t>(g_rlcDlQueueBytesByUe[ueIdx]);
+        uint8_t currentBwp = g_currentBwpByUe[ueIdx];
+        uint8_t targetBwp = currentBwp;
+
+        if (queueSize > g_bwpQueueThreshold && currentBwp == g_lowBwpId)
+        {
+            targetBwp = g_highBwpId;
+        }
+        else if (queueSize <= g_bwpQueueThreshold && currentBwp == g_highBwpId)
+        {
+            targetBwp = g_lowBwpId;
+        }
+
+        if (targetBwp != currentBwp)
+        {
+            uint16_t rnti = g_rntiByUeIdx[ueIdx];
+            if (SwitchUeBwp(rnti, targetBwp))
+            {
+                switchCount++;
+                g_policyCooldownStepsByUe[ueIdx] = g_policySwitchCooldownSteps;
+            }
+        }
+    }
+    return switchCount;
+}
+
+static void
+RunAamsMcsPolicyStep()
+{
+    for (uint32_t ueIdx = 0; ueIdx < g_ueStats.size(); ++ueIdx)
+    {
+        if (ueIdx < g_stepTbCountByUe.size() && g_stepTbCountByUe[ueIdx] > 0)
+        {
+            double bler = static_cast<double>(g_stepTbErrorByUe[ueIdx]) /
+                          static_cast<double>(g_stepTbCountByUe[ueIdx]);
+
+            if (bler > g_aamsTargetBler)
+            {
+                if (g_targetMcsByUe[ueIdx] >= g_aamsMcsOffset)
+                {
+                    g_targetMcsByUe[ueIdx] -= g_aamsMcsOffset;
+                }
+                else
+                {
+                    g_targetMcsByUe[ueIdx] = 0;
+                }
+            }
+            else if (bler < (g_aamsTargetBler * 0.1))
+            {
+                if (g_targetMcsByUe[ueIdx] <= 28 - g_aamsMcsOffset)
+                {
+                    g_targetMcsByUe[ueIdx] += g_aamsMcsOffset;
+                }
+                else
+                {
+                    g_targetMcsByUe[ueIdx] = 28;
+                }
+            }
+        }
+    }
+    ApplyPerUeMcsOverridesToSchedulers();
+}
+
+static void
+UpdateBaselineSchedulerWeights()
+{
+    if (g_schedulerPolicy != "age_optimal" && g_schedulerPolicy != "lyapunov" &&
+        g_schedulerPolicy != "drqn")
+    {
+        return;
+    }
+
+    uint32_t numUes = static_cast<uint32_t>(g_ueStats.size());
+    double nowMs = Simulator::Now().GetMilliSeconds();
+
+    for (uint32_t ueIdx = 0; ueIdx < numUes; ++ueIdx)
+    {
+        uint16_t rnti = g_rntiByUeIdx[ueIdx];
+        if (rnti == 0) continue;
+
+        if (g_schedulerPolicy == "lyapunov")
+        {
+            uint32_t qBytes = static_cast<uint32_t>(g_rlcDlQueueBytesByUe[ueIdx]);
+            for (auto& sched : g_baselineSchedulers)
+            {
+                if (sched) sched->SetUeQueueSize(rnti, qBytes);
+            }
+        }
+        else if (g_schedulerPolicy == "age_optimal")
+        {
+            double expectedAoi = 0.0;
+            for (uint8_t t = 0; t < TRAFFIC_TYPES; ++t)
+            {
+                double lastRxMs = g_lastRxTimeByType[ueIdx][t] * 1000.0;
+                if (lastRxMs > 0.0)
+                {
+                    double aoiSinceRx = nowMs - lastRxMs;
+                    expectedAoi = std::max(expectedAoi, aoiSinceRx);
+                }
+                else
+                {
+                    expectedAoi = std::max(expectedAoi, g_lastDeliveredAoiMs[ueIdx][t]);
+                }
+            }
+
+            if (expectedAoi < g_ageOptimalAoiThresholdMs)
+            {
+                expectedAoi = 0.0;
+            }
+
+            for (auto& sched : g_baselineSchedulers)
+            {
+                if (sched) sched->SetUeAoiMs(rnti, expectedAoi);
+            }
+        }
+        else if (g_schedulerPolicy == "drqn" && g_schedDqnAgent)
+        {
+            std::vector<double> state = {
+                g_rlcDlQueueBytesByUe[ueIdx] / g_queueNormBytes,
+                g_lastDeliveredAoiMs[ueIdx][LIGHT_HTTP] / 100.0,
+                g_lastDeliveredAoiMs[ueIdx][MODERATE_GAMING] / 100.0,
+                g_lastDeliveredAoiMs[ueIdx][HEAVY_VIDEO] / 100.0
+            };
+            int action = g_schedDqnAgent->SelectAction(state);
+            double weight = (action == 1) ? 2.0 : 1.0;
+            for (auto& sched : g_baselineSchedulers)
+            {
+                if (sched) sched->SetUeWeight(rnti, weight);
+            }
+        }
+    }
+}
+
 static void
 ScheduleBaselinePolicyStep()
 {
@@ -2134,6 +2303,10 @@ ScheduleBaselinePolicyStep()
     {
         switchCount = RunDtPolicyStep();
     }
+    else if (g_bwpBaseline == "queue")
+    {
+        switchCount = RunQueueThresholdPolicyStep();
+    }
     else if (ShouldDriveAequitasScheduler())
     {
         ApplyAequitasInputsToSchedulers();
@@ -2142,6 +2315,14 @@ ScheduleBaselinePolicyStep()
     {
         switchCount = RunDqnPolicyStep();
     }
+
+    if (g_mcsBaseline == "aams")
+    {
+        RunAamsMcsPolicyStep();
+    }
+
+    UpdateBaselineSchedulerWeights();
+
     RecordIntervalMetrics(switchCount);
     g_lastIntervalSwitchCount = g_nextIntervalSwitchCount;
     g_nextIntervalSwitchCount = switchCount;
@@ -2339,7 +2520,7 @@ MyGetReward()
         double auxTerm = 0.0;
         double seReward = 0.0;
         double switchPenalty = 0.0;
-        double reward = goodputTerm;
+        double reward = std::log(goodputTerm + 0.005);
         rewardSum += reward;
         aoiPenaltySum += aoiPenalty;
         goodputTermSum += goodputTerm;
@@ -2860,15 +3041,21 @@ main(int argc, char* argv[])
     }
     g_bwpBaseline = ToLower(g_bwpBaseline);
     g_schedulerPolicy = ToLower(g_schedulerPolicy);
+    g_mcsBaseline = ToLower(g_mcsBaseline);
     trafficModel = ToLower(trafficModel);
     if (g_bwpBaseline != "none" && g_bwpBaseline != "dt" && g_bwpBaseline != "dqn" &&
-        g_bwpBaseline != "aequitas")
+        g_bwpBaseline != "aequitas" && g_bwpBaseline != "queue")
     {
-        NS_ABORT_MSG("Invalid bwpBaseline. Supported values: none|dt|dqn|aequitas");
+        NS_ABORT_MSG("Invalid bwpBaseline. Supported values: none|dt|dqn|aequitas|queue");
     }
-    if (g_schedulerPolicy != "rr" && g_schedulerPolicy != "pf" && g_schedulerPolicy != "aequitas")
+    if (g_schedulerPolicy != "rr" && g_schedulerPolicy != "pf" && g_schedulerPolicy != "aequitas" &&
+        g_schedulerPolicy != "age_optimal" && g_schedulerPolicy != "lyapunov" && g_schedulerPolicy != "drqn")
     {
-        NS_ABORT_MSG("Invalid schedulerPolicy. Supported values: rr|pf|aequitas");
+        NS_ABORT_MSG("Invalid schedulerPolicy. Supported values: rr|pf|aequitas|age_optimal|lyapunov|drqn");
+    }
+    if (g_mcsBaseline != "cqi" && g_mcsBaseline != "aams")
+    {
+        NS_ABORT_MSG("Invalid mcsBaseline. Supported values: cqi|aams");
     }
     if (trafficModel != "legacy" && trafficModel != "mixed")
     {
@@ -3270,6 +3457,12 @@ main(int argc, char* argv[])
     {
         nrHelper->SetSchedulerTypeId(NrMacSchedulerOfdmaAequitas::GetTypeId());
     }
+    else if (g_schedulerPolicy == "age_optimal" || g_schedulerPolicy == "lyapunov" ||
+             g_schedulerPolicy == "drqn")
+    {
+        nrHelper->SetSchedulerTypeId(NrMacSchedulerOfdmaBaseline::GetTypeId());
+        nrHelper->SetSchedulerAttribute("Mode", StringValue(ToUpper(g_schedulerPolicy)));
+    }
     else if (g_schedulerPolicy == "pf")
     {
         nrHelper->SetSchedulerTypeId(NrMacSchedulerOfdmaPF::GetTypeId());
@@ -3333,6 +3526,7 @@ main(int argc, char* argv[])
                 DynamicCast<NrMacSchedulerNs3>(gnbNetDev->GetScheduler(bwpId));
             g_dlSchedulers.push_back(sched);
             g_aequitasSchedulers.push_back(DynamicCast<NrMacSchedulerOfdmaAequitas>(sched));
+            g_baselineSchedulers.push_back(DynamicCast<NrMacSchedulerOfdmaBaseline>(sched));
             if (g_enableRlMcsControl && sched)
             {
                 sched->SetAttribute("FixedMcsDl", BooleanValue(true));
