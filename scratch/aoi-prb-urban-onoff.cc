@@ -1551,7 +1551,7 @@ MyGetObservation()
 {
     uint32_t numUes = static_cast<uint32_t>(g_ueStats.size());
     RefreshStepSpectralEfficiencyCaches();
-    uint32_t featuresPerUe = g_rlDrqnProfile ? 13u : 9u;
+    uint32_t featuresPerUe = g_rlDrqnProfile ? 13u : 8u;
     std::vector<uint32_t> shape = {featuresPerUe * numUes};
     Ptr<OpenGymBoxContainer<float>> box = CreateObject<OpenGymBoxContainer<float>>(shape);
     auto bwpMetrics = ComputeDrqnLiteBwpMetrics();
@@ -1568,45 +1568,29 @@ MyGetObservation()
             continue;
         }
         double queueBytes = ComputeDlRlcQueueBytes(ueIdx);
-        double prevQueueBytes =
-            (ueIdx < g_prevRewardQueueBytesByUe.size() && g_prevRewardQueueBytesByUe[ueIdx] > 0.0)
-                ? g_prevRewardQueueBytesByUe[ueIdx]
-                : queueBytes;
-        double queueDeltaBytes = queueBytes - prevQueueBytes;
-        double cqi = (ueIdx < g_lastCqiByUe.size()) ? g_lastCqiByUe[ueIdx] : 0.0;
+        double arrivedBytes = static_cast<double>(ComputeUeStepArrivedBytes(ueIdx));
         double mcsOffset =
             (ueIdx < g_lastRequestedMcsOffsetByUe.size()) ? g_lastRequestedMcsOffsetByUe[ueIdx] : 0.0;
-        double bwpMode = static_cast<double>(GetCurrentUeBwp(ueIdx) == g_highBwpId ? 1.0 : 0.0);
-        double ueSe =
-            (ueIdx < g_lastStepSpectralEfficiencyByUe.size()) ? g_lastStepSpectralEfficiencyByUe[ueIdx] : 0.0;
-        uint8_t currentBwp = GetCurrentUeBwp(ueIdx);
-        double bwpSe =
-            (currentBwp < g_lastBwpStepSpectralEfficiency.size()) ? g_lastBwpStepSpectralEfficiency[currentBwp] : 0.0;
-        double relSe = ueSe / std::max(1e-6, bwpSe);
-        double recentGoodputMbps =
-            ((ueIdx < g_stepTbBytesByUe.size()) ? static_cast<double>(g_stepTbBytesByUe[ueIdx]) : 0.0) *
-            8.0 / std::max(1e-6, g_envStepTime) / 1.0e6;
-        double dropRate = 0.0;
-        double arrivedBytes = static_cast<double>(ComputeUeStepArrivedBytes(ueIdx));
-        double deliveredBytes = (ueIdx < g_stepTbBytesByUe.size()) ? static_cast<double>(g_stepTbBytesByUe[ueIdx]) : 0.0;
-        if (arrivedBytes > 0.0)
+        double bwpMode = (GetCurrentUeBwp(ueIdx) == g_highBwpId) ? 1.0 : -1.0;
+        double aoiMs = ComputeUeMeanAoiMs(ueIdx);
+        double inFlightBytes = ComputeOutstandingAoiBytes(ueIdx);
+        double timeSinceLastDeliveryMs = ComputeTimeSinceLastDeliveryMs(ueIdx);
+        double sinrNorm = 0.0;
+        if (ueIdx < g_lastSinrDbByUe.size())
         {
-            dropRate = Clamp01(std::max(0.0, arrivedBytes - deliveredBytes) / arrivedBytes);
+            sinrNorm = Clamp01((g_lastSinrDbByUe[ueIdx] + 10.0) / 40.0);
         }
-        double timeSinceLastSwitchMs =
-            (ueIdx < g_lastBwpSwitchTimeSByUe.size())
-                ? std::max(0.0, (Simulator::Now().GetSeconds() - g_lastBwpSwitchTimeSByUe[ueIdx]) * 1000.0)
-                : 0.0;
 
         box->AddValue(static_cast<float>(bwpMode));
-        box->AddValue(static_cast<float>(SignedLogScale(mcsOffset)));
-        box->AddValue(static_cast<float>(LogScaleNonNegative(cqi)));
-        box->AddValue(static_cast<float>(LogScaleNonNegative(queueBytes)));
-        box->AddValue(static_cast<float>(SignedLogScale(queueDeltaBytes)));
-        box->AddValue(static_cast<float>(LogScaleNonNegative(recentGoodputMbps)));
-        box->AddValue(static_cast<float>(LogScaleNonNegative(relSe)));
-        box->AddValue(static_cast<float>(LogScaleNonNegative(dropRate)));
-        box->AddValue(static_cast<float>(LogScaleNonNegative(timeSinceLastSwitchMs)));
+        box->AddValue(static_cast<float>(std::max(-2.0, std::min(2.0, mcsOffset))));
+        box->AddValue(static_cast<float>(SymmetricUnitNorm(sinrNorm)));
+        box->AddValue(static_cast<float>(SymmetricUnitNorm(arrivedBytes / std::max(1.0, g_queueNormBytes))));
+        box->AddValue(static_cast<float>(SymmetricUnitNorm(queueBytes / std::max(1.0, g_queueNormBytes))));
+        box->AddValue(static_cast<float>(SymmetricUnitNorm(aoiMs / std::max(1.0, g_dqnDelayTargetMs))));
+        box->AddValue(static_cast<float>(
+            SymmetricUnitNorm(inFlightBytes / std::max(1.0, g_queueNormBytes))));
+        box->AddValue(static_cast<float>(
+            SymmetricUnitNorm(timeSinceLastDeliveryMs / std::max(1.0, g_dqnDelayTargetMs))));
     }
     return box;
 }
@@ -1652,15 +1636,28 @@ MyGetReward()
         uint64_t prevTxBytes = (ueIdx < g_prevRewardTxBytesByUe.size()) ? g_prevRewardTxBytesByUe[ueIdx] : 0u;
         uint64_t arrivedBytesRaw = (currentTxBytes >= prevTxBytes) ? (currentTxBytes - prevTxBytes) : 0u;
         uint64_t deliveredBytesRaw = (ueIdx < g_stepTbBytesByUe.size()) ? g_stepTbBytesByUe[ueIdx] : 0u;
-        double aoiPenalty = -std::log1p(std::max(0.0, currentAoiMs));
+        // double aoiPenalty = -std::log1p(std::max(0.0, currentAoiMs));
+        // double aoiPenalty = currentAoiMs / (currentAoiMs + 0.5);
+        double aoiPenalty = 1 - std::exp(-currentAoiMs / 20);    // tau=20
         double goodputMbps = static_cast<double>(deliveredBytesRaw) * 8.0 / std::max(1e-6, g_envStepTime) / 1.0e6;
         double goodputTerm = std::log1p(std::max(0.0, goodputMbps));
+
+        double requestedBytes = std::max(0.0, prevQueueBytes) + static_cast<double>(arrivedBytesRaw);
+        double serviceRatio =
+            (requestedBytes > 0.0)
+            ? Clamp01(static_cast<double>(deliveredBytesRaw) / requestedBytes)
+            : 0.0;
+
         double auxTerm = -g_rewardLambdaQueue * std::log1p(currentQueueBytes / std::max(prevQueueBytes, 1e-6));
         double seReward = 0.0;
         double actualSwitch =
             (ueIdx < g_lastActualSwitchByUe.size()) ? static_cast<double>(g_lastActualSwitchByUe[ueIdx]) : 0.0;
         double switchPenalty = (actualSwitch > 0.5) ? -g_rewardLambdaSwitch : 0.0;
-        double reward = aoiPenalty + goodputTerm + auxTerm + switchPenalty;
+
+
+        double reward = aoiPenalty + serviceRatio;
+
+
         rewardSum += reward;
         aoiPenaltySum += aoiPenalty;
         goodputTermSum += goodputTerm;

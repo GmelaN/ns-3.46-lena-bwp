@@ -57,3 +57,20 @@ ns-3.46-lena-gym.zip
 scratch/bwp-switch-mac-priority.cc
 
 *.out
+
+ns3gym-venv/
+doc/
+rl-bwp/runs/
+rl-bwp/_archive/
+
+*.pdf
+*.txt
+*.pt
+*.pth
+*.pid
+*.csv
+*.json
+*.zip
+*.pkl
+_stable_baselines3_version
+data

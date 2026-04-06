@@ -148,6 +148,22 @@ class SharedPerUeAdapter(gym.Env):
         arr = np.asarray(obs, dtype=np.float32).reshape(self.num_ues, self.features_per_ue)
         return arr
 
+    def _maybe_resize_from_obs(self, obs: np.ndarray) -> None:
+        arr = np.asarray(obs, dtype=np.float32).reshape(-1)
+        if arr.size == 0 or arr.size % self.num_ues != 0:
+            return
+        new_features = int(arr.size // self.num_ues)
+        if new_features == self.features_per_ue:
+            return
+        self.features_per_ue = new_features
+        self.observation_space = spaces.Box(
+            low=-100.0,
+            high=100.0,
+            shape=(self.features_per_ue,),
+            dtype=np.float32,
+        )
+        self._global_obs = np.zeros((self.num_ues, self.features_per_ue), dtype=np.float32)
+
     def _build_default_actions(self, obs: np.ndarray) -> np.ndarray:
         defaults = np.zeros((self.num_ues, 2), dtype=np.int64)
         bwp_col = 1 if self.cfg.drqn_profile else 0
@@ -204,6 +220,7 @@ class SharedPerUeAdapter(gym.Env):
 
     def reset(self, seed: int | None = None, options: dict[str, Any] | None = None):
         obs, info = self._env.reset(seed=seed, options=options)
+        self._maybe_resize_from_obs(obs)
         self._global_obs = self._split_obs(obs)
         self._pending_actions = self._build_default_actions(self._global_obs)
         self._reward_buffer.fill(0.0)
@@ -688,6 +705,23 @@ class Ns3BwpEnv(BaseBwpEnv):
                 self._ns3_proc.wait(timeout=2.0)
         self._ns3_proc = None
 
+    def _maybe_resize_from_obs(self, raw_obs: Any) -> None:
+        arr = np.asarray(raw_obs, dtype=np.float32).reshape(-1)
+        if arr.size == 0 or arr.size % self.num_ues != 0:
+            return
+        if arr.size == self.obs_size:
+            return
+        self.features_per_ue = int(arr.size // self.num_ues)
+        self.obs_size = int(arr.size)
+        obs_low = -max(float(self.cfg.queue_max_bytes) * 2.0, 1.0e6)
+        obs_high = max(float(self.cfg.queue_max_bytes) * 2.0, 1.0e6)
+        self.observation_space = spaces.Box(
+            low=obs_low,
+            high=obs_high,
+            shape=(self.obs_size,),
+            dtype=np.float32,
+        )
+
     def _obs_to_fixed(self, raw_obs: Any) -> np.ndarray:
         arr = np.asarray(raw_obs, dtype=np.float32).reshape(-1)
         if arr.size >= self.obs_size:
@@ -746,6 +780,7 @@ class Ns3BwpEnv(BaseBwpEnv):
             )
             self._log_connected("reset")
         raw_obs = self._env.reset()
+        self._maybe_resize_from_obs(raw_obs)
         return self._obs_to_fixed(raw_obs), {}
 
     def step(self, action: np.ndarray):
