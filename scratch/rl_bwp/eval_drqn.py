@@ -93,6 +93,7 @@ def _per_ue_distribution_summary(metric_values: dict[str, list[float]]) -> dict[
 
 def build_env(args):
     ns3_args = parse_extra_args(args.ns3_arg)
+    ns3_args["enableOpenGym"] = "true"
     ns3_args["rlDrqnProfile"] = "true"
     ns3_args["enableRlMcsControl"] = "false"
     cfg = EnvConfig(
@@ -148,7 +149,7 @@ def main():
     parser.add_argument("--port", type=int, default=5555)
     parser.add_argument("--start-sim", action="store_true", default=False)
     parser.add_argument("--debug-ns3", action="store_true", default=False)
-    parser.add_argument("--ns3-script", type=str, default="aoi-prb-urban-onoff")
+    parser.add_argument("--ns3-script", type=str, default="aoi-prb-urban-appmix")
     parser.add_argument("--ns3-arg", action="append", default=[])
     parser.add_argument("--output-json", type=str, default="")
     parser.add_argument("--step-log-csv", type=str, default="")

@@ -109,17 +109,15 @@ RQR_CMD=(
   --min-completed-episodes "$MIN_COMPLETED_EPISODES"
   --total-env-steps 1
   --loss-bin-size "$VALUE_LOSS_N_STEP"
-  --save-every-episodes "$CHECKPOINT_EVERY_EPISODES"
-  --port "$RQR_PORT"
 )
 "${RQR_CMD[@]}" >"$RQR_LOG" 2>&1 &
 RQR_PID=$!
-echo "RQR-DQN agent process started with PID: $RQR_PID"
+echo "single BWP agent process started with PID: $RQR_PID"
 
 nohup "$MONITOR" "$RQR_PID" "$RQR_PORT" 10 5 \
   "aoi-prb-urban-appmix" \
   --numUes="$NUM_UES" --simTime="$EPISODE_TIME_S" --envStepTime="$STEP_TIME_S" \
-  --enableOpenGym=true --trafficModel=mixed \
+  --enableOpenGym=false --initialBwpId=0 --trafficModel=mixed \
   >"$RQR_MONITOR_LOG" 2>&1 &
 RQR_MONITOR_PID=$!
 echo "RQR-DQN monitor process started with PID: $RQR_MONITOR_PID"

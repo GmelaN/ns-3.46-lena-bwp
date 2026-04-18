@@ -36,21 +36,25 @@ def parse_extra_args(items: list[str]) -> dict[str, str]:
 
 def build_env(args, *, seed: int):
     ns3_args = parse_extra_args(args.ns3_arg)
-    if args.drqn_profile:
-        ns3_args["rlDrqnProfile"] = "true"
-        ns3_args["enableRlMcsControl"] = "false"
+    enable_rl_mcs = bool(args.enable_rl_mcs_control)
+    ns3_args["rlRqrProfile"] = "true"
+    ns3_args["enableRlMcsControl"] = "true" if enable_rl_mcs else "false"
+    ns3_args["enableRlBwpControl"] = "true"
+    ns3_args["useSymbolicSwitchDelay"] = "false"
+    ns3_args["switchDelayMs"] = f"{float(args.switch_delay_ms):.6f}"
     cfg = EnvConfig(
         num_ues=args.num_ues,
         step_time_s=args.step_time_s,
         episode_time_s=args.episode_time_s,
-        switch_delay_ms=args.switch_delay_ms,
+        switch_delay_ms=float(args.switch_delay_ms),
         queue_max_bytes=args.queue_max_bytes,
         reward_lambda_switch=args.reward_lambda_switch,
         reward_lambda_queue=args.reward_lambda_queue,
         reward_lambda_delay=args.reward_lambda_delay,
         seed=seed,
-        bwp_only_actions=bool(args.drqn_profile),
-        drqn_profile=bool(args.drqn_profile),
+        bwp_only_actions=not enable_rl_mcs,
+        drqn_profile=False,
+        rqr_profile=True,
     )
     if args.backend == "mock":
         env = MockBwpEnv(cfg)
@@ -59,8 +63,9 @@ def build_env(args, *, seed: int):
             "numUes": cfg.num_ues,
             "simTime": cfg.episode_time_s,
             "envStepTime": cfg.step_time_s,
-            "enableRlMcsControl": "false" if args.drqn_profile else "true",
+            "enableRlMcsControl": "true" if enable_rl_mcs else "false",
             "enableOpenGym": "true",
+            "rlRqrProfile": "true",
         }
         base_sim_args.update(ns3_args)
         env = Ns3BwpEnv(
@@ -80,8 +85,6 @@ def build_env(args, *, seed: int):
 
 def steps_per_episode(cfg: EnvConfig, *, shared_per_ue: bool) -> int:
     base_steps = max(1, int(round(cfg.episode_time_s / cfg.step_time_s)))
-    if shared_per_ue:
-        return base_steps * cfg.num_ues
     return base_steps
 
 
@@ -113,13 +116,13 @@ def save_checkpoint(
 
 def main():
     parser = argparse.ArgumentParser(description="Train recurrent quantile DQN over OpenGym/ns3 env.")
-    parser.add_argument("--backend", choices=["mock", "ns3"], default="mock")
-    parser.add_argument("--run-name", type=str, default="rqrdqn_bwp_mcs_ue1")
+    parser.add_argument("--backend", choices=["mock", "ns3"], default="ns3")
+    parser.add_argument("--run-name", type=str, default="rqrdqn_ue20")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--num-ues", type=int, default=20)
-    parser.add_argument("--step-time-s", type=float, default=0.01)
-    parser.add_argument("--episode-time-s", type=float, default=5.0)
-    parser.add_argument("--switch-delay-ms", type=float, default=5.0)
+    parser.add_argument("--step-time-s", type=float, default=0.001)
+    parser.add_argument("--episode-time-s", type=float, default=30.0)
+    parser.add_argument("--switch-delay-ms", type=float, default=3.0)
     parser.add_argument("--queue-max-bytes", type=float, default=200000.0)
     parser.add_argument("--reward-lambda-switch", type=float, default=0.0001)
     parser.add_argument("--reward-lambda-queue", type=float, default=0.20)
@@ -131,23 +134,22 @@ def main():
     parser.add_argument("--ns3-arg", action="append", default=[])
     parser.add_argument("--shared-per-ue", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--drqn-profile", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--total-env-steps", type=int, default=20000)
+    parser.add_argument("--enable-rl-mcs-control", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--num-quantiles", type=int, default=51)
     parser.add_argument("--seq-len", type=int, default=8)
     parser.add_argument("--burn-in", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--replay-capacity", type=int, default=20000)
-    parser.add_argument("--warmup-sequences", type=int, default=1500)
+    parser.add_argument("--warmup-sequences", type=int, default=300)
     parser.add_argument("--target-sync", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--gamma", type=float, default=0.98)
     parser.add_argument("--eps-start", type=float, default=1.0)
     parser.add_argument("--eps-end", type=float, default=0.05)
-    parser.add_argument("--eps-decay", type=float, default=0.999)
     parser.add_argument("--train-updates-per-step", type=int, default=1)
     parser.add_argument("--final-train-updates", type=int, default=256)
-    parser.add_argument("--min-completed-episodes", type=int, default=1)
+    parser.add_argument("--min-completed-episodes", type=int, default=10)
     parser.add_argument("--reward-bin-size", type=int, default=300)
     parser.add_argument("--loss-bin-size", type=int, default=300)
     parser.add_argument("--disable-step-reward-log", action=argparse.BooleanOptionalAction, default=False)
@@ -213,19 +215,24 @@ def main():
                     "global_step",
                     "ue_index",
                     "reward",
+                    "metric_valid",
                     "mean_thr_mbps",
+                    "mean_step_goodput_mbps",
+                    "ue_thr_mbps",
+                    "ue_goodput_mbps",
                     "mean_aoi_ms",
                     "reward_aoi_penalty_local",
                     "reward_service_ratio_local",
                     "reward_aux_term_local",
                     "reward_switch_penalty_local",
+                    "reward_total_global",
                 ],
             )
             writer.writeheader()
 
     cfg, env = build_env(args, seed=args.seed)
     episode_step_budget = steps_per_episode(cfg, shared_per_ue=bool(args.shared_per_ue))
-    effective_total_env_steps = max(args.total_env_steps, episode_step_budget * max(1, args.min_completed_episodes))
+    effective_total_env_steps = max(int(args.episode_time_s / args.step_time_s) * args.min_completed_episodes, episode_step_budget * max(1, args.min_completed_episodes))
     obs, _ = env.reset(seed=args.seed)
     obs = obs.astype("float32")
     obs_dim = int(obs.shape[0])
@@ -246,7 +253,7 @@ def main():
         target_sync=args.target_sync,
         eps_start=args.eps_start,
         eps_end=args.eps_end,
-        eps_decay=args.eps_decay,
+        eps_decay=max(args.eps_end, (args.eps_end / 1.0) ** (args.step_time_s / (args.episode_time_s * args.min_completed_episodes))),
         train_updates_per_step=args.train_updates_per_step,
         huber_kappa=args.huber_kappa,
         action_selection_quantile=args.action_selection_quantile,
@@ -291,6 +298,9 @@ def main():
     recent_transitions_by_ue: dict[int, deque] = {
         ue: deque(maxlen=args.seq_len) for ue in range(cfg.num_ues)
     }
+    pending_by_ue: dict[int, dict[str, np.ndarray | int] | None] = {
+        ue: None for ue in range(cfg.num_ues)
+    }
 
     global_step = 0
     episode_count = 0
@@ -320,7 +330,7 @@ def main():
     loss_history: list[float] = []
     last_step_info: dict[str, float] = {}
 
-    while global_step < effective_total_env_steps:
+    while episode_count < args.min_completed_episodes:
         epsilon = epsilon_by_step(q_cfg, global_step)
         if args.shared_per_ue:
             hidden_in = hidden_bank[current_ue_idx : current_ue_idx + 1]
@@ -344,36 +354,56 @@ def main():
         if acted_ue_idx < 0 or acted_ue_idx >= cfg.num_ues:
             acted_ue_idx = current_ue_idx if args.shared_per_ue else 0
 
-        transition = {
-            "obs": obs.copy(),
-            "action": int(action),
-            "reward": float(reward),
-            "next_obs": next_obs.copy(),
-            "done": episode_end,
-        }
+        metric_valid = float(step_info.get("metric_valid", 1.0)) > 0.5
+        action_applied = float(step_info.get("action_applied", 1.0)) > 0.5
+        episode_terminal = float(step_info.get("episode_terminal", 0.0)) > 0.5
+        transition_done = bool(episode_terminal or forced_episode_end)
 
-        episode_transitions_by_ue[acted_ue_idx].append(transition)
-        recent_transitions_by_ue[acted_ue_idx].append(transition)
+        pending = pending_by_ue.get(acted_ue_idx)
+        if metric_valid and pending is not None:
+            transition = {
+                "obs": np.asarray(pending["obs"], dtype=np.float32).copy(),
+                "action": int(pending["action"]),
+                "reward": float(reward),
+                "next_obs": obs.copy(),
+                "done": transition_done,
+            }
+            episode_transitions_by_ue[acted_ue_idx].append(transition)
+            recent_transitions_by_ue[acted_ue_idx].append(transition)
 
-        recent_rewards.append(float(reward))
-        episode_reward_values.append(float(reward))
-        episode_thr_values.append(float(step_info.get("mean_thr_mbps", 0.0)))
-        episode_aoi_values.append(float(step_info.get("mean_aoi_ms", 0.0)))
+        if action_applied:
+            pending_by_ue[acted_ue_idx] = {
+                "obs": obs.copy(),
+                "action": int(action),
+            }
+
+        if metric_valid:
+            recent_rewards.append(float(reward))
+            episode_reward_values.append(float(reward))
+            episode_thr_values.append(float(step_info.get("mean_thr_mbps", 0.0)))
+            episode_aoi_values.append(float(step_info.get("mean_aoi_ms", 0.0)))
         episode_step += 1
+        valid_step_advanced = bool(metric_valid)
         step_row = {
             "episode": episode_count + 1,
             "episode_step": episode_step,
-            "global_step": global_step + 1,
+            "global_step": global_step + (1 if valid_step_advanced else 0),
             "ue_index": int(step_info.get("ue_index", -1)),
             "reward": float(reward),
+            "metric_valid": 1 if metric_valid else 0,
             "mean_thr_mbps": float(step_info.get("mean_thr_mbps", 0.0)),
+            "mean_step_goodput_mbps": float(step_info.get("mean_step_goodput_mbps", 0.0)),
+            "ue_thr_mbps": float(step_info.get(f"ue{int(step_info.get('ue_index', -1))}_thr_mbps", 0.0)),
+            "ue_goodput_mbps": float(step_info.get(f"ue{int(step_info.get('ue_index', -1))}_goodput_mbps", 0.0)),
             "mean_aoi_ms": float(step_info.get("mean_aoi_ms", 0.0)),
             "reward_aoi_penalty_local": float(step_info.get("reward_aoi_penalty_local", 0.0)),
             "reward_service_ratio_local": float(step_info.get("reward_service_ratio_local", 0.0)),
             "reward_aux_term_local": float(step_info.get("reward_aux_term_local", 0.0)),
             "reward_switch_penalty_local": float(step_info.get("reward_switch_penalty_local", 0.0)),
+            "reward_total_global": float(step_info.get("reward_total", 0.0)),
         }
-        reward_bin_values.append(float(reward))
+        if metric_valid:
+            reward_bin_values.append(float(reward))
         if not args.disable_step_reward_log:
             with open(step_reward_log_path, "a", encoding="utf-8", newline="") as f:
                 writer = csv.DictWriter(
@@ -384,12 +414,17 @@ def main():
                         "global_step",
                         "ue_index",
                         "reward",
+                        "metric_valid",
                         "mean_thr_mbps",
+                        "mean_step_goodput_mbps",
+                        "ue_thr_mbps",
+                        "ue_goodput_mbps",
                         "mean_aoi_ms",
                         "reward_aoi_penalty_local",
                         "reward_service_ratio_local",
                         "reward_aux_term_local",
                         "reward_switch_penalty_local",
+                        "reward_total_global",
                     ],
                 )
                 writer.writerow(step_row)
@@ -411,7 +446,7 @@ def main():
             reward_bin_values.clear()
             episode_bin_index += 1
 
-        if len(replay) >= args.warmup_sequences:
+        if valid_step_advanced and len(replay) >= args.warmup_sequences:
             for _ in range(args.train_updates_per_step):
                 batch = replay.sample(args.batch_size)
                 train_stats = train_batch(online_net, target_net, optimizer, batch, q_cfg, device)
@@ -422,9 +457,6 @@ def main():
                 gru_loss_bin_values.append(loss)
                 td_quantile_bin_values.append([float(x) for x in train_stats["quantile_td_abs"]])
 
-        if global_step > 0 and global_step % args.target_sync == 0:
-            target_net.load_state_dict(online_net.state_dict())
-
         obs = next_obs
         if args.shared_per_ue:
             acted_ue_idx = int(step_info.get("ue_index", current_ue_idx))
@@ -434,9 +466,12 @@ def main():
             current_ue_idx = (acted_ue_idx + 1) % cfg.num_ues
         else:
             hidden = next_hidden.detach()
-        global_step += 1
+        if valid_step_advanced:
+            global_step += 1
+            if global_step > 0 and global_step % args.target_sync == 0:
+                target_net.load_state_dict(online_net.state_dict())
 
-        if global_step % args.loss_bin_size == 0:
+        if valid_step_advanced and global_step > 0 and global_step % args.loss_bin_size == 0:
             avg_td_quantiles = np.mean(np.asarray(td_quantile_bin_values, dtype=np.float64), axis=0) if td_quantile_bin_values else np.zeros(args.num_quantiles, dtype=np.float64)
             row = {
                 "episode": episode_count + 1,
@@ -454,6 +489,11 @@ def main():
                     fieldnames=["episode", "global_step_end", "window_steps", "num_updates", "avg_value_loss", *td_quantile_fieldnames],
                 )
                 writer.writerow(row)
+            print(
+                f"[loss] episode={episode_count + 1} global_step={global_step} avg_value_loss={row['avg_value_loss']:.6f} "
+                f"updates={row['num_updates']}",
+                flush=True,
+            )
             with open(gru_loss_log_path, "a", encoding="utf-8", newline="") as f:
                 writer = csv.DictWriter(
                     f,
@@ -509,6 +549,11 @@ def main():
                     fieldnames=["episode", "global_step", "mean_reward", "mean_thr_mbps", "mean_aoi_ms"],
                 )
                 writer.writerow(episode_row)
+            print(
+                f"[episode] ep={episode_count} global_step={global_step} mean_reward={episode_row['mean_reward']:.6f} "
+                f"mean_thr_mbps={episode_row['mean_thr_mbps']:.6f} mean_aoi_ms={episode_row['mean_aoi_ms']:.6f}",
+                flush=True,
+            )
 
             if reward_bin_values:
                 with open(reward_bin_log_path, "a", encoding="utf-8", newline="") as f:
@@ -542,6 +587,7 @@ def main():
             recent_transitions_by_ue = {
                 ue: deque(maxlen=args.seq_len) for ue in range(cfg.num_ues)
             }
+            pending_by_ue = {ue: None for ue in range(cfg.num_ues)}
 
             episode_reward_values.clear()
             episode_thr_values.clear()
@@ -551,7 +597,7 @@ def main():
             episode_bin_index = 0
 
             if args.save_every_episodes > 0 and episode_count % args.save_every_episodes == 0:
-                save_checkpoint(
+                ckpt_path = save_checkpoint(
                     out_dir,
                     episode_count,
                     online_net,
@@ -562,6 +608,7 @@ def main():
                     optimizer,
                     q_cfg,
                 )
+                print(f"[checkpoint] ep={episode_count} path={ckpt_path}", flush=True)
 
     for ue_idx in range(cfg.num_ues):
         ue_transitions = episode_transitions_by_ue.get(ue_idx, [])
@@ -629,14 +676,17 @@ def main():
         "env": asdict(cfg),
         "ns3_script": args.ns3_script,
         "ns3_args": parse_extra_args(args.ns3_arg)
-        | (
-            {"rlDrqnProfile": "true", "enableRlMcsControl": "false", "enableOpenGym": "true"}
-            if args.drqn_profile
-            else {"enableRlMcsControl": "true", "enableOpenGym": "true"}
-        ),
+        | {
+            "rlRqrProfile": "true",
+            "enableRlMcsControl": "true" if bool(args.enable_rl_mcs_control) else "false",
+            "enableRlBwpControl": "true",
+            "useSymbolicSwitchDelay": "false",
+            "switchDelayMs": f"{float(args.switch_delay_ms):.6f}",
+            "enableOpenGym": "true",
+        },
         "model": asdict(q_cfg),
         "shared_per_ue": bool(args.shared_per_ue),
-        "total_env_steps": args.total_env_steps,
+        "total_env_steps": int(args.episode_time_s / args.step_time_s) * args.min_completed_episodes,
         "effective_total_env_steps": effective_total_env_steps,
         "episode_step_budget": episode_step_budget,
         "final_train_updates": args.final_train_updates,

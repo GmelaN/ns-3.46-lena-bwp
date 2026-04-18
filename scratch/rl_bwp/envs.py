@@ -39,6 +39,7 @@ class EnvConfig:
     seed: int = 1
     bwp_only_actions: bool = False
     drqn_profile: bool = False
+    rqr_profile: bool = False
     dqn_delay_target_ms: float = 80.0
     dqn_thr_target_mbps: float = 2.0
     dqn_latency_ue_ratio: float = 0.5
@@ -81,14 +82,14 @@ class BaseBwpEnv(gym.Env):
         super().__init__()
         self.cfg = cfg
         self.num_ues = cfg.num_ues
-        self.features_per_ue = 13 if cfg.drqn_profile else 8
+        self.features_per_ue = 13 if cfg.drqn_profile else (7 if cfg.rqr_profile else 8)
         self.obs_size = self.features_per_ue * self.num_ues
 
         if cfg.bwp_only_actions:
             action_nvec = np.array(([2] * self.num_ues), dtype=np.int64)
         else:
             action_nvec = np.array(([2, 5] * self.num_ues), dtype=np.int64)
-        if cfg.drqn_profile:
+        if cfg.drqn_profile or cfg.rqr_profile:
             obs_low = -max(float(cfg.queue_max_bytes) * 2.0, 1.0e6)
             obs_high = max(float(cfg.queue_max_bytes) * 2.0, 1.0e6)
         else:
@@ -148,6 +149,11 @@ class SharedPerUeAdapter(gym.Env):
         self._info_buffer: list[dict[str, Any]] = [dict() for _ in range(self.num_ues)]
         self._current_ue = 0
         self._flushing = False
+        self._switch_delay_steps = max(
+            1, int(np.ceil(float(self.cfg.switch_delay_ms) / max(1e-6, float(self.cfg.step_time_s) * 1000.0)))
+        )
+        self._transition_wait_steps = np.zeros(self.num_ues, dtype=np.int64)
+        self._current_bwp = np.zeros(self.num_ues, dtype=np.int64)
 
     def _split_obs(self, obs: np.ndarray) -> np.ndarray:
         arr = np.asarray(obs, dtype=np.float32).reshape(self.num_ues, self.features_per_ue)
@@ -171,8 +177,11 @@ class SharedPerUeAdapter(gym.Env):
 
     def _build_default_actions(self, obs: np.ndarray) -> np.ndarray:
         defaults = np.zeros((self.num_ues, 2), dtype=np.int64)
-        bwp_col = 1 if self.cfg.drqn_profile else 0
-        defaults[:, 0] = np.rint(obs[:, bwp_col]).astype(np.int64)
+        if self.cfg.rqr_profile:
+            defaults[:, 0] = self._current_bwp.astype(np.int64)
+        else:
+            bwp_col = 1 if self.cfg.drqn_profile else 0
+            defaults[:, 0] = np.rint(obs[:, bwp_col]).astype(np.int64)
         defaults[:, 1] = 2
         return defaults
 
@@ -186,20 +195,32 @@ class SharedPerUeAdapter(gym.Env):
         info_list: list[dict[str, Any]] = []
         for ue in range(self.num_ues):
             switch_penalty = 0.0
-            if self.cfg.drqn_profile:
+            if self.cfg.rqr_profile:
+                goodput_mbps = float(info.get(f"ue{ue}_goodput_mbps", 0.0))
+                switched = float(info.get(f"ue{ue}_switched", 0.0)) > 0.5
+                goodput_term = float(np.log1p(max(0.0, goodput_mbps)))
+                switch_penalty = 0.03 if switched else 0.0
+                reward = goodput_term - switch_penalty
+                aoi_penalty = 0.0
+                aux_term = 0.0
+                se_term = 0.0
+            elif self.cfg.drqn_profile:
                 aoi_ms = float(info.get(f"ue{ue}_aoi_ms", 0.0))
-                thr_mbps = float(info.get(f"ue{ue}_thr_mbps", 0.0))
+                # Prefer step goodput over long-horizon average throughput for better credit assignment.
+                thr_mbps = float(info.get(f"ue{ue}_goodput_mbps", info.get(f"ue{ue}_thr_mbps", 0.0)))
                 delay_norm = float(np.clip(aoi_ms / max(1.0, self.cfg.dqn_delay_target_ms), 0.0, 1.0))
                 thr_norm = float(np.clip(thr_mbps / max(1e-6, self.cfg.dqn_thr_target_mbps), 0.0, 1.0))
                 latency_ues = int(round(self.cfg.dqn_latency_ue_ratio * self.num_ues))
                 is_latency = ue < latency_ues
                 lam = self.cfg.dqn_alpha if is_latency else (1.0 - self.cfg.dqn_alpha)
                 mu = self.cfg.dqn_beta if is_latency else (1.0 - self.cfg.dqn_beta)
+                switched = float(info.get(f"ue{ue}_actual_switch", info.get(f"ue{ue}_switched", 0.0))) > 0.5
+                switch_penalty = float(self.cfg.reward_lambda_switch) if switched else 0.0
                 aux_term = 0.0
                 goodput_term = 0.0
                 se_term = 0.0
                 aoi_penalty = -(lam * delay_norm)
-                reward = -(lam * delay_norm + mu * (1.0 - thr_norm))
+                reward = -(lam * delay_norm + mu * (1.0 - thr_norm)) - switch_penalty
             else:
                 current_aoi_ms = float(info.get(f"ue{ue}_aoi_ms", 0.0))
                 aoi_penalty = -float(np.clip(current_aoi_ms / max(1.0, self.cfg.dqn_delay_target_ms), 0.0, 1.0))
@@ -225,18 +246,26 @@ class SharedPerUeAdapter(gym.Env):
             ue_info["reward_aux_term_local"] = aux_term
             ue_info["reward_se_term_local"] = se_term
             ue_info["reward_bwp_se_local"] = 0.0
-            ue_info["reward_switch_penalty_local"] = switch_penalty
+            ue_info["reward_switch_penalty_local"] = -switch_penalty
             ue_info["reward_drop_penalty_local"] = 0.0
             info_list.append(ue_info)
         return rewards, info_list
+
+    def _refresh_current_bwp(self, info: dict[str, Any]) -> None:
+        for ue in range(self.num_ues):
+            key = f"ue{ue}_current_bwp"
+            if key in info:
+                self._current_bwp[ue] = int(np.clip(float(info[key]), 0.0, 1.0))
 
     def reset(self, seed: int | None = None, options: dict[str, Any] | None = None):
         obs, info = self._env.reset(seed=seed, options=options)
         self._maybe_resize_from_obs(obs)
         self._global_obs = self._split_obs(obs)
+        self._refresh_current_bwp(info)
         self._pending_actions = self._build_default_actions(self._global_obs)
         self._reward_buffer.fill(0.0)
         self._info_buffer = [dict(info, ue_index=ue, metric_valid=0.0) for ue in range(self.num_ues)]
+        self._transition_wait_steps.fill(0)
         self._current_ue = 0
         self._flushing = False
         return self._global_obs[self._current_ue].copy(), self._info_buffer[self._current_ue]
@@ -250,6 +279,7 @@ class SharedPerUeAdapter(gym.Env):
         ue = self._current_ue
         reward = float(self._reward_buffer[ue])
         info = dict(self._info_buffer[ue])
+        info["action_applied"] = 0.0
 
         if self._flushing:
             terminated = ue == self.num_ues - 1
@@ -258,8 +288,17 @@ class SharedPerUeAdapter(gym.Env):
                 self._current_ue += 1
             return self._global_obs[ue].copy(), reward, terminated, truncated, info
 
-        self._pending_actions[ue, 0] = int(action[0])
-        self._pending_actions[ue, 1] = 2 if self.cfg.bwp_only_actions else int(action[1])
+        if self._transition_wait_steps[ue] > 0:
+            self._pending_actions[ue, 0] = int(self._current_bwp[ue])
+            self._pending_actions[ue, 1] = 2
+            info["action_applied"] = 0.0
+        else:
+            bwp_target = int(np.clip(int(action[0]), 0, 1))
+            self._pending_actions[ue, 0] = bwp_target
+            self._pending_actions[ue, 1] = 2 if self.cfg.bwp_only_actions else int(action[1])
+            will_switch = bwp_target != int(self._current_bwp[ue])
+            self._transition_wait_steps[ue] = self._switch_delay_steps if will_switch else 0
+            info["action_applied"] = 1.0
 
         if ue < self.num_ues - 1:
             self._current_ue += 1
@@ -272,8 +311,17 @@ class SharedPerUeAdapter(gym.Env):
             dispatch_action = self._pending_actions.reshape(-1)
         next_obs_flat, _, terminated, truncated, next_info = self._env.step(dispatch_action)
         self._global_obs = self._split_obs(next_obs_flat)
+        self._refresh_current_bwp(next_info)
         self._pending_actions = self._build_default_actions(self._global_obs)
         self._reward_buffer, self._info_buffer = self._compute_per_ue_rewards(prev_obs, self._global_obs, next_info)
+        for i in range(self.num_ues):
+            in_switch_delay = self._transition_wait_steps[i] > 0
+            self._info_buffer[i]["metric_valid"] = 0.0 if in_switch_delay else 1.0
+            if in_switch_delay:
+                self._transition_wait_steps[i] -= 1
+        episode_terminal = 1.0 if (terminated or truncated) else 0.0
+        for i in range(self.num_ues):
+            self._info_buffer[i]["episode_terminal"] = episode_terminal
         self._current_ue = 0
         self._flushing = bool(terminated or truncated)
         return self._global_obs[self._current_ue].copy(), reward, False, False, info
@@ -362,6 +410,23 @@ class MockBwpEnv(BaseBwpEnv):
         return cqi.astype(np.float32)
 
     def _build_obs(self) -> np.ndarray:
+        if self.cfg.rqr_profile:
+            current_bwp = np.where(self.bwp_mode > 0, 1.0, -1.0).astype(np.float32)
+            mcs_offset = np.clip(self.last_requested_mcs_offset.astype(np.float32) / 2.0, -1.0, 1.0)
+            sinr_norm = (2.0 * np.clip((self.sinr_db.astype(np.float32) + 10.0) / 40.0, 0.0, 1.0)) - 1.0
+            cqi_norm = (2.0 * np.clip(self.cqi.astype(np.float32) / 15.0, 0.0, 1.0)) - 1.0
+            queue_norm = (2.0 * np.clip(
+                self.queue_bytes.astype(np.float32) / max(1.0, self.cfg.queue_max_bytes), 0.0, 1.0
+            )) - 1.0
+            tbler_norm = (2.0 * np.clip(self.recent_bler.astype(np.float32), 0.0, 1.0)) - 1.0
+            goodput_norm = (2.0 * np.clip(
+                self.throughput_mbps.astype(np.float32) / max(1e-6, self.cfg.dqn_thr_target_mbps), 0.0, 1.0
+            )) - 1.0
+            stacked = np.stack(
+                [current_bwp, mcs_offset, sinr_norm, cqi_norm, queue_norm, tbler_norm, goodput_norm],
+                axis=1,
+            )
+            return stacked.reshape(-1).astype(np.float32)
         if self.cfg.drqn_profile:
             queue_norm = np.clip(self.queue_bytes / max(1.0, self.cfg.queue_max_bytes), 0.0, 1.0)
             channel_norm = np.clip(self.cqi / 15.0, 0.0, 1.0)
@@ -574,7 +639,9 @@ class MockBwpEnv(BaseBwpEnv):
         mean_aoi_ms = float(np.mean(self.aoi_ms))
         mean_delta_aoi_ms = float(np.mean(self.aoi_ms - self.prev_aoi_ms))
         mean_throughput_mbps = float(np.mean(self.throughput_mbps))
-        if self.cfg.drqn_profile:
+        if self.cfg.rqr_profile:
+            reward = float(np.mean(np.log1p(np.maximum(self.throughput_mbps.astype(np.float64), 0.0))))
+        elif self.cfg.drqn_profile:
             reward = self._shape_reward(
                 mean_aoi_ms,
                 float(np.mean(self.prev_aoi_ms)),
@@ -616,6 +683,7 @@ class MockBwpEnv(BaseBwpEnv):
             info[f"ue{ue}_prev_aoi_ms"] = float(self.prev_aoi_ms[ue])
             info[f"ue{ue}_bler"] = float(self.recent_bler[ue])
             info[f"ue{ue}_hol_age_ms"] = float(self.hol_age_ms[ue])
+            info[f"ue{ue}_current_bwp"] = float(self.bwp_mode[ue])
         info["bwp0_avg_mcs"] = bwp0_avg_mcs
         info["bwp1_avg_mcs"] = bwp1_avg_mcs
         info["bwp0_total_prb"] = 40.0
@@ -678,6 +746,7 @@ class Ns3BwpEnv(BaseBwpEnv):
         cli_args = [
             self._sim_script,
             f"--openGymPort={self._port}",
+            f"--RngRun={sim_seed}",
         ]
         for k, v in self._sim_args.items():
             key = str(k)
@@ -729,7 +798,10 @@ class Ns3BwpEnv(BaseBwpEnv):
 
     def _obs_to_fixed(self, raw_obs: Any) -> np.ndarray:
         arr = np.asarray(raw_obs, dtype=np.float32).reshape(-1)
-        clip_bound = 100.0 if self.cfg.drqn_profile else 2.0
+        if self.cfg.drqn_profile or self.cfg.rqr_profile:
+            clip_bound = max(float(self.cfg.queue_max_bytes) * 2.0, 1.0e6)
+        else:
+            clip_bound = 2.0
         if arr.size >= self.obs_size:
             out = arr[: self.obs_size]
             out = np.nan_to_num(out, nan=0.0, posinf=clip_bound, neginf=-clip_bound)
@@ -798,8 +870,10 @@ class Ns3BwpEnv(BaseBwpEnv):
         encoded = []
         for ue in range(self.num_ues):
             if self.cfg.bwp_only_actions:
-                bwp_target = int(action[ue])
-                delta_idx = 2
+                # For BWP-only control, pass raw {0,1} directly.
+                # ns-3 side may not decode bwp*5+mcs_idx when MCS control is disabled.
+                encoded.append(int(np.clip(int(action[ue]), 0, 1)))
+                continue
             else:
                 bwp_target = int(action[2 * ue + 0])
                 delta_idx = int(action[2 * ue + 1])

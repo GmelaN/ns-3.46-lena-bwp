@@ -25,6 +25,7 @@
 #include "ns3/nr-gnb-mac.h"
 #include "ns3/nr-gnb-net-device.h"
 #include "ns3/nr-mac-scheduler-ofdma-aequitas.h"
+#include "ns3/nr-mac-scheduler-ofdma-aequitas.h"
 #include "ns3/nr-mac-scheduler-ofdma-baseline.h"
 #include "ns3/nr-mac-scheduler-ofdma-pf.h"
 #include "ns3/nr-mac-scheduler-ofdma-rr.h"
@@ -71,8 +72,6 @@ enum TrafficType : uint8_t
     HEAVY_VIDEO = 2,
     TRAFFIC_TYPES = 3
 };
-
-static constexpr uint8_t G_DPP_ACTION_COUNT = 6;
 
 class TxTimeTag : public Tag
 {
@@ -284,6 +283,8 @@ static std::vector<double> g_policyBaseStartSByUe;
 static std::vector<int32_t> g_policyPhaseOffsetByUe;
 static bool g_policyUseOnOff2Phase = false;
 static double g_policySegmentDurationS = 0.6;
+static std::vector<int32_t> g_oracleLastPhaseByUe;
+static std::vector<double> g_oracleHighHoldUntilSByUe;
 
 static Ptr<BwpManagerGnb> g_gnbBwpMgr;
 static std::unordered_map<uint16_t, Ptr<BwpManagerUe>> g_ueMgrByRnti;
@@ -309,13 +310,13 @@ static std::unordered_map<uint16_t, uint32_t> g_ueIdxByRnti;
 static std::vector<uint16_t> g_rntiByUeIdx;
 static std::vector<uint32_t> g_totalPrbByBwp;
 
-// Control loop state
-static bool g_enableOpenGym = false;
-static uint32_t g_openGymPort = 5555;
+// RL/OpenGym state
+static bool g_enableOpenGym = true;
 static bool g_enableRlBwpControl = true;
-static bool g_enableRlMcsControl = false;
+static bool g_enableRlMcsControl = true;
+static bool g_rlRqrProfile = false;
 static bool g_rlDebug = false;
-static double g_rewardLambdaSwitch = 0.01;
+static uint32_t g_openGymPort = 5555;
 static double g_envStepTime = 0.02; // 20 ms
 static bool g_enableLosNlosStats = true;
 static double g_losSamplePeriodS = 0.02;
@@ -326,9 +327,13 @@ static uint32_t g_switchDelaySymbols = 14;
 static uint8_t g_switchDelayNumerology = 0;
 static bool g_useSymbolicSwitchDelay = false;
 static double g_queueNormBytes = 200000.0;
-static uint8_t g_initialMcs = 10;
-static bool g_enablePerUeMcsControl = false;
-static uint32_t g_rlcMaxTxBufferBytes = 10 * 1024;
+static double g_rewardLambdaSwitch = 0.0001;
+static double g_rewardLambdaQueue = 0.20;
+static double g_rewardLambdaDelay = 0.10;
+static double g_rqrSwitchPenaltyWeight = 0.03;
+static double g_rqrHighBwpNlosPenaltyWeight = 0.10;
+static double g_rqrQueueStallPenaltyWeight = 0.08;
+static uint8_t g_rlInitialMcs = 10;
 static int32_t g_staticMcsOffset = 0;
 static double g_prbDemandC0 = 5.0;
 static double g_prbDemandC1 = 2.0;
@@ -385,7 +390,6 @@ struct PendingBwpSwitch
 };
 
 static std::unordered_map<uint16_t, PendingBwpSwitch> g_pendingBwpSwitchByRnti;
-static void TriggerDppPolicyEpoch();
 
 static uint32_t g_lastIntervalSwitchCount = 0;
 static uint32_t g_nextIntervalSwitchCount = 0;
@@ -394,6 +398,7 @@ static double g_lastQueueOverflowRatio = 0.0;
 static double g_lastMeanPrbUtility = 0.0;
 static double g_lastMeanRewardAoiTerm = 0.0;
 static double g_lastMeanRewardThrTerm = 0.0;
+static double g_lastMeanRewardPdrTerm = 0.0;
 static double g_lastMeanRewardSeTerm = 0.0;
 static double g_lastMeanRewardSwitchPenalty = 0.0;
 static double g_lastMeanRewardTotal = 0.0;
@@ -417,9 +422,7 @@ static std::vector<double> g_prevRewardAoiMsByUe;
 static std::vector<double> g_prevRewardThrMbpsByUe;
 static std::vector<uint64_t> g_prevRewardTxBytesByUe;
 static std::vector<uint64_t> g_prevRewardRxBytesByUe;
-static std::vector<std::array<uint64_t, TRAFFIC_TYPES>> g_prevRewardTxBytesByType;
 static std::vector<double> g_lastRewardPrevQueueBytesByUe;
-static std::vector<double> g_lastRewardPrevAoiMsByUe;
 static std::vector<uint64_t> g_lastRewardArrivedBytesByUe;
 static std::vector<uint64_t> g_lastRewardDeliveredBytesByUe;
 static uint64_t g_nextAoiPacketId = 1;
@@ -486,15 +489,11 @@ static std::string g_layoutTraceFile = "";
 static std::string g_trajectoryTraceFile = "";
 static double g_trajectorySamplePeriodS = 0.1;
 static std::unique_ptr<std::ofstream> g_trajectoryTraceStream;
-static bool g_dppScoreDebug = false;
-static std::string g_dppScoreTraceFile = "";
-static std::unique_ptr<std::ofstream> g_dppScoreTraceStream;
-static int32_t g_dppScoreTraceUe = -1;
 
-static std::string g_schedulerPolicy = "rr"; // rr|pf|aequitas|age_optimal|tps|dgs
+static std::string g_schedulerPolicy = "rr"; // rr|pf|aequitas|age_optimal|lyapunov|drqn
 
 // Baseline policy configuration
-static std::string g_bwpBaseline = "none"; // none|dt|aequitas|queue|dpp
+static std::string g_bwpBaseline = "none"; // none|dt|dqn|aequitas|queue|oracle_tmcs
 static std::string g_mcsBaseline = "cqi"; // cqi|aams
 static double g_aequitasDeadlineMs = 100.0;
 static bool g_aequitasEnableMcsSelection = true;
@@ -502,24 +501,17 @@ static uint32_t g_policySwitchCooldownSteps = 2;
 static std::vector<uint32_t> g_policyCooldownStepsByUe;
 
 // Queue-Threshold BWP baseline parameters (Device_Power_Saving paper)
-static uint32_t g_bwpQueueThreshold = 800; // threshold in bytes
+static uint32_t g_bwpQueueThreshold = 600; // threshold in bytes
 
 // AAMS MCS baseline parameters
 static double g_aamsTargetBler = 0.10; // 10% target BLER
 static uint8_t g_aamsMcsOffset = 2;
 
+// Lyapunov scheduling parameters
+static double g_lyapunovV = 10.0;
+
 // Age-Optimal scheduling parameters
 static double g_ageOptimalAoiThresholdMs = 20.0;
-static double g_ageOptimalGammaPenalty = 20.0;
-static double g_tpsDeadlineMs = 100.0;
-static double g_dgsDelayTargetMs = 100.0;
-static bool g_rlDrqnProfile = false;
-static double g_dqnDelayTargetMs = 80.0;
-static double g_dqnThrTargetMbps = 2.0;
-static double g_dqnLatencyUeRatio = 0.5;
-static double g_dqnAlpha = 0.7; // delay weight for latency-sensitive UEs
-static double g_dqnBeta = 0.3;  // throughput weight for latency-sensitive UEs
-static int32_t g_appmixStateOverride = -1;
 
 // DT-like predictive baseline parameters
 static double g_dtDelayTargetMs = 80.0;
@@ -531,30 +523,251 @@ static double g_dtEmaAlpha = 0.25;
 static std::vector<double> g_dtEmaAoiMsByUe;
 static std::vector<double> g_dtEmaQueueNormByUe;
 
-// DPP baseline parameters and trigger-epoch state.
-static double g_dppV = 0.1;
-static double g_dppLambdaSwitch = 0.005;
-static double g_dppLambdaBler = 1.0;
-static double g_dppEpochMinIntervalS = 0.01;
-static double g_dppLastEpochS = -1.0;
-static uint32_t g_dppSwitchCountAccum = 0;
-static EventId g_dppEpochEvent;
-static double g_dppMuPriorMeanMbps = 1.0;
-static double g_dppMuPriorPrecision = 1.0;
-static double g_dppMuObsPrecision = 2.0;
-static double g_dppBlerPriorAlpha = 1.0;
-static double g_dppBlerPriorBeta = 9.0;
-static std::vector<std::array<double, G_DPP_ACTION_COUNT>> g_dppMuPostMeanByUe;
-static std::vector<std::array<double, G_DPP_ACTION_COUNT>> g_dppMuPostPrecisionByUe;
-static std::vector<std::array<double, G_DPP_ACTION_COUNT>> g_dppBlerAlphaByUe;
-static std::vector<std::array<double, G_DPP_ACTION_COUNT>> g_dppBlerBetaByUe;
-static std::vector<int32_t> g_dppLastActionByUe;
-static std::vector<bool> g_dppHasLastActionByUe;
-static std::vector<double> g_dppLastDecisionTimeSByUe;
-static std::vector<double> g_dppLastEpochDeltaSByUe;
-static std::vector<uint64_t> g_dppLastTbBytesCumByUe;
-static std::vector<uint64_t> g_dppLastTbCountCumByUe;
-static std::vector<uint64_t> g_dppLastTbErrorCumByUe;
+// Oracle traffic-aware BWP + channel-aware MCS-delta baseline parameters.
+static double g_oracleSinrHighDb = 18.0;
+static double g_oracleSinrLowDb = 8.0;
+static double g_oracleQueueHighNorm = 0.80;
+static double g_oracleQueueLowNorm = 0.25;
+static double g_oraclePhaseLeadS = 0.06;
+static double g_oracleBurstMinHoldS = 0.10;
+
+// DQN-like baseline parameters
+static uint32_t g_dqnHistoryLen = 4;
+static uint32_t g_dqnHiddenSize = 32;
+static uint32_t g_dqnReplayCapacity = 6000;
+static uint32_t g_dqnBatchSize = 64;
+static uint32_t g_dqnWarmup = 300;
+static uint32_t g_dqnTargetSync = 100;
+static double g_dqnLr = 1e-3;
+static double g_dqnGamma = 0.98;
+static double g_dqnEpsStart = 1.0;
+static double g_dqnEpsEnd = 0.05;
+static double g_dqnEpsDecay = 0.999;
+static double g_dqnDelayTargetMs = 80.0;
+static double g_dqnThrTargetMbps = 2.0;
+static double g_dqnLatencyUeRatio = 0.5;
+static double g_dqnAlpha = 0.7; // delay weight for latency-sensitive UEs
+static double g_dqnBeta = 0.3;  // throughput weight for latency-sensitive UEs
+static bool g_rlDrqnProfile = false;
+
+static std::vector<std::deque<std::array<double, 7>>> g_dqnFeatureHistoryByUe;
+static std::vector<std::vector<double>> g_dqnPrevStateByUe;
+static std::vector<int> g_dqnPrevActionByUe;
+static std::vector<bool> g_dqnHasPrevByUe;
+
+struct DqnTransition
+{
+    std::vector<double> s;
+    int a{0};
+    double r{0.0};
+    std::vector<double> sNext;
+};
+
+class SimpleDqnAgent
+{
+  public:
+    SimpleDqnAgent(uint32_t stateDim,
+                   uint32_t hiddenDim,
+                   double lr,
+                   double gamma,
+                   uint32_t replayCapacity,
+                   uint32_t batchSize,
+                   uint32_t warmup,
+                   uint32_t targetSync,
+                   double epsStart,
+                   double epsEnd,
+                   double epsDecay)
+        : m_stateDim(stateDim),
+          m_hiddenDim(hiddenDim),
+          m_lr(lr),
+          m_gamma(gamma),
+          m_replayCapacity(replayCapacity),
+          m_batchSize(batchSize),
+          m_warmup(warmup),
+          m_targetSync(targetSync),
+          m_eps(epsStart),
+          m_epsEnd(epsEnd),
+          m_epsDecay(epsDecay)
+    {
+        std::normal_distribution<double> nd(0.0, 0.05);
+        m_w1.assign(m_hiddenDim * m_stateDim, 0.0);
+        m_b1.assign(m_hiddenDim, 0.0);
+        m_w2.assign(2 * m_hiddenDim, 0.0);
+        m_b2.assign(2, 0.0);
+        for (auto& w : m_w1)
+        {
+            w = nd(m_rng);
+        }
+        for (auto& w : m_w2)
+        {
+            w = nd(m_rng);
+        }
+        SyncTarget();
+    }
+
+    int SelectAction(const std::vector<double>& state)
+    {
+        std::uniform_real_distribution<double> ur(0.0, 1.0);
+        if (ur(m_rng) < m_eps)
+        {
+            std::uniform_int_distribution<int> ui(0, 1);
+            return ui(m_rng);
+        }
+        auto q = Forward(state, m_w1, m_b1, m_w2, m_b2);
+        return (q[1] > q[0]) ? 1 : 0;
+    }
+
+    void Observe(const DqnTransition& tr)
+    {
+        if (tr.s.empty() || tr.sNext.empty())
+        {
+            return;
+        }
+        if (m_replay.size() >= m_replayCapacity)
+        {
+            m_replay.pop_front();
+        }
+        m_replay.push_back(tr);
+        m_step++;
+        if (m_eps > m_epsEnd)
+        {
+            m_eps = std::max(m_epsEnd, m_eps * m_epsDecay);
+        }
+        if (m_replay.size() >= m_warmup)
+        {
+            TrainOneBatch();
+            if (m_targetSync > 0 && m_step % m_targetSync == 0)
+            {
+                SyncTarget();
+            }
+        }
+    }
+
+  private:
+    std::array<double, 2> Forward(const std::vector<double>& s,
+                                  const std::vector<double>& w1,
+                                  const std::vector<double>& b1,
+                                  const std::vector<double>& w2,
+                                  const std::vector<double>& b2) const
+    {
+        std::vector<double> h(m_hiddenDim, 0.0);
+        for (uint32_t i = 0; i < m_hiddenDim; ++i)
+        {
+            double z = b1[i];
+            for (uint32_t j = 0; j < m_stateDim; ++j)
+            {
+                z += w1[i * m_stateDim + j] * s[j];
+            }
+            h[i] = (z > 0.0) ? z : 0.0;
+        }
+        std::array<double, 2> q = {b2[0], b2[1]};
+        for (uint32_t a = 0; a < 2; ++a)
+        {
+            for (uint32_t i = 0; i < m_hiddenDim; ++i)
+            {
+                q[a] += w2[a * m_hiddenDim + i] * h[i];
+            }
+        }
+        return q;
+    }
+
+    void TrainOneBatch()
+    {
+        std::uniform_int_distribution<uint32_t> ui(0, static_cast<uint32_t>(m_replay.size() - 1));
+        uint32_t bs = std::min<uint32_t>(m_batchSize, static_cast<uint32_t>(m_replay.size()));
+        for (uint32_t bi = 0; bi < bs; ++bi)
+        {
+            const auto& tr = m_replay[ui(m_rng)];
+            std::vector<double> h(m_hiddenDim, 0.0);
+            std::vector<double> z(m_hiddenDim, 0.0);
+            for (uint32_t i = 0; i < m_hiddenDim; ++i)
+            {
+                z[i] = m_b1[i];
+                for (uint32_t j = 0; j < m_stateDim; ++j)
+                {
+                    z[i] += m_w1[i * m_stateDim + j] * tr.s[j];
+                }
+                h[i] = (z[i] > 0.0) ? z[i] : 0.0;
+            }
+
+            std::array<double, 2> q = {m_b2[0], m_b2[1]};
+            for (uint32_t a = 0; a < 2; ++a)
+            {
+                for (uint32_t i = 0; i < m_hiddenDim; ++i)
+                {
+                    q[a] += m_w2[a * m_hiddenDim + i] * h[i];
+                }
+            }
+
+            auto qNext = Forward(tr.sNext, m_w1Target, m_b1Target, m_w2Target, m_b2Target);
+            double target = tr.r + m_gamma * std::max(qNext[0], qNext[1]);
+            double err = q[tr.a] - target;
+            double gradQ = 2.0 * err;
+
+            for (uint32_t i = 0; i < m_hiddenDim; ++i)
+            {
+                m_w2[tr.a * m_hiddenDim + i] -= m_lr * gradQ * h[i];
+            }
+            m_b2[tr.a] -= m_lr * gradQ;
+
+            std::vector<double> gradH(m_hiddenDim, 0.0);
+            for (uint32_t i = 0; i < m_hiddenDim; ++i)
+            {
+                gradH[i] = gradQ * m_w2[tr.a * m_hiddenDim + i];
+                if (z[i] <= 0.0)
+                {
+                    gradH[i] = 0.0;
+                }
+            }
+            for (uint32_t i = 0; i < m_hiddenDim; ++i)
+            {
+                for (uint32_t j = 0; j < m_stateDim; ++j)
+                {
+                    m_w1[i * m_stateDim + j] -= m_lr * gradH[i] * tr.s[j];
+                }
+                m_b1[i] -= m_lr * gradH[i];
+            }
+        }
+    }
+
+    void SyncTarget()
+    {
+        m_w1Target = m_w1;
+        m_b1Target = m_b1;
+        m_w2Target = m_w2;
+        m_b2Target = m_b2;
+    }
+
+  private:
+    uint32_t m_stateDim{0};
+    uint32_t m_hiddenDim{0};
+    double m_lr{1e-3};
+    double m_gamma{0.98};
+    uint32_t m_replayCapacity{5000};
+    uint32_t m_batchSize{64};
+    uint32_t m_warmup{200};
+    uint32_t m_targetSync{100};
+    uint64_t m_step{0};
+    double m_eps{1.0};
+    double m_epsEnd{0.05};
+    double m_epsDecay{0.999};
+    std::mt19937 m_rng{7};
+
+    std::vector<double> m_w1;
+    std::vector<double> m_b1;
+    std::vector<double> m_w2;
+    std::vector<double> m_b2;
+
+    std::vector<double> m_w1Target;
+    std::vector<double> m_b1Target;
+    std::vector<double> m_w2Target;
+    std::vector<double> m_b2Target;
+
+    std::deque<DqnTransition> m_replay;
+};
+
+static std::unique_ptr<SimpleDqnAgent> g_dqnAgent;
+static std::unique_ptr<SimpleDqnAgent> g_schedDqnAgent;
 
 static bool
 HasPendingBwpSwitch(uint16_t rnti)
@@ -699,7 +912,6 @@ DlSchedulingTrace(NrSchedulingCallbackInfo info)
             g_schedCountCumByUe[ueIdx]++;
         }
     }
-    TriggerDppPolicyEpoch();
     if (!g_enableMcsSwitch)
     {
         return;
@@ -774,7 +986,7 @@ RegisterUeManager(Ptr<NrUeNetDevice> ueDev, uint32_t ueIdx)
     {
         g_currentBwpByUe[ueIdx] = g_initialBwpId;
     }
-    if (g_enablePerUeMcsControl && ueIdx < g_targetMcsByUe.size())
+    if (g_enableRlMcsControl && ueIdx < g_targetMcsByUe.size())
     {
         for (auto const& sched : g_dlSchedulers)
         {
@@ -1504,6 +1716,17 @@ ComputeOFDMASymbolDurationMs(uint8_t numerology)
     return slotDurationMs / 14.0;
 }
 
+static double
+GetEffectiveMinSwitchIntervalMs()
+{
+    // If not explicitly configured, derive a practical default from switching delay.
+    if (g_minSwitchIntervalMs > 0.0)
+    {
+        return g_minSwitchIntervalMs;
+    }
+    return std::max(1.0, 10.0 * g_switchDelayMsCfg);
+}
+
 static uint8_t
 GetCurrentUeBwp(uint32_t ueIdx)
 {
@@ -1522,20 +1745,6 @@ ComputeDlRlcQueueBytes(uint32_t ueIdx)
         return 0.0;
     }
     return std::max(0.0, g_rlcDlQueueBytesByUe[ueIdx]);
-}
-
-static double
-ComputeDppBacklogRatio(uint32_t ueIdx)
-{
-    const double queueBytes = ComputeDlRlcQueueBytes(ueIdx);
-    uint32_t activeLcids = 1u;
-    if (ueIdx < g_rlcDlQueueBytesByUeAndLcid.size())
-    {
-        activeLcids = std::max<uint32_t>(1u, static_cast<uint32_t>(g_rlcDlQueueBytesByUeAndLcid[ueIdx].size()));
-    }
-    const double denom = static_cast<double>(activeLcids) *
-                         static_cast<double>(std::max<uint32_t>(1u, g_rlcMaxTxBufferBytes));
-    return Clamp01(queueBytes / std::max(1.0, denom));
 }
 
 static void
@@ -1566,7 +1775,6 @@ RlcTxBufferSizeTrace(uint16_t rnti, uint8_t lcid, uint32_t bytes)
         totalBytes += std::max(0.0, qBytes);
     }
     g_rlcDlQueueBytesByUe[ueIdx] = totalBytes;
-    TriggerDppPolicyEpoch();
 }
 
 static void
@@ -1651,8 +1859,8 @@ ComputeCurrentAoiMs(uint32_t ueIdx, uint8_t type)
         static_cast<double>((Simulator::Now() - NanoSeconds(outstanding.begin()->first)).GetMilliSeconds()));
 }
 
-[[maybe_unused]] static double
-ComputeUeHolAoiMs(uint32_t ueIdx)
+static double
+ComputeUeMeanAoiMs(uint32_t ueIdx)
 {
     if (ueIdx >= g_outstandingAoiByUe.size())
     {
@@ -1669,25 +1877,16 @@ ComputeUeHolAoiMs(uint32_t ueIdx)
 }
 
 static double
-ComputeUeMeanAoiMs(uint32_t ueIdx)
+ComputeUeKpiAoiMs(uint32_t ueIdx)
 {
-    if (ueIdx >= g_ueStats.size())
+    // Primary AoI: HOL age from outstanding queue.
+    const double holAoiMs = ComputeUeMeanAoiMs(ueIdx);
+    if (holAoiMs > 0.0)
     {
-        return std::max(1.0, g_envStepTime * 1000.0);
+        return holAoiMs;
     }
 
-    const auto& http = g_ueStats[ueIdx].flow[LIGHT_HTTP];
-    const auto& gaming = g_ueStats[ueIdx].flow[MODERATE_GAMING];
-    const auto& video = g_ueStats[ueIdx].flow[HEAVY_VIDEO];
-
-    const uint64_t samples = http.aoiSamples + gaming.aoiSamples + video.aoiSamples;
-    if (samples > 0)
-    {
-        const double sumMs = http.aoiSumMs + gaming.aoiSumMs + video.aoiSumMs;
-        return std::max(0.0, sumMs / static_cast<double>(samples));
-    }
-
-    // Fallback before first Rx sample: receiver-side age since last delivery timestamp.
+    // Fallback AoI: receiver-side age since last successful delivery.
     if (ueIdx < g_lastNodeRxTimeByUe.size())
     {
         const double lastRxS = g_lastNodeRxTimeByUe[ueIdx];
@@ -1708,34 +1907,29 @@ ComputeUeMeanAoiMs(uint32_t ueIdx)
 }
 
 static double
-ComputeUeKpiAoiMs(uint32_t ueIdx)
+ComputeOutstandingAoiBytes(uint32_t ueIdx)
 {
-    // Unified KPI AoI: packet-level AoI.
-    return ComputeUeMeanAoiMs(ueIdx);
-}
-
-static double
-ComputeExpectedReceiverAoiMs(uint32_t ueIdx, double nowMs)
-{
-    if (ueIdx >= g_lastRxTimeByType.size() || ueIdx >= g_lastDeliveredAoiMs.size())
+    if (ueIdx >= g_outstandingAoiBytesByUe.size())
     {
         return 0.0;
     }
+    return static_cast<double>(g_outstandingAoiBytesByUe[ueIdx]);
+}
 
-    double expectedAoi = 0.0;
-    for (uint8_t t = 0; t < TRAFFIC_TYPES; ++t)
+static double
+ComputeTimeSinceLastDeliveryMs(uint32_t ueIdx)
+{
+    if (ueIdx >= g_lastDeliveryTimeNsByUe.size())
     {
-        const double lastRxMs = g_lastRxTimeByType[ueIdx][t] * 1000.0;
-        if (lastRxMs > 0.0)
-        {
-            expectedAoi = std::max(expectedAoi, std::max(0.0, nowMs - lastRxMs));
-        }
-        else
-        {
-            expectedAoi = std::max(expectedAoi, g_lastDeliveredAoiMs[ueIdx][t]);
-        }
+        return 0.0;
     }
-    return expectedAoi;
+    uint64_t nowNs = static_cast<uint64_t>(Simulator::Now().GetNanoSeconds());
+    uint64_t lastNs = g_lastDeliveryTimeNsByUe[ueIdx];
+    if (nowNs <= lastNs)
+    {
+        return 0.0;
+    }
+    return static_cast<double>((nowNs - lastNs) / 1000000.0);
 }
 
 static void
@@ -1811,7 +2005,7 @@ ComputeUePrbUtility(uint32_t ueIdx)
     {
         totalPrb = std::max<uint32_t>(1u, g_totalPrbByBwp[bwp]);
     }
-    double mcs = (ueIdx < g_lastMcsByUe.size()) ? g_lastMcsByUe[ueIdx] : static_cast<double>(g_initialMcs);
+    double mcs = (ueIdx < g_lastMcsByUe.size()) ? g_lastMcsByUe[ueIdx] : static_cast<double>(g_rlInitialMcs);
     double bytesPerPrb = std::max(1.0, g_prbDemandC0 + g_prbDemandC1 * mcs);
     double demandedPrb = queueBytes / std::max(1.0, bytesPerPrb);
     return demandedPrb / static_cast<double>(totalPrb);
@@ -1833,6 +2027,36 @@ ComputeUeThroughputMbps(uint32_t ueIdx)
     return static_cast<double>(rxBytes) * 8.0 / durationS / 1e6;
 }
 
+static uint64_t
+ComputeUeTxBytes(uint32_t ueIdx)
+{
+    if (ueIdx >= g_txBytesByType.size())
+    {
+        return 0u;
+    }
+    uint64_t txBytes = 0u;
+    for (uint8_t type = 0; type < TRAFFIC_TYPES; ++type)
+    {
+        txBytes += g_txBytesByType[ueIdx][type];
+    }
+    return txBytes;
+}
+
+static uint64_t
+ComputeUeRxBytes(uint32_t ueIdx)
+{
+    if (ueIdx >= g_ueStats.size())
+    {
+        return 0u;
+    }
+    uint64_t rxBytes = 0u;
+    for (uint8_t type = 0; type < TRAFFIC_TYPES; ++type)
+    {
+        rxBytes += g_ueStats[ueIdx].flow[type].rxBytes;
+    }
+    return rxBytes;
+}
+
 static double
 ComputeUeStepSpectralEfficiency(uint32_t ueIdx)
 {
@@ -1847,6 +2071,85 @@ ComputeUeStepSpectralEfficiency(uint32_t ueIdx)
     }
     double deliveredBits = static_cast<double>(g_stepTbBytesByUe[ueIdx]) * 8.0;
     return deliveredBits / static_cast<double>(assignedPrb);
+}
+
+static uint64_t
+ComputeUeStepArrivedBytes(uint32_t ueIdx)
+{
+    uint64_t currentTxBytes = ComputeUeTxBytes(ueIdx);
+    uint64_t prevTxBytes = (ueIdx < g_prevRewardTxBytesByUe.size()) ? g_prevRewardTxBytesByUe[ueIdx] : 0u;
+    return (currentTxBytes >= prevTxBytes) ? (currentTxBytes - prevTxBytes) : 0u;
+}
+
+static void
+RefreshStepSpectralEfficiencyCaches()
+{
+    for (uint32_t ueIdx = 0; ueIdx < g_lastStepSpectralEfficiencyByUe.size(); ++ueIdx)
+    {
+        g_lastStepSpectralEfficiencyByUe[ueIdx] = ComputeUeStepSpectralEfficiency(ueIdx);
+    }
+
+    std::fill(g_lastBwpStepSpectralEfficiency.begin(), g_lastBwpStepSpectralEfficiency.end(), 0.0);
+    std::vector<double> bwpAssignedPrb(g_totalPrbByBwp.size(), 0.0);
+    std::vector<double> bwpDeliveredBits(g_totalPrbByBwp.size(), 0.0);
+    std::vector<double> bwpMcsSum(g_totalPrbByBwp.size(), 0.0);
+    std::vector<uint32_t> bwpMcsCount(g_totalPrbByBwp.size(), 0u);
+
+    for (uint32_t ueIdx = 0; ueIdx < g_stepAssignedPrbByUe.size() && ueIdx < g_lastStepSpectralEfficiencyByUe.size();
+         ++ueIdx)
+    {
+        uint8_t bwp = GetCurrentUeBwp(ueIdx);
+        if (bwp >= g_totalPrbByBwp.size())
+        {
+            continue;
+        }
+        bwpAssignedPrb[bwp] += static_cast<double>(g_stepAssignedPrbByUe[ueIdx]);
+        bwpDeliveredBits[bwp] +=
+            static_cast<double>((ueIdx < g_stepTbBytesByUe.size()) ? g_stepTbBytesByUe[ueIdx] : 0u) * 8.0;
+        if (ueIdx < g_lastMcsByUe.size())
+        {
+            bwpMcsSum[bwp] += g_lastMcsByUe[ueIdx];
+            bwpMcsCount[bwp]++;
+        }
+    }
+
+    for (uint32_t bwp = 0; bwp < g_lastBwpStepSpectralEfficiency.size(); ++bwp)
+    {
+        if (bwpAssignedPrb[bwp] > 0.0)
+        {
+            g_lastBwpStepSpectralEfficiency[bwp] = bwpDeliveredBits[bwp] / bwpAssignedPrb[bwp];
+        }
+        if (bwpMcsCount[bwp] > 0)
+        {
+            g_lastBwpAvgMcs[bwp] = bwpMcsSum[bwp] / static_cast<double>(bwpMcsCount[bwp]);
+        }
+    }
+}
+
+static double
+LogScaleNonNegative(double v)
+{
+    return std::log1p(std::max(0.0, v));
+}
+
+static double
+SignedLogScale(double v)
+{
+    if (v > 0.0)
+    {
+        return std::log1p(v);
+    }
+    if (v < 0.0)
+    {
+        return -std::log1p(-v);
+    }
+    return 0.0;
+}
+
+static double
+SymmetricUnitNorm(double v)
+{
+    return 2.0 * Clamp01(v) - 1.0;
 }
 
 static void
@@ -2029,31 +2332,378 @@ TrySwitchUeToBwp(uint32_t ueIdx, uint8_t targetBwp)
 {
     if (ueIdx >= g_rntiByUeIdx.size() || ueIdx >= g_currentBwpByUe.size())
     {
+        if (g_rlDebug)
+        {
+            NS_LOG_UNCOND("[rl-debug] switch reject ue=" << ueIdx << " reason=index_oob");
+        }
         return false;
     }
     if (!CanSwitchByCooldown(ueIdx))
     {
         g_nextSwitchRejectCooldownCount++;
+        if (g_rlDebug)
+        {
+            NS_LOG_UNCOND("[rl-debug] switch reject ue="
+                          << ueIdx << " reason=cooldown current=" << unsigned(GetCurrentUeBwp(ueIdx))
+                          << " target=" << unsigned(targetBwp)
+                          << " cooldown=" << g_policyCooldownStepsByUe[ueIdx]);
+        }
         return false;
     }
     uint16_t rnti = g_rntiByUeIdx[ueIdx];
     if (rnti == 0)
     {
         g_nextSwitchRejectNoRntiCount++;
+        if (g_rlDebug)
+        {
+            NS_LOG_UNCOND("[rl-debug] switch reject ue=" << ueIdx << " reason=no_rnti");
+        }
         return false;
     }
     uint8_t current = GetCurrentUeBwp(ueIdx);
     if (current == targetBwp)
     {
         g_nextSwitchRejectSameTargetCount++;
+        if (g_rlDebug)
+        {
+            NS_LOG_UNCOND("[rl-debug] switch reject ue="
+                          << ueIdx << " reason=same_target current=" << unsigned(current)
+                          << " target=" << unsigned(targetBwp));
+        }
         return false;
     }
     if (!SwitchUeBwp(rnti, targetBwp))
     {
+        if (g_rlDebug)
+        {
+            NS_LOG_UNCOND("[rl-debug] switch reject ue="
+                          << ueIdx << " reason=switch_apply_failed current=" << unsigned(current)
+                          << " target=" << unsigned(targetBwp) << " rnti=" << rnti);
+        }
         return false;
+    }
+    if (g_rlDebug)
+    {
+        NS_LOG_UNCOND("[rl-debug] switch success ue="
+                      << ueIdx << " current=" << unsigned(current) << " target="
+                      << unsigned(targetBwp) << " rnti=" << rnti);
     }
     g_policyCooldownStepsByUe[ueIdx] = g_policySwitchCooldownSteps;
     return true;
+}
+
+static std::array<double, 7>
+BuildDqnFeature(uint32_t ueIdx)
+{
+    double queueNorm = Clamp01(ComputeDlRlcQueueBytes(ueIdx) / std::max(1.0, g_queueNormBytes));
+    double aoiNorm = Clamp01(ComputeUeMeanAoiMs(ueIdx) / std::max(1.0, g_dqnDelayTargetMs));
+    double thrNorm = Clamp01(ComputeUeThroughputMbps(ueIdx) / std::max(1e-6, g_dqnThrTargetMbps));
+    double prbUtility = Clamp01(ComputeUePrbUtility(ueIdx));
+    double cqiNorm = 0.0;
+    double sinrNorm = 0.0;
+    if (ueIdx < g_lastCqiByUe.size())
+    {
+        cqiNorm = Clamp01(g_lastCqiByUe[ueIdx] / 15.0);
+    }
+    if (ueIdx < g_lastSinrDbByUe.size())
+    {
+        sinrNorm = Clamp01((g_lastSinrDbByUe[ueIdx] + 10.0) / 40.0);
+    }
+    double bwpNorm = Clamp01(GetCurrentUeBwp(ueIdx) == g_highBwpId ? 1.0 : 0.0);
+    return {queueNorm, aoiNorm, thrNorm, prbUtility, cqiNorm, sinrNorm, bwpNorm};
+}
+
+static double
+ComputeUeStepBler(uint32_t ueIdx)
+{
+    if (ueIdx >= g_stepTbCountByUe.size() || ueIdx >= g_stepTbErrorByUe.size())
+    {
+        return 0.0;
+    }
+    uint64_t tbCount = g_stepTbCountByUe[ueIdx];
+    if (tbCount == 0)
+    {
+        return 0.0;
+    }
+    return static_cast<double>(g_stepTbErrorByUe[ueIdx]) / static_cast<double>(tbCount);
+}
+
+static std::array<double, 4>
+ComputeDrqnLiteBwpMetrics()
+{
+    std::array<double, 4> metrics = {0.0, 0.0, 0.0, 0.0}; // active0, bler0, active1, bler1
+    std::array<double, 2> active = {0.0, 0.0};
+    std::array<double, 2> blerSum = {0.0, 0.0};
+    std::array<double, 2> blerCount = {0.0, 0.0};
+    double numUes = std::max<uint32_t>(1u, static_cast<uint32_t>(g_ueStats.size()));
+    for (uint32_t ueIdx = 0; ueIdx < g_ueStats.size(); ++ueIdx)
+    {
+        uint8_t bwp = GetCurrentUeBwp(ueIdx);
+        if (bwp > 1)
+        {
+            continue;
+        }
+        active[bwp] += 1.0;
+        double tbCount = (ueIdx < g_stepTbCountByUe.size()) ? static_cast<double>(g_stepTbCountByUe[ueIdx]) : 0.0;
+        if (tbCount > 0.0)
+        {
+            blerSum[bwp] += ComputeUeStepBler(ueIdx);
+            blerCount[bwp] += 1.0;
+        }
+    }
+    metrics[0] = Clamp01(active[0] / numUes);
+    metrics[2] = Clamp01(active[1] / numUes);
+    metrics[1] = (blerCount[0] > 0.0) ? Clamp01(blerSum[0] / blerCount[0]) : 0.0;
+    metrics[3] = (blerCount[1] > 0.0) ? Clamp01(blerSum[1] / blerCount[1]) : 0.0;
+    return metrics;
+}
+
+static std::vector<double>
+BuildDrqnLiteObservation(uint32_t ueIdx, const std::array<double, 4>& bwpMetrics)
+{
+    double blerNorm = Clamp01(ComputeUeStepBler(ueIdx));
+    double dropRate = 0.0;
+    double arrivedBytes = static_cast<double>(ComputeUeStepArrivedBytes(ueIdx));
+    double deliveredBytes = (ueIdx < g_stepTbBytesByUe.size()) ? static_cast<double>(g_stepTbBytesByUe[ueIdx]) : 0.0;
+    if (arrivedBytes > 0.0)
+    {
+        dropRate = Clamp01(std::max(0.0, arrivedBytes - deliveredBytes) / arrivedBytes);
+    }
+    double queueNorm = Clamp01(ComputeDlRlcQueueBytes(ueIdx) / std::max(1.0, g_queueNormBytes));
+    double channelNorm = 0.0;
+    if (ueIdx < g_lastCqiByUe.size())
+    {
+        channelNorm = Clamp01(g_lastCqiByUe[ueIdx] / 15.0);
+    }
+    double delayNorm = Clamp01(ComputeUeMeanAoiMs(ueIdx) / std::max(1.0, g_dqnDelayTargetMs));
+    double txSizeNorm = Clamp01(deliveredBytes / std::max(1.0, g_queueNormBytes));
+    double incomingNorm = Clamp01(arrivedBytes / std::max(1.0, g_queueNormBytes));
+    uint8_t currentBwp = GetCurrentUeBwp(ueIdx);
+    double bwp0 = (currentBwp == g_lowBwpId) ? 1.0 : 0.0;
+    double bwp1 = (currentBwp == g_highBwpId) ? 1.0 : 0.0;
+    return {blerNorm,
+            dropRate,
+            queueNorm,
+            channelNorm,
+            delayNorm,
+            txSizeNorm,
+            incomingNorm,
+            bwp0,
+            bwp1,
+            bwpMetrics[0],
+            bwpMetrics[1],
+            bwpMetrics[2],
+            bwpMetrics[3]};
+}
+
+static std::vector<double>
+BuildDqnStateFromHistory(uint32_t ueIdx)
+{
+    const uint32_t featDim = 7;
+    std::vector<double> state(g_dqnHistoryLen * featDim, 0.0);
+    if (ueIdx >= g_dqnFeatureHistoryByUe.size())
+    {
+        return state;
+    }
+    auto& hist = g_dqnFeatureHistoryByUe[ueIdx];
+    while (hist.size() > g_dqnHistoryLen)
+    {
+        hist.pop_front();
+    }
+    uint32_t offset = static_cast<uint32_t>(g_dqnHistoryLen - hist.size());
+    for (uint32_t t = 0; t < hist.size(); ++t)
+    {
+        for (uint32_t k = 0; k < featDim; ++k)
+        {
+            state[(offset + t) * featDim + k] = hist[t][k];
+        }
+    }
+    return state;
+}
+
+static double
+ComputeDrqnLiteReward(uint32_t ueIdx)
+{
+    double delayNorm =
+        std::log1p(std::max(0.0, ComputeUeMeanAoiMs(ueIdx))) / std::log1p(std::max(1.0, g_dqnDelayTargetMs));
+    double thrNorm = Clamp01(ComputeUeThroughputMbps(ueIdx) / std::max(1e-6, g_dqnThrTargetMbps));
+
+    uint32_t numUes = static_cast<uint32_t>(g_ueStats.size());
+    uint32_t latencyUes = static_cast<uint32_t>(std::round(g_dqnLatencyUeRatio * numUes));
+    bool isLatencySensitive = (ueIdx < latencyUes);
+    double lambda = isLatencySensitive ? g_dqnAlpha : (1.0 - g_dqnAlpha);
+    double mu = isLatencySensitive ? g_dqnBeta : (1.0 - g_dqnBeta);
+    return -(lambda * delayNorm + mu * (1.0 - thrNorm));
+}
+
+static double
+ComputeDqnReward(uint32_t ueIdx)
+{
+    double delayNorm =
+        std::log1p(std::max(0.0, ComputeUeMeanAoiMs(ueIdx))) / std::log1p(std::max(1.0, g_dqnDelayTargetMs));
+    double thrNorm = Clamp01(ComputeUeThroughputMbps(ueIdx) / std::max(1e-6, g_dqnThrTargetMbps));
+
+    uint32_t numUes = static_cast<uint32_t>(g_ueStats.size());
+    uint32_t latencyUes = static_cast<uint32_t>(std::round(g_dqnLatencyUeRatio * numUes));
+    bool isLatencySensitive = (ueIdx < latencyUes);
+    double lambda = isLatencySensitive ? g_dqnAlpha : (1.0 - g_dqnAlpha);
+    double mu = isLatencySensitive ? g_dqnBeta : (1.0 - g_dqnBeta);
+    return -(lambda * delayNorm + mu * (1.0 - thrNorm));
+}
+
+static int32_t
+GetOnOff2PhaseState(uint32_t ueIdx, double nowS)
+{
+    if (!g_policyUseOnOff2Phase || g_policySegmentDurationS <= 1e-9 ||
+        ueIdx >= g_policyBaseStartSByUe.size() || ueIdx >= g_policyPhaseOffsetByUe.size())
+    {
+        return -1;
+    }
+    double baseStartS = g_policyBaseStartSByUe[ueIdx];
+    int32_t phase = g_policyPhaseOffsetByUe[ueIdx];
+    if (nowS < baseStartS)
+    {
+        return phase % 2;
+    }
+    int32_t segIdx = static_cast<int32_t>(std::floor((nowS - baseStartS) / g_policySegmentDurationS));
+    return (phase + segIdx) % 2;
+}
+
+static int32_t
+ComputeOracleMcsDelta(uint32_t ueIdx, uint8_t currentBwp)
+{
+    const double sinrDb = (ueIdx < g_lastSinrDbByUe.size()) ? g_lastSinrDbByUe[ueIdx] : 0.0;
+    const int8_t losState = QueryUeLosState(ueIdx);
+
+    if (losState == 1)
+    {
+        if (sinrDb >= 24.0)
+        {
+            return 2;
+        }
+        if (sinrDb >= g_oracleSinrHighDb)
+        {
+            return 1;
+        }
+        if (sinrDb <= g_oracleSinrLowDb - 4.0)
+        {
+            return -1;
+        }
+        return 0;
+    }
+
+    if (sinrDb <= 0.0)
+    {
+        return -2;
+    }
+    if (sinrDb <= g_oracleSinrLowDb)
+    {
+        return -2;
+    }
+    if (sinrDb <= g_oracleSinrHighDb - 2.0)
+    {
+        return -1;
+    }
+    if (currentBwp == g_highBwpId)
+    {
+        return -1;
+    }
+    return 0;
+}
+
+static uint32_t
+RunOracleTrafficMcsPolicyStep()
+{
+    uint32_t switchCount = 0;
+    const double nowS = Simulator::Now().GetSeconds();
+    for (uint32_t ueIdx = 0; ueIdx < g_ueStats.size(); ++ueIdx)
+    {
+        const uint8_t currentBwp = GetCurrentUeBwp(ueIdx);
+        const double queueNorm = Clamp01(ComputeDlRlcQueueBytes(ueIdx) / std::max(1.0, g_queueNormBytes));
+        const double sinrDb = (ueIdx < g_lastSinrDbByUe.size()) ? g_lastSinrDbByUe[ueIdx] : 0.0;
+        const int8_t losState = QueryUeLosState(ueIdx);
+        const int32_t phaseNow = GetOnOff2PhaseState(ueIdx, nowS); // 0: burst-heavy, 1: bg-heavy
+        const int32_t phaseLead = GetOnOff2PhaseState(ueIdx, nowS + std::max(0.0, g_oraclePhaseLeadS));
+        const int32_t phaseState = (phaseLead >= 0) ? phaseLead : phaseNow;
+
+        if (ueIdx < g_oracleLastPhaseByUe.size() && ueIdx < g_oracleHighHoldUntilSByUe.size())
+        {
+            const int32_t prev = g_oracleLastPhaseByUe[ueIdx];
+            if (phaseState == 0 && prev != 0)
+            {
+                // Entering burst-heavy phase: keep high BWP for a minimum dwell.
+                g_oracleHighHoldUntilSByUe[ueIdx] =
+                    std::max(g_oracleHighHoldUntilSByUe[ueIdx], nowS + std::max(0.0, g_oracleBurstMinHoldS));
+            }
+            g_oracleLastPhaseByUe[ueIdx] = phaseState;
+        }
+
+        uint8_t targetBwp = currentBwp;
+        if (phaseState == 0)
+        {
+            // Burst-heavy phase: use high BWP only when channel supports it.
+            if (losState == 1 && sinrDb >= g_oracleSinrLowDb)
+            {
+                targetBwp = g_highBwpId;
+            }
+            else if (queueNorm >= g_oracleQueueHighNorm && sinrDb >= (g_oracleSinrLowDb - 2.0))
+            {
+                targetBwp = g_highBwpId;
+            }
+            else
+            {
+                targetBwp = g_lowBwpId;
+            }
+        }
+        else if (phaseState == 1)
+        {
+            // Background-heavy phase: prefer low BWP for robustness unless queue builds up in good channel.
+            if (queueNorm >= g_oracleQueueHighNorm && losState == 1 && sinrDb >= g_oracleSinrHighDb)
+            {
+                targetBwp = g_highBwpId;
+            }
+            else if (queueNorm <= g_oracleQueueLowNorm || losState == 0)
+            {
+                targetBwp = g_lowBwpId;
+            }
+        }
+        else
+        {
+            // Fallback for non-onoff2phase traffic: channel-first BWP decision.
+            targetBwp = (losState == 1 && sinrDb >= g_oracleSinrHighDb) ? g_highBwpId : g_lowBwpId;
+        }
+
+        // Timing hold: avoid premature down-switch right after burst-phase entry.
+        if (ueIdx < g_oracleHighHoldUntilSByUe.size() && nowS < g_oracleHighHoldUntilSByUe[ueIdx])
+        {
+            const bool severeNlos = (losState == 0 && sinrDb < (g_oracleSinrLowDb - 2.0));
+            if (!severeNlos)
+            {
+                targetBwp = g_highBwpId;
+            }
+        }
+
+        if (TrySwitchUeToBwp(ueIdx, targetBwp))
+        {
+            switchCount++;
+        }
+
+        const int32_t delta = ComputeOracleMcsDelta(ueIdx, currentBwp);
+        const int32_t baseMcs = (ueIdx < g_lastCqiByUe.size())
+                                    ? EstimateBaseMcsFromCqi(g_lastCqiByUe[ueIdx])
+                                    : static_cast<int32_t>(g_rlInitialMcs);
+        const int32_t targetMcs = std::max(0, std::min(27, baseMcs + delta));
+        if (ueIdx < g_targetMcsByUe.size())
+        {
+            g_targetMcsByUe[ueIdx] = static_cast<uint8_t>(targetMcs);
+        }
+        if (ueIdx < g_lastRequestedMcsOffsetByUe.size())
+        {
+            g_lastRequestedMcsOffsetByUe[ueIdx] = static_cast<double>(delta);
+        }
+    }
+    ApplyPerUeMcsOverridesToSchedulers();
+    return switchCount;
 }
 
 static uint32_t
@@ -2099,6 +2749,41 @@ RunDtPolicyStep()
 }
 
 static uint32_t
+RunDqnPolicyStep()
+{
+    uint32_t switchCount = 0;
+    uint32_t numUes = static_cast<uint32_t>(g_ueStats.size());
+    for (uint32_t ueIdx = 0; ueIdx < numUes; ++ueIdx)
+    {
+        auto feature = BuildDqnFeature(ueIdx);
+        g_dqnFeatureHistoryByUe[ueIdx].push_back(feature);
+        auto state = BuildDqnStateFromHistory(ueIdx);
+
+        if (g_dqnHasPrevByUe[ueIdx])
+        {
+            DqnTransition tr;
+            tr.s = g_dqnPrevStateByUe[ueIdx];
+            tr.a = g_dqnPrevActionByUe[ueIdx];
+            tr.r = ComputeDqnReward(ueIdx);
+            tr.sNext = state;
+            g_dqnAgent->Observe(tr);
+        }
+
+        int action = g_dqnAgent->SelectAction(state); // 0=low, 1=high
+        uint8_t targetBwp = (action == 1) ? g_highBwpId : g_lowBwpId;
+        if (TrySwitchUeToBwp(ueIdx, targetBwp))
+        {
+            switchCount++;
+        }
+
+        g_dqnPrevStateByUe[ueIdx] = std::move(state);
+        g_dqnPrevActionByUe[ueIdx] = action;
+        g_dqnHasPrevByUe[ueIdx] = true;
+    }
+    return switchCount;
+}
+
+static uint32_t
 RunQueueThresholdPolicyStep()
 {
     uint32_t switchCount = 0;
@@ -2133,372 +2818,6 @@ RunQueueThresholdPolicyStep()
         }
     }
     return switchCount;
-}
-
-enum DppAction : uint8_t
-{
-    DPP_BWP0_CQI = 0,
-    DPP_BWP0_CQI_P1 = 1,
-    DPP_BWP0_CQI_P2 = 2,
-    DPP_BWP1_CQI = 3,
-    DPP_BWP1_CQI_M1 = 4,
-    DPP_BWP1_CQI_M2 = 5,
-    DPP_ACTIONS = G_DPP_ACTION_COUNT
-};
-
-static void
-DecodeDppAction(uint8_t action, uint8_t* targetBwp, int32_t* mcsDelta)
-{
-    uint8_t bwp = g_lowBwpId;
-    int32_t delta = 0;
-    switch (action)
-    {
-    case DPP_BWP0_CQI:
-        bwp = g_lowBwpId;
-        delta = 0;
-        break;
-    case DPP_BWP0_CQI_P1:
-        bwp = g_lowBwpId;
-        delta = 1;
-        break;
-    case DPP_BWP0_CQI_P2:
-        bwp = g_lowBwpId;
-        delta = 2;
-        break;
-    case DPP_BWP1_CQI:
-        bwp = g_highBwpId;
-        delta = 0;
-        break;
-    case DPP_BWP1_CQI_M1:
-        bwp = g_highBwpId;
-        delta = -1;
-        break;
-    case DPP_BWP1_CQI_M2:
-        bwp = g_highBwpId;
-        delta = -2;
-        break;
-    default:
-        bwp = g_lowBwpId;
-        delta = 0;
-        break;
-    }
-    if (targetBwp)
-    {
-        *targetBwp = bwp;
-    }
-    if (mcsDelta)
-    {
-        *mcsDelta = delta;
-    }
-}
-
-static void
-UpdateDppPosteriorForUe(uint32_t ueIdx)
-{
-    if (ueIdx >= g_dppHasLastActionByUe.size() || ueIdx >= g_dppLastActionByUe.size())
-    {
-        return;
-    }
-    const uint64_t tbBytesCum = (ueIdx < g_rxTbBytesCumByUe.size()) ? g_rxTbBytesCumByUe[ueIdx] : 0u;
-    const uint64_t tbCountCum = (ueIdx < g_rxTbCountCumByUe.size()) ? g_rxTbCountCumByUe[ueIdx] : 0u;
-    const uint64_t tbErrCum = (ueIdx < g_rxTbErrorCumByUe.size()) ? g_rxTbErrorCumByUe[ueIdx] : 0u;
-    const double nowS = Simulator::Now().GetSeconds();
-    const double prevTimeS =
-        (ueIdx < g_dppLastDecisionTimeSByUe.size()) ? g_dppLastDecisionTimeSByUe[ueIdx] : nowS;
-    const double deltaS = std::max(1e-6, nowS - prevTimeS);
-
-    if (g_dppHasLastActionByUe[ueIdx])
-    {
-        const int32_t lastAction = g_dppLastActionByUe[ueIdx];
-        if (lastAction >= 0 && lastAction < static_cast<int32_t>(DPP_ACTIONS))
-        {
-            const uint64_t prevTbBytes = (ueIdx < g_dppLastTbBytesCumByUe.size()) ? g_dppLastTbBytesCumByUe[ueIdx] : 0u;
-            const uint64_t prevTbCount = (ueIdx < g_dppLastTbCountCumByUe.size()) ? g_dppLastTbCountCumByUe[ueIdx] : 0u;
-            const uint64_t prevTbErr = (ueIdx < g_dppLastTbErrorCumByUe.size()) ? g_dppLastTbErrorCumByUe[ueIdx] : 0u;
-            const uint64_t dTbBytes = (tbBytesCum >= prevTbBytes) ? (tbBytesCum - prevTbBytes) : 0u;
-            const uint64_t dTbCount = (tbCountCum >= prevTbCount) ? (tbCountCum - prevTbCount) : 0u;
-            const uint64_t dTbErr = (tbErrCum >= prevTbErr) ? (tbErrCum - prevTbErr) : 0u;
-            const double obsGoodputMbps = static_cast<double>(dTbBytes) * 8.0 / deltaS / 1.0e6;
-
-            auto& muMean = g_dppMuPostMeanByUe[ueIdx][lastAction];
-            auto& muPrec = g_dppMuPostPrecisionByUe[ueIdx][lastAction];
-            const double obsPrec = std::max(1e-9, g_dppMuObsPrecision);
-            const double newPrec = muPrec + obsPrec;
-            muMean = (muPrec * muMean + obsPrec * obsGoodputMbps) / std::max(1e-9, newPrec);
-            muPrec = newPrec;
-
-            if (dTbCount > 0)
-            {
-                auto& alpha = g_dppBlerAlphaByUe[ueIdx][lastAction];
-                auto& beta = g_dppBlerBetaByUe[ueIdx][lastAction];
-                const uint64_t err = std::min(dTbErr, dTbCount);
-                const uint64_t succ = dTbCount - err;
-                alpha += static_cast<double>(err);
-                beta += static_cast<double>(succ);
-            }
-        }
-    }
-
-    if (ueIdx < g_dppLastTbBytesCumByUe.size())
-    {
-        g_dppLastTbBytesCumByUe[ueIdx] = tbBytesCum;
-    }
-    if (ueIdx < g_dppLastTbCountCumByUe.size())
-    {
-        g_dppLastTbCountCumByUe[ueIdx] = tbCountCum;
-    }
-    if (ueIdx < g_dppLastTbErrorCumByUe.size())
-    {
-        g_dppLastTbErrorCumByUe[ueIdx] = tbErrCum;
-    }
-    if (ueIdx < g_dppLastDecisionTimeSByUe.size())
-    {
-        g_dppLastDecisionTimeSByUe[ueIdx] = nowS;
-    }
-    if (ueIdx < g_dppLastEpochDeltaSByUe.size())
-    {
-        g_dppLastEpochDeltaSByUe[ueIdx] = deltaS;
-    }
-}
-
-static double
-EstimateExpectedGoodputBayesianDummy(uint32_t ueIdx, uint8_t targetBwp, uint8_t targetMcs)
-{
-    // Pure Bayesian posterior mean of expected goodput mu_i(t,a).
-    uint8_t action = DPP_BWP0_CQI;
-    if (targetBwp == g_lowBwpId && targetMcs >= 2)
-    {
-        const int32_t baseMcs = (ueIdx < g_lastCqiByUe.size()) ? EstimateBaseMcsFromCqi(g_lastCqiByUe[ueIdx])
-                                                               : static_cast<int32_t>(g_initialMcs);
-        const int32_t delta = static_cast<int32_t>(targetMcs) - baseMcs;
-        if (delta >= 2)
-        {
-            action = DPP_BWP0_CQI_P2;
-        }
-        else if (delta >= 1)
-        {
-            action = DPP_BWP0_CQI_P1;
-        }
-        else
-        {
-            action = DPP_BWP0_CQI;
-        }
-    }
-    else if (targetBwp == g_highBwpId)
-    {
-        const int32_t baseMcs = (ueIdx < g_lastCqiByUe.size()) ? EstimateBaseMcsFromCqi(g_lastCqiByUe[ueIdx])
-                                                               : static_cast<int32_t>(g_initialMcs);
-        const int32_t delta = static_cast<int32_t>(targetMcs) - baseMcs;
-        if (delta <= -2)
-        {
-            action = DPP_BWP1_CQI_M2;
-        }
-        else if (delta <= -1)
-        {
-            action = DPP_BWP1_CQI_M1;
-        }
-        else
-        {
-            action = DPP_BWP1_CQI;
-        }
-    }
-    if (ueIdx < g_dppMuPostMeanByUe.size())
-    {
-        return std::max(0.0, g_dppMuPostMeanByUe[ueIdx][action]);
-    }
-    return std::max(0.0, g_dppMuPriorMeanMbps);
-}
-
-static double
-EstimateExpectedBlerBayesianDummy(uint32_t ueIdx, uint8_t targetBwp, uint8_t targetMcs)
-{
-    // Pure Bayesian posterior mean of expected BLER e_i(t,a).
-    uint8_t action = DPP_BWP0_CQI;
-    if (targetBwp == g_lowBwpId)
-    {
-        const int32_t baseMcs = (ueIdx < g_lastCqiByUe.size()) ? EstimateBaseMcsFromCqi(g_lastCqiByUe[ueIdx])
-                                                               : static_cast<int32_t>(g_initialMcs);
-        const int32_t delta = static_cast<int32_t>(targetMcs) - baseMcs;
-        action = (delta >= 2) ? DPP_BWP0_CQI_P2 : ((delta >= 1) ? DPP_BWP0_CQI_P1 : DPP_BWP0_CQI);
-    }
-    else if (targetBwp == g_highBwpId)
-    {
-        const int32_t baseMcs = (ueIdx < g_lastCqiByUe.size()) ? EstimateBaseMcsFromCqi(g_lastCqiByUe[ueIdx])
-                                                               : static_cast<int32_t>(g_initialMcs);
-        const int32_t delta = static_cast<int32_t>(targetMcs) - baseMcs;
-        action = (delta <= -2) ? DPP_BWP1_CQI_M2 : ((delta <= -1) ? DPP_BWP1_CQI_M1 : DPP_BWP1_CQI);
-    }
-    double postBler = g_dppBlerPriorAlpha / std::max(1e-9, (g_dppBlerPriorAlpha + g_dppBlerPriorBeta));
-    if (ueIdx < g_dppBlerAlphaByUe.size())
-    {
-        const double a = g_dppBlerAlphaByUe[ueIdx][action];
-        const double b = g_dppBlerBetaByUe[ueIdx][action];
-        postBler = a / std::max(1e-9, a + b);
-    }
-    return Clamp01(postBler);
-}
-
-static uint32_t
-RunDppPolicyEpochStep()
-{
-    uint32_t switchCount = 0;
-    const uint32_t numUes = static_cast<uint32_t>(g_ueStats.size());
-        for (uint32_t ueIdx = 0; ueIdx < numUes; ++ueIdx)
-        {
-        UpdateDppPosteriorForUe(ueIdx);
-        const double backlogBytes = std::max(0.0, ComputeDlRlcQueueBytes(ueIdx));
-        const double backlog = ComputeDppBacklogRatio(ueIdx); // Q_i(t) in [0,1]
-        const double epochDeltaS =
-            (ueIdx < g_dppLastEpochDeltaSByUe.size()) ? std::max(1e-6, g_dppLastEpochDeltaSByUe[ueIdx])
-                                                      : std::max(1e-6, g_envStepTime);
-        const uint8_t currentBwp = GetCurrentUeBwp(ueIdx);
-        const int32_t cqiMcs = (ueIdx < g_lastCqiByUe.size()) ? EstimateBaseMcsFromCqi(g_lastCqiByUe[ueIdx])
-                                                              : static_cast<int32_t>(g_initialMcs);
-
-        double bestScore = -std::numeric_limits<double>::infinity();
-        uint8_t bestAction = DPP_BWP0_CQI;
-        uint8_t bestTargetBwp = currentBwp;
-        uint8_t bestTargetMcs = static_cast<uint8_t>(std::max(0, std::min(27, cqiMcs)));
-        int32_t bestDelta = 0;
-        std::array<uint8_t, DPP_ACTIONS> actionTargetBwp{};
-        std::array<uint8_t, DPP_ACTIONS> actionTargetMcs{};
-        std::array<int32_t, DPP_ACTIONS> actionMcsDelta{};
-        std::array<double, DPP_ACTIONS> actionMu{};
-        std::array<double, DPP_ACTIONS> actionE{};
-        std::array<double, DPP_ACTIONS> actionRewardTerm{};
-        std::array<double, DPP_ACTIONS> actionPenaltySwitch{};
-        std::array<double, DPP_ACTIONS> actionPenaltyBler{};
-        std::array<double, DPP_ACTIONS> actionPenaltyTotal{};
-        std::array<double, DPP_ACTIONS> actionScore{};
-
-        for (uint8_t a = 0; a < DPP_ACTIONS; ++a)
-        {
-            uint8_t targetBwp = currentBwp;
-            int32_t mcsDelta = 0;
-            DecodeDppAction(a, &targetBwp, &mcsDelta);
-            const int32_t targetMcs = std::max(0, std::min(27, cqiMcs + mcsDelta));
-            const double mu = EstimateExpectedGoodputBayesianDummy(ueIdx, targetBwp, static_cast<uint8_t>(targetMcs));
-            const double e = EstimateExpectedBlerBayesianDummy(ueIdx, targetBwp, static_cast<uint8_t>(targetMcs));
-            const double reliability = Clamp01(1.0 - e);
-            const double switchIndicator = (targetBwp != currentBwp) ? 1.0 : 0.0;
-            const double rewardTerm = backlog * mu * epochDeltaS * reliability;
-            const double penaltySwitch = g_dppV * g_dppLambdaSwitch * switchIndicator;
-            const double penaltyBler = 0.0;
-            const double penaltyTotal = penaltySwitch + penaltyBler;
-            const double score = rewardTerm - penaltyTotal;
-            actionTargetBwp[a] = targetBwp;
-            actionTargetMcs[a] = static_cast<uint8_t>(targetMcs);
-            actionMcsDelta[a] = mcsDelta;
-            actionMu[a] = mu;
-            actionE[a] = e;
-            actionRewardTerm[a] = rewardTerm;
-            actionPenaltySwitch[a] = penaltySwitch;
-            actionPenaltyBler[a] = penaltyBler;
-            actionPenaltyTotal[a] = penaltyTotal;
-            actionScore[a] = score;
-            if (score > bestScore)
-            {
-                bestScore = score;
-                bestAction = a;
-                bestTargetBwp = targetBwp;
-                bestTargetMcs = static_cast<uint8_t>(targetMcs);
-                bestDelta = mcsDelta;
-            }
-        }
-        const bool traceThisUe = (g_dppScoreTraceUe < 0) || (ueIdx == static_cast<uint32_t>(g_dppScoreTraceUe));
-        if (traceThisUe && (g_dppScoreDebug || (g_dppScoreTraceStream && g_dppScoreTraceStream->is_open())))
-        {
-            for (uint8_t a = 0; a < DPP_ACTIONS; ++a)
-            {
-                const int selected = (a == bestAction) ? 1 : 0;
-                if (g_dppScoreTraceStream && g_dppScoreTraceStream->is_open())
-                {
-                    (*g_dppScoreTraceStream) << std::fixed << std::setprecision(6)
-                                             << Simulator::Now().GetSeconds() << ","
-                                             << ueIdx << "," << static_cast<uint32_t>(a) << ","
-                                             << selected << "," << static_cast<uint32_t>(actionTargetBwp[a]) << ","
-                                             << static_cast<uint32_t>(actionTargetMcs[a]) << ","
-                                             << actionMcsDelta[a] << "," << backlogBytes << ","
-                                             << backlog << "," << epochDeltaS << ","
-                                             << actionMu[a] << "," << actionE[a] << ","
-                                             << ((actionTargetBwp[a] != currentBwp) ? 1 : 0) << ","
-                                             << actionRewardTerm[a] << "," << actionPenaltySwitch[a] << ","
-                                             << actionPenaltyBler[a] << "," << actionPenaltyTotal[a] << ","
-                                             << actionScore[a] << "\n";
-                }
-            }
-            if (g_dppScoreTraceStream && g_dppScoreTraceStream->is_open())
-            {
-                g_dppScoreTraceStream->flush();
-            }
-            if (g_dppScoreDebug)
-            {
-                NS_LOG_UNCOND("[dpp-score] t=" << Simulator::Now().GetSeconds()
-                                               << " ue=" << ueIdx
-                                               << " bestAction=" << static_cast<uint32_t>(bestAction)
-                                               << " backlogBytes=" << backlogBytes
-                                               << " backlogRatio=" << backlog
-                                               << " epochDeltaS=" << epochDeltaS
-                                               << " mu=" << actionMu[bestAction]
-                                               << " e=" << actionE[bestAction]
-                                               << " rewardTerm=" << actionRewardTerm[bestAction]
-                                               << " penaltySwitch=" << actionPenaltySwitch[bestAction]
-                                               << " penaltyBler=" << actionPenaltyBler[bestAction]
-                                               << " score=" << actionScore[bestAction]);
-            }
-        }
-
-        if (ueIdx < g_dppLastActionByUe.size())
-        {
-            g_dppLastActionByUe[ueIdx] = static_cast<int32_t>(bestAction);
-        }
-        if (ueIdx < g_dppHasLastActionByUe.size())
-        {
-            g_dppHasLastActionByUe[ueIdx] = true;
-        }
-        if (ueIdx < g_targetMcsByUe.size())
-        {
-            g_targetMcsByUe[ueIdx] = bestTargetMcs;
-        }
-        if (ueIdx < g_lastRequestedMcsOffsetByUe.size())
-        {
-            g_lastRequestedMcsOffsetByUe[ueIdx] = static_cast<double>(bestDelta);
-        }
-        if (bestTargetBwp != currentBwp && TrySwitchUeToBwp(ueIdx, bestTargetBwp))
-        {
-            switchCount++;
-        }
-    }
-    ApplyPerUeMcsOverridesToSchedulers();
-    return switchCount;
-}
-
-static void
-RunDppPolicyEpoch()
-{
-    if (g_bwpBaseline != "dpp" || Simulator::Now().GetSeconds() >= g_simTime)
-    {
-        return;
-    }
-    g_dppLastEpochS = Simulator::Now().GetSeconds();
-    g_dppSwitchCountAccum += RunDppPolicyEpochStep();
-}
-
-static void
-TriggerDppPolicyEpoch()
-{
-    if (g_bwpBaseline != "dpp" || Simulator::Now().GetSeconds() >= g_simTime)
-    {
-        return;
-    }
-    if (g_dppEpochEvent.IsPending())
-    {
-        return;
-    }
-    const double nowS = Simulator::Now().GetSeconds();
-    const double elapsedS = (g_dppLastEpochS < 0.0) ? 1.0e9 : (nowS - g_dppLastEpochS);
-    const double delayS = std::max(0.0, g_dppEpochMinIntervalS - elapsedS);
-    g_dppEpochEvent = Simulator::Schedule(Seconds(delayS), &RunDppPolicyEpoch);
 }
 
 static void
@@ -2546,7 +2865,7 @@ RunStaticMcsOffsetPolicyStep()
         // Apply offset against CQI-derived baseline MCS (non-cumulative).
         const int32_t baseMcs = (ueIdx < g_lastCqiByUe.size())
                                     ? EstimateBaseMcsFromCqi(g_lastCqiByUe[ueIdx])
-                                    : static_cast<int32_t>(g_initialMcs);
+                                    : static_cast<int32_t>(g_rlInitialMcs);
         int32_t targetMcs = std::max(0, std::min(27, baseMcs + g_staticMcsOffset));
         g_targetMcsByUe[ueIdx] = static_cast<uint8_t>(targetMcs);
     }
@@ -2556,8 +2875,8 @@ RunStaticMcsOffsetPolicyStep()
 static void
 UpdateBaselineSchedulerWeights()
 {
-    if (g_schedulerPolicy != "age_optimal" &&
-        g_schedulerPolicy != "tps" && g_schedulerPolicy != "dgs")
+    if (g_schedulerPolicy != "age_optimal" && g_schedulerPolicy != "lyapunov" &&
+        g_schedulerPolicy != "drqn")
     {
         return;
     }
@@ -2568,50 +2887,57 @@ UpdateBaselineSchedulerWeights()
     for (uint32_t ueIdx = 0; ueIdx < numUes; ++ueIdx)
     {
         uint16_t rnti = g_rntiByUeIdx[ueIdx];
-        if (rnti == 0)
+        if (rnti == 0) continue;
+
+        if (g_schedulerPolicy == "lyapunov")
         {
-            continue;
+            uint32_t qBytes = static_cast<uint32_t>(g_rlcDlQueueBytesByUe[ueIdx]);
+            for (auto& sched : g_baselineSchedulers)
+            {
+                if (sched) sched->SetUeQueueSize(rnti, qBytes);
+            }
         }
-
-        const uint32_t qBytes = static_cast<uint32_t>(ComputeDlRlcQueueBytes(ueIdx));
-        const double aoiMs = ComputeUeMeanAoiMs(ueIdx);
-        const double receiverAoiMs = ComputeExpectedReceiverAoiMs(ueIdx, nowMs);
-        const double mcs = (ueIdx < g_lastMcsByUe.size()) ? g_lastMcsByUe[ueIdx] : 0.0;
-        const double tbErrorRate =
-            (ueIdx < g_stepTbCountByUe.size() && g_stepTbCountByUe[ueIdx] > 0)
-                ? static_cast<double>(g_stepTbErrorByUe[ueIdx]) /
-                      static_cast<double>(g_stepTbCountByUe[ueIdx])
-                : 0.0;
-
-
-        for (auto& sched : g_baselineSchedulers)
+        else if (g_schedulerPolicy == "age_optimal")
         {
-            if (!sched)
+            double expectedAoi = 0.0;
+            for (uint8_t t = 0; t < TRAFFIC_TYPES; ++t)
             {
-                continue;
+                double lastRxMs = g_lastRxTimeByType[ueIdx][t] * 1000.0;
+                if (lastRxMs > 0.0)
+                {
+                    double aoiSinceRx = nowMs - lastRxMs;
+                    expectedAoi = std::max(expectedAoi, aoiSinceRx);
+                }
+                else
+                {
+                    expectedAoi = std::max(expectedAoi, g_lastDeliveredAoiMs[ueIdx][t]);
+                }
             }
 
-            if (g_schedulerPolicy == "age_optimal" && receiverAoiMs < g_ageOptimalAoiThresholdMs)
+            if (expectedAoi < g_ageOptimalAoiThresholdMs)
             {
-                sched->SetUeReceiverAoiMs(rnti, 0.0);
-            }
-            else
-            {
-                sched->SetUeReceiverAoiMs(rnti, receiverAoiMs);
+                expectedAoi = 0.0;
             }
 
-            sched->SetUeAoiMs(rnti, aoiMs);
-            sched->SetUeHolDelayMs(rnti, aoiMs);
-            sched->SetUeQueueSize(rnti, qBytes);
-            sched->SetUeDlMcs(rnti, mcs);
-            sched->SetUeTbErrorRate(rnti, tbErrorRate);
-            sched->SetUeDeadlineMs(rnti,
-                                   (g_schedulerPolicy == "dgs")
-                                       ? g_dgsDelayTargetMs
-                                       : ((g_schedulerPolicy == "tps") ? g_tpsDeadlineMs
-                                                                       : g_aequitasDeadlineMs));
-            sched->SetStepDurationMs(g_envStepTime * 1000.0);
-            sched->SetAgeOptimalGamma(g_ageOptimalGammaPenalty);
+            for (auto& sched : g_baselineSchedulers)
+            {
+                if (sched) sched->SetUeAoiMs(rnti, expectedAoi);
+            }
+        }
+        else if (g_schedulerPolicy == "drqn" && g_schedDqnAgent)
+        {
+            std::vector<double> state = {
+                g_rlcDlQueueBytesByUe[ueIdx] / g_queueNormBytes,
+                g_lastDeliveredAoiMs[ueIdx][LIGHT_HTTP] / 100.0,
+                g_lastDeliveredAoiMs[ueIdx][MODERATE_GAMING] / 100.0,
+                g_lastDeliveredAoiMs[ueIdx][HEAVY_VIDEO] / 100.0
+            };
+            int action = g_schedDqnAgent->SelectAction(state);
+            double weight = (action == 1) ? 2.0 : 1.0;
+            for (auto& sched : g_baselineSchedulers)
+            {
+                if (sched) sched->SetUeWeight(rnti, weight);
+            }
         }
     }
 }
@@ -2641,26 +2967,26 @@ ScheduleBaselinePolicyStep()
     {
         switchCount = RunQueueThresholdPolicyStep();
     }
-    else if (g_bwpBaseline == "dpp")
-    {
-        switchCount = g_dppSwitchCountAccum;
-        g_dppSwitchCountAccum = 0;
-    }
     else if (ShouldDriveAequitasScheduler())
     {
         ApplyAequitasInputsToSchedulers();
     }
-
-    if (g_bwpBaseline != "dpp")
+    else if (g_bwpBaseline == "dqn" && g_dqnAgent)
     {
-        if (g_mcsBaseline == "aams")
-        {
-            RunAamsMcsPolicyStep();
-        }
-        else if (g_staticMcsOffset != 0)
-        {
-            RunStaticMcsOffsetPolicyStep();
-        }
+        switchCount = RunDqnPolicyStep();
+    }
+    else if (g_bwpBaseline == "oracle_tmcs")
+    {
+        switchCount = RunOracleTrafficMcsPolicyStep();
+    }
+
+    if (g_mcsBaseline == "aams")
+    {
+        RunAamsMcsPolicyStep();
+    }
+    else if (g_staticMcsOffset != 0)
+    {
+        RunStaticMcsOffsetPolicyStep();
     }
 
     UpdateBaselineSchedulerWeights();
@@ -2676,170 +3002,14 @@ ScheduleBaselinePolicyStep()
     Simulator::Schedule(Seconds(g_envStepTime), &ScheduleBaselinePolicyStep);
 }
 
-static uint64_t
-ComputeUeTxBytes(uint32_t ueIdx)
-{
-    if (ueIdx >= g_txBytesByType.size())
-    {
-        return 0u;
-    }
-    uint64_t total = 0u;
-    for (uint8_t t = 0; t < TRAFFIC_TYPES; ++t)
-    {
-        total += g_txBytesByType[ueIdx][t];
-    }
-    return total;
-}
-
-static uint64_t
-ComputeUeStepArrivedBytesByType(uint32_t ueIdx, uint8_t type)
-{
-    if (ueIdx >= g_txBytesByType.size() || ueIdx >= g_prevRewardTxBytesByType.size() || type >= TRAFFIC_TYPES)
-    {
-        return 0u;
-    }
-    const uint64_t curr = g_txBytesByType[ueIdx][type];
-    const uint64_t prev = g_prevRewardTxBytesByType[ueIdx][type];
-    return (curr >= prev) ? (curr - prev) : 0u;
-}
-
-static uint64_t
-ComputeUeStepArrivedBytes(uint32_t ueIdx)
-{
-    uint64_t total = 0u;
-    for (uint8_t t = 0; t < TRAFFIC_TYPES; ++t)
-    {
-        total += ComputeUeStepArrivedBytesByType(ueIdx, t);
-    }
-    return total;
-}
-
-static double
-ComputeUeStepBler(uint32_t ueIdx)
-{
-    if (ueIdx >= g_stepTbCountByUe.size() || ueIdx >= g_stepTbErrorByUe.size())
-    {
-        return 0.0;
-    }
-    const uint64_t tbCount = g_stepTbCountByUe[ueIdx];
-    if (tbCount == 0)
-    {
-        return 0.0;
-    }
-    return Clamp01(static_cast<double>(g_stepTbErrorByUe[ueIdx]) / static_cast<double>(tbCount));
-}
-
-static int32_t
-ComputeCurrentAppStateCode(uint32_t ueIdx)
-{
-    if (ueIdx >= g_policyBaseStartSByUe.size() || ueIdx >= g_policyPhaseOffsetByUe.size())
-    {
-        return -1;
-    }
-    const double nowS = Simulator::Now().GetSeconds();
-    const double baseS = g_policyBaseStartSByUe[ueIdx];
-    const int32_t phase = g_policyPhaseOffsetByUe[ueIdx];
-    const double segS = std::max(1e-6, g_policySegmentDurationS);
-    const int32_t segIdx = (nowS > baseS) ? static_cast<int32_t>(std::floor((nowS - baseS) / segS)) : 0;
-    if (g_policyUseOnOff2Phase)
-    {
-        return (phase + segIdx) % 2; // 0=burst-heavy, 1=bg-heavy
-    }
-    if (g_appmixStateOverride >= 0)
-    {
-        return g_appmixStateOverride; // 0=ftp_only, 1=video_only, 2=ftp_video
-    }
-    return (phase + segIdx) % 3;
-}
-
-static std::array<double, 4>
-ComputeDrqnLiteBwpMetrics()
-{
-    std::array<double, 4> metrics = {0.0, 0.0, 0.0, 0.0}; // active0, bler0, active1, bler1
-    std::array<double, 2> active = {0.0, 0.0};
-    std::array<double, 2> blerSum = {0.0, 0.0};
-    std::array<double, 2> blerCount = {0.0, 0.0};
-    const double numUes = std::max<uint32_t>(1u, static_cast<uint32_t>(g_ueStats.size()));
-    for (uint32_t ueIdx = 0; ueIdx < g_ueStats.size(); ++ueIdx)
-    {
-        const uint8_t bwp = GetCurrentUeBwp(ueIdx);
-        if (bwp > 1)
-        {
-            continue;
-        }
-        active[bwp] += 1.0;
-        const double tbCount =
-            (ueIdx < g_stepTbCountByUe.size()) ? static_cast<double>(g_stepTbCountByUe[ueIdx]) : 0.0;
-        if (tbCount > 0.0)
-        {
-            blerSum[bwp] += ComputeUeStepBler(ueIdx);
-            blerCount[bwp] += 1.0;
-        }
-    }
-    metrics[0] = Clamp01(active[0] / numUes);
-    metrics[2] = Clamp01(active[1] / numUes);
-    metrics[1] = (blerCount[0] > 0.0) ? Clamp01(blerSum[0] / blerCount[0]) : 0.0;
-    metrics[3] = (blerCount[1] > 0.0) ? Clamp01(blerSum[1] / blerCount[1]) : 0.0;
-    return metrics;
-}
-
-static std::vector<double>
-BuildDrqnAppmixObservation(uint32_t ueIdx, const std::array<double, 4>& bwpMetrics)
-{
-    const double blerNorm = Clamp01(ComputeUeStepBler(ueIdx));
-    const double queueNorm = Clamp01(ComputeDlRlcQueueBytes(ueIdx) / std::max(1.0, g_queueNormBytes));
-    const double channelNorm = (ueIdx < g_lastCqiByUe.size()) ? Clamp01(g_lastCqiByUe[ueIdx] / 15.0) : 0.0;
-    const double delayNorm = Clamp01(ComputeUeMeanAoiMs(ueIdx) / std::max(1.0, g_dqnDelayTargetMs));
-    const double deliveredBytes =
-        (ueIdx < g_stepTbBytesByUe.size()) ? static_cast<double>(g_stepTbBytesByUe[ueIdx]) : 0.0;
-    const uint64_t arrivedBytes = ComputeUeStepArrivedBytes(ueIdx);
-    const double txSizeNorm = Clamp01(deliveredBytes / std::max(1.0, g_queueNormBytes));
-    const double incomingNorm = Clamp01(static_cast<double>(arrivedBytes) / std::max(1.0, g_queueNormBytes));
-    double dropRate = 0.0;
-    if (arrivedBytes > 0)
-    {
-        dropRate = Clamp01(std::max(0.0, static_cast<double>(arrivedBytes) - deliveredBytes) /
-                           static_cast<double>(arrivedBytes));
-    }
-    const uint8_t currentBwp = GetCurrentUeBwp(ueIdx);
-    const double bwp0 = (currentBwp == g_lowBwpId) ? 1.0 : 0.0;
-    const double bwp1 = (currentBwp == g_highBwpId) ? 1.0 : 0.0;
-
-    const uint64_t arrivedFtp = ComputeUeStepArrivedBytesByType(ueIdx, LIGHT_HTTP);
-    const uint64_t arrivedVideo = ComputeUeStepArrivedBytesByType(ueIdx, HEAVY_VIDEO);
-    const double totalArrived = std::max(1.0, static_cast<double>(arrivedBytes));
-    const double ftpShare = Clamp01(static_cast<double>(arrivedFtp) / totalArrived);
-    const double videoShare = Clamp01(static_cast<double>(arrivedVideo) / totalArrived);
-    const int32_t stateCode = ComputeCurrentAppStateCode(ueIdx);
-    const bool burstHeavy = g_policyUseOnOff2Phase ? (stateCode == 0) : (stateCode == 1 || stateCode == 2);
-    const double burstPhase = burstHeavy ? 1.0 : 0.0;
-
-    return {blerNorm,
-            dropRate,
-            queueNorm,
-            channelNorm,
-            delayNorm,
-            txSizeNorm,
-            incomingNorm,
-            bwp0,
-            bwp1,
-            bwpMetrics[0],
-            bwpMetrics[1],
-            bwpMetrics[2],
-            bwpMetrics[3],
-            ftpShare,
-            videoShare,
-            burstPhase};
-}
-
 #ifdef HAVE_OPENGYM
 static Ptr<OpenGymSpace>
 MyGetObservationSpace()
 {
-    const uint32_t featuresPerUe = g_rlDrqnProfile ? 16u : 8u;
-    const uint32_t obsDim = featuresPerUe * static_cast<uint32_t>(g_ueStats.size());
+    const uint32_t featuresPerUe = g_rlDrqnProfile ? 13u : (g_rlRqrProfile ? 7u : 8u);
+    uint32_t obsDim = featuresPerUe * static_cast<uint32_t>(g_ueStats.size());
     std::vector<uint32_t> shape = {obsDim};
-    if (g_rlDrqnProfile)
+    if (g_rlDrqnProfile || g_rlRqrProfile)
     {
         return CreateObject<OpenGymBoxSpace>(-1.0e6f, 1.0e6f, shape, TypeNameGet<float>());
     }
@@ -2849,16 +3019,16 @@ MyGetObservationSpace()
 static Ptr<OpenGymSpace>
 MyGetActionSpace()
 {
-    const uint32_t numUes = static_cast<uint32_t>(g_ueStats.size());
+    uint32_t numUes = static_cast<uint32_t>(g_ueStats.size());
+    const bool bwpOnly = g_rlDrqnProfile || !g_enableRlMcsControl;
     if (numUes <= 1)
     {
-        return CreateObject<OpenGymDiscreteSpace>(
-            g_rlDrqnProfile ? 2u : (g_enableRlMcsControl ? 10u : 2u));
+        return CreateObject<OpenGymDiscreteSpace>(bwpOnly ? 2u : 10u);
     }
     std::vector<uint32_t> shape = {numUes};
     return CreateObject<OpenGymBoxSpace>(
         0.0f,
-        g_rlDrqnProfile ? 1.0f : (g_enableRlMcsControl ? 9.0f : 1.0f),
+        bwpOnly ? 1.0f : 9.0f,
         shape,
         TypeNameGet<uint32_t>());
 }
@@ -2872,32 +3042,85 @@ MyGetGameOver()
 static Ptr<OpenGymDataContainer>
 MyGetObservation()
 {
-    const uint32_t numUes = static_cast<uint32_t>(g_ueStats.size());
-    const uint32_t featuresPerUe = g_rlDrqnProfile ? 16u : 8u;
+    uint32_t numUes = static_cast<uint32_t>(g_ueStats.size());
+    RefreshStepSpectralEfficiencyCaches();
+    uint32_t featuresPerUe = g_rlDrqnProfile ? 13u : (g_rlRqrProfile ? 7u : 8u);
     std::vector<uint32_t> shape = {featuresPerUe * numUes};
     Ptr<OpenGymBoxContainer<float>> box = CreateObject<OpenGymBoxContainer<float>>(shape);
-    const auto bwpMetrics = ComputeDrqnLiteBwpMetrics();
+    auto bwpMetrics = ComputeDrqnLiteBwpMetrics();
 
     for (uint32_t ueIdx = 0; ueIdx < numUes; ++ueIdx)
     {
         if (g_rlDrqnProfile)
         {
-            const auto obs = BuildDrqnAppmixObservation(ueIdx, bwpMetrics);
+            auto obs = BuildDrqnLiteObservation(ueIdx, bwpMetrics);
             for (double v : obs)
             {
                 box->AddValue(static_cast<float>(v));
             }
             continue;
         }
-        // Backward-compatible minimal profile.
-        box->AddValue(static_cast<float>(GetCurrentUeBwp(ueIdx) == g_highBwpId ? 1.0 : -1.0));
-        box->AddValue(static_cast<float>(ComputeDlRlcQueueBytes(ueIdx)));
-        box->AddValue(static_cast<float>(ComputeUeMeanAoiMs(ueIdx)));
-        box->AddValue(static_cast<float>(ComputeUeThroughputMbps(ueIdx)));
-        box->AddValue(static_cast<float>((ueIdx < g_lastCqiByUe.size()) ? g_lastCqiByUe[ueIdx] : 0.0));
-        box->AddValue(static_cast<float>(ComputeUeStepBler(ueIdx)));
-        box->AddValue(static_cast<float>(ComputeUeStepSpectralEfficiency(ueIdx)));
-        box->AddValue(static_cast<float>(ComputeUePrbUtility(ueIdx)));
+        if (g_rlRqrProfile)
+        {
+            const double currentBwpSym = (GetCurrentUeBwp(ueIdx) == g_highBwpId) ? 1.0 : -1.0;
+            const double mcsOffsetNorm = std::max(
+                -1.0,
+                std::min(1.0,
+                         ((ueIdx < g_lastRequestedMcsOffsetByUe.size()) ? g_lastRequestedMcsOffsetByUe[ueIdx] : 0.0) /
+                             2.0));
+            const double sinrNorm =
+                (ueIdx < g_lastSinrDbByUe.size())
+                    ? SymmetricUnitNorm(Clamp01((g_lastSinrDbByUe[ueIdx] + 10.0) / 40.0))
+                    : -1.0;
+            const double cqiNorm = (ueIdx < g_lastCqiByUe.size())
+                                       ? SymmetricUnitNorm(Clamp01(g_lastCqiByUe[ueIdx] / 15.0))
+                                       : -1.0;
+            const double queueBytes = ComputeDlRlcQueueBytes(ueIdx);
+            const double queueNormSym = SymmetricUnitNorm(Clamp01(queueBytes / std::max(1.0, g_queueNormBytes)));
+            const double tblerNormSym =
+                (ueIdx < g_lastTblerByUe.size() && g_lastTblerByUe[ueIdx] >= 0.0)
+                    ? SymmetricUnitNorm(Clamp01(g_lastTblerByUe[ueIdx]))
+                    : -1.0;
+            const double deliveredBytes =
+                (ueIdx < g_lastRewardDeliveredBytesByUe.size()) ? static_cast<double>(g_lastRewardDeliveredBytesByUe[ueIdx]) : 0.0;
+            const double stepGoodputMbps =
+                deliveredBytes *
+                8.0 / std::max(1e-6, g_envStepTime) / 1.0e6;
+            const double goodputNormSym =
+                SymmetricUnitNorm(Clamp01(stepGoodputMbps / std::max(1e-6, g_dqnThrTargetMbps)));
+            box->AddValue(static_cast<float>(currentBwpSym));
+            box->AddValue(static_cast<float>(mcsOffsetNorm));
+            box->AddValue(static_cast<float>(sinrNorm));
+            box->AddValue(static_cast<float>(cqiNorm));
+            box->AddValue(static_cast<float>(queueNormSym));
+            box->AddValue(static_cast<float>(tblerNormSym));
+            box->AddValue(static_cast<float>(goodputNormSym));
+            continue;
+        }
+        double queueBytes = ComputeDlRlcQueueBytes(ueIdx);
+        double arrivedBytes = static_cast<double>(ComputeUeStepArrivedBytes(ueIdx));
+        double mcsOffset =
+            (ueIdx < g_lastRequestedMcsOffsetByUe.size()) ? g_lastRequestedMcsOffsetByUe[ueIdx] : 0.0;
+        double bwpMode = (GetCurrentUeBwp(ueIdx) == g_highBwpId) ? 1.0 : -1.0;
+        double aoiMs = ComputeUeMeanAoiMs(ueIdx);
+        double inFlightBytes = ComputeOutstandingAoiBytes(ueIdx);
+        double timeSinceLastDeliveryMs = ComputeTimeSinceLastDeliveryMs(ueIdx);
+        double sinrNorm = 0.0;
+        if (ueIdx < g_lastSinrDbByUe.size())
+        {
+            sinrNorm = Clamp01((g_lastSinrDbByUe[ueIdx] + 10.0) / 40.0);
+        }
+
+        box->AddValue(static_cast<float>(bwpMode));
+        box->AddValue(static_cast<float>(std::max(-2.0, std::min(2.0, mcsOffset))));
+        box->AddValue(static_cast<float>(SymmetricUnitNorm(sinrNorm)));
+        box->AddValue(static_cast<float>(SymmetricUnitNorm(arrivedBytes / std::max(1.0, g_queueNormBytes))));
+        box->AddValue(static_cast<float>(SymmetricUnitNorm(queueBytes / std::max(1.0, g_queueNormBytes))));
+        box->AddValue(static_cast<float>(SymmetricUnitNorm(aoiMs / std::max(1.0, g_dqnDelayTargetMs))));
+        box->AddValue(static_cast<float>(
+            SymmetricUnitNorm(inFlightBytes / std::max(1.0, g_queueNormBytes))));
+        box->AddValue(static_cast<float>(
+            SymmetricUnitNorm(timeSinceLastDeliveryMs / std::max(1.0, g_dqnDelayTargetMs))));
     }
     return box;
 }
@@ -2905,76 +3128,179 @@ MyGetObservation()
 static float
 MyGetReward()
 {
-    const uint32_t numUes = static_cast<uint32_t>(g_ueStats.size());
+    uint32_t numUes = static_cast<uint32_t>(g_ueStats.size());
     if (numUes == 0)
     {
         return 0.0f;
     }
 
+    RefreshStepSpectralEfficiencyCaches();
+
+    if (g_rlDrqnProfile)
+    {
+        double rewardSum = 0.0;
+        g_lastMeanAoiMs = 0.0;
+        double aoiPenaltySum = 0.0;
+        double goodputTermSum = 0.0;
+        double auxTermSum = 0.0;
+        double seTermSum = 0.0;
+        double switchPenaltySum = 0.0;
+        for (uint32_t ueIdx = 0; ueIdx < numUes; ++ueIdx)
+        {
+            double currentAoiMs = ComputeUeMeanAoiMs(ueIdx);
+            g_lastMeanAoiMs += ComputeUeKpiAoiMs(ueIdx);
+            double prevQueueBytes =
+                (ueIdx < g_prevRewardQueueBytesByUe.size()) ? g_prevRewardQueueBytesByUe[ueIdx] : 0.0;
+            double currentQueueBytes = ComputeDlRlcQueueBytes(ueIdx);
+            uint64_t currentTxBytes = ComputeUeTxBytes(ueIdx);
+            uint64_t prevTxBytes = (ueIdx < g_prevRewardTxBytesByUe.size()) ? g_prevRewardTxBytesByUe[ueIdx] : 0u;
+            uint64_t arrivedBytesRaw = (currentTxBytes >= prevTxBytes) ? (currentTxBytes - prevTxBytes) : 0u;
+            uint64_t deliveredBytesRaw = (ueIdx < g_stepTbBytesByUe.size()) ? g_stepTbBytesByUe[ueIdx] : 0u;
+            double reward = ComputeDrqnLiteReward(ueIdx);
+            rewardSum += reward;
+            aoiPenaltySum +=
+                -std::log1p(std::max(0.0, currentAoiMs)) / std::log1p(std::max(1.0, g_dqnDelayTargetMs));
+            goodputTermSum += deliveredBytesRaw > 0u ? std::log1p(static_cast<double>(deliveredBytesRaw)) : 0.0;
+            if (ueIdx < g_lastRewardPrevQueueBytesByUe.size())
+            {
+                g_lastRewardPrevQueueBytesByUe[ueIdx] = prevQueueBytes;
+            }
+            if (ueIdx < g_lastRewardArrivedBytesByUe.size())
+            {
+                g_lastRewardArrivedBytesByUe[ueIdx] = arrivedBytesRaw;
+            }
+            if (ueIdx < g_lastRewardDeliveredBytesByUe.size())
+            {
+                g_lastRewardDeliveredBytesByUe[ueIdx] = deliveredBytesRaw;
+            }
+            if (ueIdx < g_prevRewardQueueBytesByUe.size())
+            {
+                g_prevRewardQueueBytesByUe[ueIdx] = currentQueueBytes;
+            }
+            if (ueIdx < g_prevRewardAoiMsByUe.size())
+            {
+                g_prevRewardAoiMsByUe[ueIdx] = currentAoiMs;
+            }
+            if (ueIdx < g_prevRewardTxBytesByUe.size())
+            {
+                g_prevRewardTxBytesByUe[ueIdx] = currentTxBytes;
+            }
+        }
+        g_lastMeanAoiMs /= numUes;
+        g_lastMeanRewardAoiTerm = aoiPenaltySum / static_cast<double>(numUes);
+        g_lastMeanRewardThrTerm = goodputTermSum / static_cast<double>(numUes);
+        g_lastMeanRewardPdrTerm = auxTermSum / static_cast<double>(numUes);
+        g_lastMeanRewardSeTerm = seTermSum / static_cast<double>(numUes);
+        g_lastMeanRewardSwitchPenalty = switchPenaltySum / static_cast<double>(numUes);
+        g_lastMeanRewardTotal = rewardSum / static_cast<double>(numUes);
+        return static_cast<float>(g_lastMeanRewardTotal);
+    }
+    if (g_rlRqrProfile)
+    {
+        double rewardSum = 0.0;
+        g_lastMeanAoiMs = 0.0;
+        double goodputTermSum = 0.0;
+        double switchPenaltySum = 0.0;
+        for (uint32_t ueIdx = 0; ueIdx < numUes; ++ueIdx)
+        {
+            g_lastMeanAoiMs += ComputeUeKpiAoiMs(ueIdx);
+            const uint64_t currentRxBytes = ComputeUeRxBytes(ueIdx);
+            const uint64_t prevRxBytes =
+                (ueIdx < g_prevRewardRxBytesByUe.size()) ? g_prevRewardRxBytesByUe[ueIdx] : 0u;
+            const uint64_t deliveredBytesRaw = (currentRxBytes >= prevRxBytes) ? (currentRxBytes - prevRxBytes) : 0u;
+            const double deliveredBytes = static_cast<double>(deliveredBytesRaw);
+            const double stepGoodputMbps = deliveredBytes * 8.0 / std::max(1e-6, g_envStepTime) / 1.0e6;
+            const bool switched = (ueIdx < g_lastActualSwitchByUe.size()) && (g_lastActualSwitchByUe[ueIdx] > 0);
+            const double switchPenalty = switched ? std::max(0.0, g_rqrSwitchPenaltyWeight) : 0.0;
+            const double reward = std::log1p(std::max(0.0, stepGoodputMbps)) - switchPenalty;
+            rewardSum += reward;
+            goodputTermSum += std::log1p(std::max(0.0, stepGoodputMbps));
+            switchPenaltySum += -switchPenalty;
+            if (ueIdx < g_lastRewardDeliveredBytesByUe.size())
+            {
+                g_lastRewardDeliveredBytesByUe[ueIdx] = deliveredBytesRaw;
+            }
+            if (ueIdx < g_prevRewardRxBytesByUe.size())
+            {
+                g_prevRewardRxBytesByUe[ueIdx] = currentRxBytes;
+            }
+        }
+        g_lastMeanAoiMs /= numUes;
+        g_lastMeanRewardAoiTerm = 0.0;
+        g_lastMeanRewardThrTerm = goodputTermSum / static_cast<double>(numUes);
+        g_lastMeanRewardPdrTerm = 0.0;
+        g_lastMeanRewardSeTerm = 0.0;
+        g_lastMeanRewardSwitchPenalty = switchPenaltySum / static_cast<double>(numUes);
+        g_lastMeanRewardTotal = rewardSum / static_cast<double>(numUes);
+        return static_cast<float>(g_lastMeanRewardTotal);
+    }
+    g_lastMeanAoiMs = 0.0;
     double rewardSum = 0.0;
-    double aoiTermSum = 0.0;
-    double thrTermSum = 0.0;
+    double aoiPenaltySum = 0.0;
+    double goodputTermSum = 0.0;
+    double auxTermSum = 0.0;
+    double seTermSum = 0.0;
     double switchPenaltySum = 0.0;
-    double meanAoi = 0.0;
+
     for (uint32_t ueIdx = 0; ueIdx < numUes; ++ueIdx)
     {
-        const double aoiMs = ComputeUeMeanAoiMs(ueIdx);
-        meanAoi += aoiMs;
-        const double delayNorm = Clamp01(aoiMs / std::max(1.0, g_dqnDelayTargetMs));
-        const double deliveredBytes =
-            (ueIdx < g_stepTbBytesByUe.size()) ? static_cast<double>(g_stepTbBytesByUe[ueIdx]) : 0.0;
-        const double goodputMbps = deliveredBytes * 8.0 / std::max(1e-6, g_envStepTime) / 1e6;
-        const double thrNorm = Clamp01(goodputMbps / std::max(1e-6, g_dqnThrTargetMbps));
-        const uint32_t latencyUes = static_cast<uint32_t>(std::round(g_dqnLatencyUeRatio * numUes));
-        const bool isLatencySensitive = (ueIdx < latencyUes);
-        const double lambda = isLatencySensitive ? g_dqnAlpha : (1.0 - g_dqnAlpha);
-        const double mu = isLatencySensitive ? g_dqnBeta : (1.0 - g_dqnBeta);
-        const double aoiTerm = -(lambda * delayNorm);
-        const double thrTerm = -(mu * (1.0 - thrNorm));
-        const double switchPenalty =
-            (ueIdx < g_lastActualSwitchByUe.size() && g_lastActualSwitchByUe[ueIdx] > 0)
-                ? g_rewardLambdaSwitch
+        double currentAoiMs = ComputeUeMeanAoiMs(ueIdx);
+        g_lastMeanAoiMs += ComputeUeKpiAoiMs(ueIdx);
+        double prevQueueBytes =
+            (ueIdx < g_prevRewardQueueBytesByUe.size()) ? g_prevRewardQueueBytesByUe[ueIdx] : 0.0;
+        double currentQueueBytes = ComputeDlRlcQueueBytes(ueIdx);
+        uint64_t currentTxBytes = ComputeUeTxBytes(ueIdx);
+        uint64_t prevTxBytes = (ueIdx < g_prevRewardTxBytesByUe.size()) ? g_prevRewardTxBytesByUe[ueIdx] : 0u;
+        uint64_t arrivedBytesRaw = (currentTxBytes >= prevTxBytes) ? (currentTxBytes - prevTxBytes) : 0u;
+        uint64_t deliveredBytesRaw = (ueIdx < g_stepTbBytesByUe.size()) ? g_stepTbBytesByUe[ueIdx] : 0u;
+        double requestedBytes = std::max(0.0, prevQueueBytes) + static_cast<double>(arrivedBytesRaw);
+        double serviceRatio =
+            (requestedBytes > 0.0)
+                ? Clamp01(static_cast<double>(deliveredBytesRaw) / requestedBytes)
                 : 0.0;
-        const double reward = aoiTerm + thrTerm - switchPenalty;
-
+        double aoiPenalty =
+            -std::log1p(std::max(0.0, currentAoiMs)) / std::log1p(std::max(1.0, g_dqnDelayTargetMs));
+        double goodputTerm = serviceRatio;
+        double auxTerm = 0.0;
+        double seReward = 0.0;
+        double switchPenalty = 0.0;
+        double reward = std::log(goodputTerm + 0.005);
         rewardSum += reward;
-        aoiTermSum += aoiTerm;
-        thrTermSum += thrTerm;
-        switchPenaltySum += -switchPenalty;
-
-        if (ueIdx < g_lastRewardPrevAoiMsByUe.size())
-        {
-            g_lastRewardPrevAoiMsByUe[ueIdx] = (ueIdx < g_prevRewardAoiMsByUe.size()) ? g_prevRewardAoiMsByUe[ueIdx] : aoiMs;
-        }
-        if (ueIdx < g_prevRewardAoiMsByUe.size())
-        {
-            g_prevRewardAoiMsByUe[ueIdx] = aoiMs;
-        }
+        aoiPenaltySum += aoiPenalty;
+        goodputTermSum += goodputTerm;
+        auxTermSum += auxTerm;
+        seTermSum += seReward;
+        switchPenaltySum += switchPenalty;
         if (ueIdx < g_lastRewardPrevQueueBytesByUe.size())
         {
-            g_lastRewardPrevQueueBytesByUe[ueIdx] = ComputeDlRlcQueueBytes(ueIdx);
+            g_lastRewardPrevQueueBytesByUe[ueIdx] = prevQueueBytes;
         }
         if (ueIdx < g_lastRewardArrivedBytesByUe.size())
         {
-            g_lastRewardArrivedBytesByUe[ueIdx] = ComputeUeStepArrivedBytes(ueIdx);
+            g_lastRewardArrivedBytesByUe[ueIdx] = arrivedBytesRaw;
         }
         if (ueIdx < g_lastRewardDeliveredBytesByUe.size())
         {
-            g_lastRewardDeliveredBytesByUe[ueIdx] = (ueIdx < g_stepTbBytesByUe.size()) ? g_stepTbBytesByUe[ueIdx] : 0u;
+            g_lastRewardDeliveredBytesByUe[ueIdx] = deliveredBytesRaw;
+        }
+        if (ueIdx < g_prevRewardQueueBytesByUe.size())
+        {
+            g_prevRewardQueueBytesByUe[ueIdx] = currentQueueBytes;
+        }
+        if (ueIdx < g_prevRewardAoiMsByUe.size())
+        {
+            g_prevRewardAoiMsByUe[ueIdx] = currentAoiMs;
         }
         if (ueIdx < g_prevRewardTxBytesByUe.size())
         {
-            g_prevRewardTxBytesByUe[ueIdx] = ComputeUeTxBytes(ueIdx);
-        }
-        if (ueIdx < g_prevRewardTxBytesByType.size() && ueIdx < g_txBytesByType.size())
-        {
-            g_prevRewardTxBytesByType[ueIdx] = g_txBytesByType[ueIdx];
+            g_prevRewardTxBytesByUe[ueIdx] = currentTxBytes;
         }
     }
-    g_lastMeanAoiMs = meanAoi / static_cast<double>(numUes);
-    g_lastMeanRewardAoiTerm = aoiTermSum / static_cast<double>(numUes);
-    g_lastMeanRewardThrTerm = thrTermSum / static_cast<double>(numUes);
-    g_lastMeanRewardSeTerm = 0.0;
+    g_lastMeanAoiMs /= numUes;
+    g_lastMeanRewardAoiTerm = aoiPenaltySum / static_cast<double>(numUes);
+    g_lastMeanRewardThrTerm = goodputTermSum / static_cast<double>(numUes);
+    g_lastMeanRewardPdrTerm = auxTermSum / static_cast<double>(numUes);
+    g_lastMeanRewardSeTerm = seTermSum / static_cast<double>(numUes);
     g_lastMeanRewardSwitchPenalty = switchPenaltySum / static_cast<double>(numUes);
     g_lastMeanRewardTotal = rewardSum / static_cast<double>(numUes);
     return static_cast<float>(g_lastMeanRewardTotal);
@@ -2983,15 +3309,21 @@ MyGetReward()
 static std::string
 MyGetExtraInfo()
 {
-    const uint32_t numUes = static_cast<uint32_t>(g_ueStats.size());
+    uint32_t numUes = static_cast<uint32_t>(g_ueStats.size());
+    RefreshStepSpectralEfficiencyCaches();
     double meanThrMbps = 0.0;
+    double meanStepGoodputMbps = 0.0;
     for (uint32_t ueIdx = 0; ueIdx < numUes; ++ueIdx)
     {
         meanThrMbps += ComputeUeThroughputMbps(ueIdx);
+        const double deliveredBytes =
+            (ueIdx < g_lastRewardDeliveredBytesByUe.size()) ? static_cast<double>(g_lastRewardDeliveredBytesByUe[ueIdx]) : 0.0;
+        meanStepGoodputMbps += deliveredBytes * 8.0 / std::max(1e-6, g_envStepTime) / 1.0e6;
     }
     if (numUes > 0)
     {
-        meanThrMbps /= static_cast<double>(numUes);
+        meanThrMbps /= numUes;
+        meanStepGoodputMbps /= numUes;
     }
 
     std::ostringstream oss;
@@ -3002,45 +3334,67 @@ MyGetExtraInfo()
         << "switch_count=" << g_lastIntervalSwitchCount << "|"
         << "requested_bwp0_count=" << g_lastRequestedBwp0Count << "|"
         << "requested_bwp1_count=" << g_lastRequestedBwp1Count << "|"
+        << "switch_reject_cooldown=" << g_lastSwitchRejectCooldownCount << "|"
+        << "switch_reject_no_rnti=" << g_lastSwitchRejectNoRntiCount << "|"
+        << "switch_reject_same_target=" << g_lastSwitchRejectSameTargetCount << "|"
+        << "switch_reject_mgr_busy=" << g_lastSwitchRejectMgrBusyCount << "|"
+        << "switch_reject_mgr_missing=" << g_lastSwitchRejectMgrMissingCount << "|"
+        << "switch_reject_uemgr_missing=" << g_lastSwitchRejectUeMgrMissingCount << "|"
         << "mean_thr_mbps=" << meanThrMbps << "|"
+        << "mean_step_goodput_mbps=" << meanStepGoodputMbps << "|"
         << "reward_aoi_penalty=" << g_lastMeanRewardAoiTerm << "|"
-        << "reward_goodput_term=" << g_lastMeanRewardThrTerm << "|"
-        << "reward_aux_term=0|"
+        << "reward_service_ratio_term=" << g_lastMeanRewardThrTerm << "|"
+        << "reward_aux_term=" << g_lastMeanRewardPdrTerm << "|"
         << "reward_se_term=" << g_lastMeanRewardSeTerm << "|"
         << "reward_switch_penalty=" << g_lastMeanRewardSwitchPenalty << "|"
         << "reward_total=" << g_lastMeanRewardTotal << "|"
-        << "bwp0_se="
-        << ((g_lowBwpId < g_lastBwpStepSpectralEfficiency.size()) ? g_lastBwpStepSpectralEfficiency[g_lowBwpId] : 0.0)
-        << "|bwp1_se="
-        << ((g_highBwpId < g_lastBwpStepSpectralEfficiency.size()) ? g_lastBwpStepSpectralEfficiency[g_highBwpId] : 0.0)
-        << "|bwp0_total_prb=" << ((g_lowBwpId < g_totalPrbByBwp.size()) ? g_totalPrbByBwp[g_lowBwpId] : 0u)
-        << "|bwp1_total_prb=" << ((g_highBwpId < g_totalPrbByBwp.size()) ? g_totalPrbByBwp[g_highBwpId] : 0u);
+        << "bwp0_avg_mcs=" << ((g_lowBwpId < g_lastBwpAvgMcs.size()) ? g_lastBwpAvgMcs[g_lowBwpId] : 0.0) << "|"
+        << "bwp1_avg_mcs=" << ((g_highBwpId < g_lastBwpAvgMcs.size()) ? g_lastBwpAvgMcs[g_highBwpId] : 0.0) << "|"
+        << "bwp0_se=" << ((g_lowBwpId < g_lastBwpStepSpectralEfficiency.size()) ? g_lastBwpStepSpectralEfficiency[g_lowBwpId] : 0.0) << "|"
+        << "bwp1_se=" << ((g_highBwpId < g_lastBwpStepSpectralEfficiency.size()) ? g_lastBwpStepSpectralEfficiency[g_highBwpId] : 0.0) << "|"
+        << "bwp0_total_prb=" << ((g_lowBwpId < g_totalPrbByBwp.size()) ? g_totalPrbByBwp[g_lowBwpId] : 0u) << "|"
+        << "bwp1_total_prb=" << ((g_highBwpId < g_totalPrbByBwp.size()) ? g_totalPrbByBwp[g_highBwpId] : 0u);
 
     for (uint32_t ueIdx = 0; ueIdx < numUes; ++ueIdx)
     {
-        const double goodputMbps =
+        double stepGoodputMbps =
             ((ueIdx < g_lastRewardDeliveredBytesByUe.size()) ? static_cast<double>(g_lastRewardDeliveredBytesByUe[ueIdx]) : 0.0) *
             8.0 / std::max(1e-6, g_envStepTime) / 1.0e6;
-        oss << "|ue" << ueIdx << "_thr_mbps=" << ComputeUeThroughputMbps(ueIdx)
-            << "|ue" << ueIdx << "_goodput_mbps=" << goodputMbps
-            << "|ue" << ueIdx << "_aoi_ms=" << ComputeUeMeanAoiMs(ueIdx)
-            << "|ue" << ueIdx << "_prev_aoi_ms="
-            << ((ueIdx < g_lastRewardPrevAoiMsByUe.size()) ? g_lastRewardPrevAoiMsByUe[ueIdx] : 0.0)
-            << "|ue" << ueIdx << "_bler=" << ComputeUeStepBler(ueIdx)
-            << "|ue" << ueIdx << "_hol_age_ms=" << ComputeUeMeanAoiMs(ueIdx)
-            << "|ue" << ueIdx << "_se=" << ComputeUeStepSpectralEfficiency(ueIdx)
+        double aoiFtpMs = ComputeCurrentAoiMs(ueIdx, LIGHT_HTTP);
+        double aoiGamingMs = ComputeCurrentAoiMs(ueIdx, MODERATE_GAMING);
+        double aoiVideoMs = ComputeCurrentAoiMs(ueIdx, HEAVY_VIDEO);
+        double currentBwp = static_cast<double>(GetCurrentUeBwp(ueIdx) == g_highBwpId ? 1 : 0);
+        double queueBytes = ComputeDlRlcQueueBytes(ueIdx);
+        double sinrDb = (ueIdx < g_lastSinrDbByUe.size()) ? g_lastSinrDbByUe[ueIdx] : -20.0;
+        int8_t losState = QueryUeLosState(ueIdx);
+        oss << "|ue" << ueIdx << "_thr_mbps=" << ComputeUeThroughputMbps(ueIdx) << "|ue" << ueIdx
+            << "_goodput_mbps=" << stepGoodputMbps << "|ue" << ueIdx
+            << "_aoi_ms=" << ComputeUeKpiAoiMs(ueIdx) << "|ue" << ueIdx
+            << "_queue_bytes=" << queueBytes << "|ue" << ueIdx
+            << "_sinr_db=" << sinrDb << "|ue" << ueIdx
+            << "_current_bwp=" << currentBwp << "|ue" << ueIdx
+            << "_los_state=" << static_cast<int32_t>(losState) << "|ue" << ueIdx
+            << "_switched=" << ((ueIdx < g_lastActualSwitchByUe.size()) ? g_lastActualSwitchByUe[ueIdx] : 0u)
+            << "|ue" << ueIdx
+            << "_bler=" << ComputeUeStepBler(ueIdx) << "|ue" << ueIdx
+            << "_aoi_ftp_ms=" << aoiFtpMs << "|ue" << ueIdx
+            << "_aoi_gaming_ms=" << aoiGamingMs << "|ue" << ueIdx
+            << "_aoi_video_ms=" << aoiVideoMs << "|ue" << ueIdx
+            << "_se="
+            << ((ueIdx < g_lastStepSpectralEfficiencyByUe.size()) ? g_lastStepSpectralEfficiencyByUe[ueIdx]
+                                                                  : 0.0)
             << "|ue" << ueIdx << "_assigned_prb="
-            << ((ueIdx < g_lastStepAssignedPrbByUe.size()) ? static_cast<double>(g_lastStepAssignedPrbByUe[ueIdx]) : 0.0)
+            << ((ueIdx < g_lastStepAssignedPrbByUe.size()) ? static_cast<double>(g_lastStepAssignedPrbByUe[ueIdx])
+                                                           : 0.0)
             << "|ue" << ueIdx << "_arrived_bytes="
-            << ((ueIdx < g_lastRewardArrivedBytesByUe.size()) ? static_cast<double>(g_lastRewardArrivedBytesByUe[ueIdx]) : 0.0)
+            << ((ueIdx < g_lastRewardArrivedBytesByUe.size()) ? static_cast<double>(g_lastRewardArrivedBytesByUe[ueIdx])
+                                                              : 0.0)
             << "|ue" << ueIdx << "_delivered_bytes="
-            << ((ueIdx < g_lastRewardDeliveredBytesByUe.size()) ? static_cast<double>(g_lastRewardDeliveredBytesByUe[ueIdx]) : 0.0)
-            << "|ue" << ueIdx << "_queue_bytes=" << ComputeDlRlcQueueBytes(ueIdx)
+            << ((ueIdx < g_lastRewardDeliveredBytesByUe.size())
+                    ? static_cast<double>(g_lastRewardDeliveredBytesByUe[ueIdx])
+                    : 0.0)
             << "|ue" << ueIdx << "_prev_queue_bytes="
-            << ((ueIdx < g_lastRewardPrevQueueBytesByUe.size()) ? g_lastRewardPrevQueueBytesByUe[ueIdx] : 0.0)
-            << "|ue" << ueIdx << "_actual_switch="
-            << ((ueIdx < g_lastActualSwitchByUe.size()) ? static_cast<double>(g_lastActualSwitchByUe[ueIdx]) : 0.0)
-            << "|ue" << ueIdx << "_current_bwp=" << static_cast<double>(GetCurrentUeBwp(ueIdx));
+            << ((ueIdx < g_lastRewardPrevQueueBytesByUe.size()) ? g_lastRewardPrevQueueBytesByUe[ueIdx] : 0.0);
     }
     return oss.str();
 }
@@ -3048,8 +3402,9 @@ MyGetExtraInfo()
 static bool
 MyExecuteActions(Ptr<OpenGymDataContainer> action)
 {
-    const uint32_t numUes = static_cast<uint32_t>(g_ueStats.size());
-    std::vector<uint32_t> codes(numUes, g_enableRlMcsControl ? 2u : 0u);
+    uint32_t numUes = static_cast<uint32_t>(g_ueStats.size());
+    std::vector<uint32_t> codes(numUes, 2); // force BWP 0 + delta 0
+    const bool bwpOnly = g_rlDrqnProfile || !g_enableRlMcsControl;
 
     if (numUes <= 1)
     {
@@ -3089,29 +3444,36 @@ MyExecuteActions(Ptr<OpenGymDataContainer> action)
     std::fill(g_nextActualSwitchByUe.begin(), g_nextActualSwitchByUe.end(), 0u);
     for (uint32_t ueIdx = 0; ueIdx < numUes; ++ueIdx)
     {
-        const uint32_t code = std::min<uint32_t>(9u, codes[ueIdx]);
+        uint32_t code = std::min<uint32_t>(bwpOnly ? 1u : 9u, codes[ueIdx]);
         uint8_t bwpTarget = 0;
         uint8_t deltaIdx = 2;
-        if (g_enableRlMcsControl)
+        if (!bwpOnly)
         {
             bwpTarget = static_cast<uint8_t>(code / 5u);
             deltaIdx = static_cast<uint8_t>(code % 5u);
         }
         else
         {
-            // Accept both raw {0,1} and encoded {0..9} inputs.
-            bwpTarget = (code <= 1u) ? static_cast<uint8_t>(code)
-                                     : static_cast<uint8_t>(std::min<uint32_t>(1u, code / 5u));
+            bwpTarget = static_cast<uint8_t>(code);
         }
-
         int8_t delta = 0;
         switch (deltaIdx)
         {
-        case 0: delta = -2; break;
-        case 1: delta = -1; break;
-        case 3: delta = +1; break;
-        case 4: delta = +2; break;
-        default: delta = 0; break;
+        case 0:
+            delta = -2;
+            break;
+        case 1:
+            delta = -1;
+            break;
+        case 3:
+            delta = +1;
+            break;
+        case 4:
+            delta = +2;
+            break;
+        default:
+            delta = 0;
+            break;
         }
         if (ueIdx < g_lastRequestedMcsOffsetByUe.size())
         {
@@ -3127,18 +3489,32 @@ MyExecuteActions(Ptr<OpenGymDataContainer> action)
             requestedBwp1Count++;
         }
 
-        if (g_enableRlMcsControl && ueIdx < g_targetMcsByUe.size())
+        if (!bwpOnly && ueIdx < g_targetMcsByUe.size())
         {
-            const int baseMcs =
-                (ueIdx < g_lastCqiByUe.size()) ? EstimateBaseMcsFromCqi(g_lastCqiByUe[ueIdx]) : static_cast<int>(g_initialMcs);
-            int targetMcs = std::max(0, std::min(27, baseMcs + static_cast<int>(delta)));
-            g_targetMcsByUe[ueIdx] = static_cast<uint8_t>(targetMcs);
+            int target = static_cast<int>(g_targetMcsByUe[ueIdx]) + delta;
+            target = std::max(0, std::min(27, target));
+            g_targetMcsByUe[ueIdx] = static_cast<uint8_t>(target);
+        }
+
+        if (g_rlDebug)
+        {
+            uint8_t current = (ueIdx < g_currentBwpByUe.size()) ? GetCurrentUeBwp(ueIdx) : 0;
+            uint8_t target = (bwpTarget == 0) ? g_lowBwpId : g_highBwpId;
+            uint8_t targetMcs = (ueIdx < g_targetMcsByUe.size()) ? g_targetMcsByUe[ueIdx] : 0;
+            NS_LOG_UNCOND("[rl-debug] action ue="
+                          << ueIdx << " code=" << code << " current_bwp=" << unsigned(current)
+                          << " target_bwp=" << unsigned(target) << " mcs_delta=" << int(delta)
+                          << " target_mcs=" << unsigned(targetMcs)
+                          << " prb_utility=" << ComputeUePrbUtility(ueIdx)
+                          << " thr_mbps=" << ComputeUeThroughputMbps(ueIdx)
+                          << " aoi_ms=" << ComputeUeMeanAoiMs(ueIdx)
+                          << " queue_bytes=" << ComputeDlRlcQueueBytes(ueIdx));
         }
 
         if (g_enableRlBwpControl && ueIdx < g_rntiByUeIdx.size() && g_rntiByUeIdx[ueIdx] != 0)
         {
-            const uint8_t current = GetCurrentUeBwp(ueIdx);
-            const uint8_t target = (bwpTarget == 0) ? g_lowBwpId : g_highBwpId;
+            uint8_t current = GetCurrentUeBwp(ueIdx);
+            uint8_t target = (bwpTarget == 0) ? g_lowBwpId : g_highBwpId;
             if (current != target && TrySwitchUeToBwp(ueIdx, target))
             {
                 switchCount++;
@@ -3153,13 +3529,20 @@ MyExecuteActions(Ptr<OpenGymDataContainer> action)
             }
         }
     }
-    if (g_enableRlMcsControl && !g_targetMcsByUe.empty())
+
+    if (!bwpOnly && !g_targetMcsByUe.empty())
     {
         ApplyPerUeMcsOverridesToSchedulers();
     }
     g_nextRequestedBwp0Count = requestedBwp0Count;
     g_nextRequestedBwp1Count = requestedBwp1Count;
     g_nextIntervalSwitchCount = switchCount;
+    if (g_rlDebug)
+    {
+        NS_LOG_UNCOND("[rl-debug] action-summary requested_bwp0="
+                      << requestedBwp0Count << " requested_bwp1=" << requestedBwp1Count
+                      << " actual_switches=" << switchCount);
+    }
     return true;
 }
 
@@ -3177,7 +3560,6 @@ ScheduleNextStateRead(Ptr<OpenGymInterface> openGym)
             g_policyCooldownStepsByUe[ueIdx]--;
         }
     }
-
     g_lastIntervalSwitchCount = g_nextIntervalSwitchCount;
     g_lastRequestedBwp0Count = g_nextRequestedBwp0Count;
     g_lastRequestedBwp1Count = g_nextRequestedBwp1Count;
@@ -3188,8 +3570,24 @@ ScheduleNextStateRead(Ptr<OpenGymInterface> openGym)
     g_lastSwitchRejectMgrMissingCount = g_nextSwitchRejectMgrMissingCount;
     g_lastSwitchRejectUeMgrMissingCount = g_nextSwitchRejectUeMgrMissingCount;
     g_lastActualSwitchByUe = g_nextActualSwitchByUe;
-
     RecordIntervalMetrics(g_lastIntervalSwitchCount);
+    if (g_rlDebug)
+    {
+        NS_LOG_UNCOND("[rl-debug] interval-summary switches="
+                      << g_lastIntervalSwitchCount
+                      << " req0=" << g_lastRequestedBwp0Count
+                      << " req1=" << g_lastRequestedBwp1Count
+                      << " rej_cooldown=" << g_lastSwitchRejectCooldownCount
+                      << " rej_same_target=" << g_lastSwitchRejectSameTargetCount
+                      << " rej_mgr_busy=" << g_lastSwitchRejectMgrBusyCount
+                      << " mean_prb=" << g_lastMeanPrbUtility
+                      << " mean_aoi=" << g_lastMeanAoiMs
+                      << " reward_aoi_penalty=" << g_lastMeanRewardAoiTerm
+                      << " reward_goodput=" << g_lastMeanRewardThrTerm
+                      << " reward_se=" << g_lastMeanRewardSeTerm
+                      << " reward_switch=" << g_lastMeanRewardSwitchPenalty
+                      << " reward=" << g_lastMeanRewardTotal);
+    }
     g_nextIntervalSwitchCount = 0;
     g_nextRequestedBwp0Count = 0;
     g_nextRequestedBwp1Count = 0;
@@ -3200,7 +3598,6 @@ ScheduleNextStateRead(Ptr<OpenGymInterface> openGym)
     g_nextSwitchRejectMgrMissingCount = 0;
     g_nextSwitchRejectUeMgrMissingCount = 0;
     std::fill(g_nextActualSwitchByUe.begin(), g_nextActualSwitchByUe.end(), 0u);
-
     openGym->NotifyCurrentState();
     std::fill(g_stepAssignedPrbByUe.begin(), g_stepAssignedPrbByUe.end(), 0);
     std::fill(g_stepTbBytesByUe.begin(), g_stepTbBytesByUe.end(), 0);
@@ -3229,8 +3626,6 @@ main(int argc, char* argv[])
     double ueSpeed = 2.0;
     bool enableMobility = true;
     double switchDelayMs = g_switchDelayMsCfg;
-    uint32_t randomSeed = 1;
-    uint32_t randomRun = 1;
 
     // Bursty traffic
     double burstRateMbps = 8.0;
@@ -3254,7 +3649,7 @@ main(int argc, char* argv[])
     double mixedModerateRatio = 0.4;
     double mixedHeavyRatio = 0.2;
     double segmentDurationS = 0.6;
-    int32_t appmixStateOverride = g_appmixStateOverride;
+    int32_t appmixStateOverride = -1;
     double phase0BurstScale = 2.0;
     double phase0BgScale = 1.0;
     double phase1BurstScale = 0.5;
@@ -3311,8 +3706,6 @@ main(int argc, char* argv[])
     cmd.AddValue("mixedHeavyRatio", "UE ratio for heavy mixed-traffic class", mixedHeavyRatio);
     cmd.AddValue("ueSpeed", "UE speed along x-axis (m/s)", ueSpeed);
     cmd.AddValue("enableMobility", "Enable UE mobility", enableMobility);
-    cmd.AddValue("randomSeed", "Global ns-3 RNG seed (fixed for reproducibility)", randomSeed);
-    cmd.AddValue("randomRun", "Global ns-3 RNG run number", randomRun);
     cmd.AddValue("initialBwpId", "Initial BWP id (0=low,1=high)", g_initialBwpId);
     cmd.AddValue("mcsLowThreshold", "Switch to low BWP if MCS <= threshold", g_mcsLowThreshold);
     cmd.AddValue("mcsHighThreshold", "Switch to high BWP if MCS >= threshold", g_mcsHighThreshold);
@@ -3328,72 +3721,43 @@ main(int argc, char* argv[])
     cmd.AddValue("switchDelayNumerology",
                  "Numerology (mu) used to convert switchDelaySymbols to ms",
                  g_switchDelayNumerology);
-    cmd.AddValue("envStepTime", "Control step time (s)", g_envStepTime);
     cmd.AddValue("enableOpenGym", "Enable OpenGym interface (ns3-gym)", g_enableOpenGym);
     cmd.AddValue("openGymPort", "OpenGym TCP port", g_openGymPort);
-    cmd.AddValue("enableRlBwpControl", "Use RL actions for BWP switching", g_enableRlBwpControl);
-    cmd.AddValue("enableRlMcsControl", "Use RL actions for MCS delta control", g_enableRlMcsControl);
-    cmd.AddValue("rlDebug", "Enable verbose RL action/switch debug logs", g_rlDebug);
-    cmd.AddValue("rewardLambdaSwitch", "Reward penalty weight for actual BWP switches in RL profile",
-                 g_rewardLambdaSwitch);
-    cmd.AddValue("rlDrqnProfile", "Use DRQN state/action/reward profile for OpenGym RL", g_rlDrqnProfile);
-    cmd.AddValue("dqnDelayTargetMs", "DRQN delay normalization target (ms)", g_dqnDelayTargetMs);
-    cmd.AddValue("dqnThrTargetMbps", "DRQN throughput normalization target (Mbps)", g_dqnThrTargetMbps);
-    cmd.AddValue("dqnLatencyUeRatio", "Fraction of UEs treated as latency-sensitive [0,1]", g_dqnLatencyUeRatio);
-    cmd.AddValue("dqnAlpha", "Delay weight for latency-sensitive UEs", g_dqnAlpha);
-    cmd.AddValue("dqnBeta", "Throughput weight for latency-sensitive UEs", g_dqnBeta);
+    cmd.AddValue("envStepTime", "OpenGym env step time (s)", g_envStepTime);
+    cmd.AddValue("rlRqrProfile",
+                 "Use RQR-DQN profile: state={bwp,mcs,sinr,cqi,queue,tbler,goodput}, action={bwp,mcsDelta}, reward=log(goodput)-switch_penalty",
+                 g_rlRqrProfile);
     cmd.AddValue("enableLosNlosStats",
                  "Enable UE LOS/NLOS dwell and environment-conditioned KPI statistics",
                  g_enableLosNlosStats);
     cmd.AddValue("losSamplePeriodS",
                  "LOS/NLOS dwell sampling period in seconds",
                  g_losSamplePeriodS);
-    cmd.AddValue("initialMcs", "Initial fixed DL MCS", g_initialMcs);
+    cmd.AddValue("enableRlBwpControl", "Use RL actions for BWP switching", g_enableRlBwpControl);
+    cmd.AddValue("enableRlMcsControl", "Use RL actions for MCS delta control", g_enableRlMcsControl);
+    cmd.AddValue("rlDebug", "Enable verbose RL action/switch debug logs", g_rlDebug);
+    cmd.AddValue("rlInitialMcs", "Initial fixed DL MCS for RL control", g_rlInitialMcs);
     cmd.AddValue("staticMcsOffset", "Static MCS offset to apply to CQI-based MCS", g_staticMcsOffset);
     cmd.AddValue("prbDemandC0", "Linear PRB-demand proxy intercept in bytes/PRB", g_prbDemandC0);
     cmd.AddValue("prbDemandC1", "Linear PRB-demand proxy slope in bytes/PRB per MCS", g_prbDemandC1);
     cmd.AddValue("queueNormBytes", "Queue normalization/overflow threshold in bytes", g_queueNormBytes);
-    cmd.AddValue("rlcMaxTxBufferBytes",
-                 "Per-RLC-entity MaxTxBufferSize used for RLC config and DPP backlog ratio normalization",
-                 g_rlcMaxTxBufferBytes);
+    cmd.AddValue("rewardLambdaSwitch", "Reward penalty weight for switch count", g_rewardLambdaSwitch);
+    cmd.AddValue("rewardLambdaQueue", "Reward penalty weight for queue overflow ratio", g_rewardLambdaQueue);
+    cmd.AddValue("rewardLambdaDelay", "Reward penalty weight for switch delay burden", g_rewardLambdaDelay);
+    cmd.AddValue("rqrSwitchPenaltyWeight",
+                 "RQR reward penalty for per-step BWP switch (throughput-first shaping)",
+                 g_rqrSwitchPenaltyWeight);
+    cmd.AddValue("rqrHighBwpNlosPenaltyWeight",
+                 "RQR reward penalty for using high BWP in NLOS/low-SINR region",
+                 g_rqrHighBwpNlosPenaltyWeight);
+    cmd.AddValue("rqrQueueStallPenaltyWeight",
+                 "RQR reward penalty for queue build-up with zero delivery in a step",
+                 g_rqrQueueStallPenaltyWeight);
     cmd.AddValue("bwpBaseline",
-                 "Built-in baseline policy: none|dt|aequitas|queue|dpp",
+                 "Built-in baseline policy when OpenGym is disabled: none|dt|dqn|aequitas|queue|oracle_tmcs",
                  g_bwpBaseline);
-    cmd.AddValue("bwpQueueThreshold",
-                 "Queue-threshold baseline switch threshold in bytes.",
-                 g_bwpQueueThreshold);
-    cmd.AddValue("dppV", "DPP V coefficient", g_dppV);
-    cmd.AddValue("dppLambdaSwitch", "DPP switch penalty lambda", g_dppLambdaSwitch);
-    cmd.AddValue("dppLambdaBler", "DPP expected BLER penalty lambda", g_dppLambdaBler);
-    cmd.AddValue("dppEpochMinIntervalS",
-                 "Minimum interval between trigger-based DPP epochs (s)",
-                 g_dppEpochMinIntervalS);
-    cmd.AddValue("dppMuPriorMeanMbps",
-                 "DPP Bayesian prior mean of expected goodput (Mbps)",
-                 g_dppMuPriorMeanMbps);
-    cmd.AddValue("dppMuPriorPrecision",
-                 "DPP Bayesian prior precision for expected goodput",
-                 g_dppMuPriorPrecision);
-    cmd.AddValue("dppMuObsPrecision",
-                 "DPP Bayesian observation precision for expected goodput",
-                 g_dppMuObsPrecision);
-    cmd.AddValue("dppBlerPriorAlpha",
-                 "DPP Beta prior alpha for expected BLER",
-                 g_dppBlerPriorAlpha);
-    cmd.AddValue("dppBlerPriorBeta",
-                 "DPP Beta prior beta for expected BLER",
-                 g_dppBlerPriorBeta);
-    cmd.AddValue("dppScoreDebug",
-                 "Enable verbose DPP raw-score tracing to log and optional CSV file",
-                 g_dppScoreDebug);
-    cmd.AddValue("dppScoreTraceFile",
-                 "Write per-UE per-action DPP raw-score terms CSV to this file path.",
-                 g_dppScoreTraceFile);
-    cmd.AddValue("dppScoreTraceUe",
-                 "UE index filter for DPP raw-score tracing (-1 means all UEs).",
-                 g_dppScoreTraceUe);
     cmd.AddValue("schedulerPolicy",
-                 "NR MAC scheduler policy: rr|pf|aequitas|age_optimal|tps|dgs",
+                 "NR MAC scheduler policy: rr|pf|aequitas",
                  g_schedulerPolicy);
     cmd.AddValue("aequitasDeadlineMs",
                  "AoI deadline (ms) supplied to the Aequitas scheduler baseline.",
@@ -3401,15 +3765,6 @@ main(int argc, char* argv[])
     cmd.AddValue("aequitasEnableMcsSelection",
                  "Enable Aequitas-specific MCS selection; if false, use AoI-aware ordering only.",
                  g_aequitasEnableMcsSelection);
-    cmd.AddValue("ageOptimalGammaPenalty",
-                 "Lagrange penalty gamma used by Age-Optimal scheduler metric.",
-                 g_ageOptimalGammaPenalty);
-    cmd.AddValue("tpsDeadlineMs",
-                 "Deadline target (ms) used by TPS surrogate.",
-                 g_tpsDeadlineMs);
-    cmd.AddValue("dgsDelayTargetMs",
-                 "Target delay (ms) used as tau in DGS slack metric.",
-                 g_dgsDelayTargetMs);
     cmd.AddValue("policySwitchCooldownSteps",
                  "Minimum control steps between two BWP switches of the same UE",
                  g_policySwitchCooldownSteps);
@@ -3421,6 +3776,41 @@ main(int argc, char* argv[])
                  "DT baseline queue trend prediction gain",
                  g_dtPredictGainQueue);
     cmd.AddValue("dtEmaAlpha", "DT baseline EMA alpha", g_dtEmaAlpha);
+    cmd.AddValue("oracleSinrHighDb",
+                 "Oracle baseline SINR high threshold (dB) for preferring high BWP / positive MCS delta.",
+                 g_oracleSinrHighDb);
+    cmd.AddValue("oracleSinrLowDb",
+                 "Oracle baseline SINR low threshold (dB) for preferring low BWP / negative MCS delta.",
+                 g_oracleSinrLowDb);
+    cmd.AddValue("oracleQueueHighNorm",
+                 "Oracle baseline high queue threshold (normalized) to force high BWP in burst phase.",
+                 g_oracleQueueHighNorm);
+    cmd.AddValue("oracleQueueLowNorm",
+                 "Oracle baseline low queue threshold (normalized) to relax to low BWP in background phase.",
+                 g_oracleQueueLowNorm);
+    cmd.AddValue("oraclePhaseLeadS",
+                 "Oracle baseline phase look-ahead in seconds for earlier burst-phase switching.",
+                 g_oraclePhaseLeadS);
+    cmd.AddValue("oracleBurstMinHoldS",
+                 "Oracle baseline minimum hold time in high BWP after entering burst-heavy phase (seconds).",
+                 g_oracleBurstMinHoldS);
+    cmd.AddValue("dqnHistoryLen", "DQN baseline history window length", g_dqnHistoryLen);
+    cmd.AddValue("dqnHiddenSize", "DQN baseline hidden layer size", g_dqnHiddenSize);
+    cmd.AddValue("dqnReplayCapacity", "DQN baseline replay capacity", g_dqnReplayCapacity);
+    cmd.AddValue("dqnBatchSize", "DQN baseline minibatch size", g_dqnBatchSize);
+    cmd.AddValue("dqnWarmup", "DQN baseline warmup transitions before training", g_dqnWarmup);
+    cmd.AddValue("dqnTargetSync", "DQN baseline target sync interval (steps)", g_dqnTargetSync);
+    cmd.AddValue("dqnLr", "DQN baseline learning rate", g_dqnLr);
+    cmd.AddValue("dqnGamma", "DQN baseline discount factor", g_dqnGamma);
+    cmd.AddValue("dqnEpsStart", "DQN baseline epsilon start", g_dqnEpsStart);
+    cmd.AddValue("dqnEpsEnd", "DQN baseline epsilon end", g_dqnEpsEnd);
+    cmd.AddValue("dqnEpsDecay", "DQN baseline epsilon decay multiplier", g_dqnEpsDecay);
+    cmd.AddValue("dqnDelayTargetMs", "DQN baseline delay normalization target (ms)", g_dqnDelayTargetMs);
+    cmd.AddValue("dqnThrTargetMbps", "DQN baseline throughput normalization target (Mbps)", g_dqnThrTargetMbps);
+    cmd.AddValue("dqnLatencyUeRatio", "Fraction of UEs treated as latency-sensitive [0,1]", g_dqnLatencyUeRatio);
+    cmd.AddValue("dqnAlpha", "Delay weight for latency-sensitive UEs", g_dqnAlpha);
+    cmd.AddValue("dqnBeta", "Throughput weight for latency-sensitive UEs", g_dqnBeta);
+    cmd.AddValue("rlDrqnProfile", "Use DRQN state/action/reward profile for OpenGym RL", g_rlDrqnProfile);
     cmd.AddValue("segmentDurationS",
                  "Duration of each appmix traffic-state segment in seconds.",
                  segmentDurationS);
@@ -3492,8 +3882,6 @@ main(int argc, char* argv[])
                  "UE trajectory trace sampling period in seconds.",
                  trajectorySamplePeriodS);
     cmd.Parse(argc, argv);
-    RngSeedManager::SetSeed(randomSeed);
-    RngSeedManager::SetRun(randomRun);
 
     g_simTime = simTime;
     g_appStartTime = appStart;
@@ -3511,50 +3899,21 @@ main(int argc, char* argv[])
     g_schedulerPolicy = ToLower(g_schedulerPolicy);
     g_mcsBaseline = ToLower(g_mcsBaseline);
     trafficModel = ToLower(trafficModel);
-    if (g_bwpBaseline != "none" && g_bwpBaseline != "dt" &&
+    if (g_bwpBaseline != "none" && g_bwpBaseline != "dt" && g_bwpBaseline != "dqn" &&
         g_bwpBaseline != "aequitas" && g_bwpBaseline != "queue" &&
-        g_bwpBaseline != "dpp")
+        g_bwpBaseline != "oracle_tmcs")
     {
-        NS_ABORT_MSG("Invalid bwpBaseline. Supported values: none|dt|aequitas|queue|dpp");
+        NS_ABORT_MSG("Invalid bwpBaseline. Supported values: none|dt|dqn|aequitas|queue|oracle_tmcs");
     }
     if (g_schedulerPolicy != "rr" && g_schedulerPolicy != "pf" && g_schedulerPolicy != "aequitas" &&
-        g_schedulerPolicy != "age_optimal" && g_schedulerPolicy != "tps" &&
-        g_schedulerPolicy != "dgs")
+        g_schedulerPolicy != "age_optimal" && g_schedulerPolicy != "lyapunov" && g_schedulerPolicy != "drqn")
     {
-        NS_ABORT_MSG("Invalid schedulerPolicy. Supported values: rr|pf|aequitas|age_optimal|tps|dgs");
+        NS_ABORT_MSG("Invalid schedulerPolicy. Supported values: rr|pf|aequitas|age_optimal|lyapunov|drqn");
     }
     if (g_mcsBaseline != "cqi" && g_mcsBaseline != "aams")
     {
         NS_ABORT_MSG("Invalid mcsBaseline. Supported values: cqi|aams");
     }
-    if (g_bwpBaseline != "none" && g_enableOpenGym)
-    {
-        NS_LOG_UNCOND("bwpBaseline is set; forcing enableOpenGym=false for standalone baseline mode.");
-        g_enableOpenGym = false;
-    }
-    if (g_enableOpenGym && g_enableMcsSwitch)
-    {
-        NS_LOG_UNCOND("OpenGym enabled: disabling threshold-based MCS switching to avoid policy conflicts.");
-        g_enableMcsSwitch = false;
-    }
-    g_aequitasDeadlineMs = std::max(1.0, g_aequitasDeadlineMs);
-    g_ageOptimalGammaPenalty = std::max(0.0, g_ageOptimalGammaPenalty);
-    g_tpsDeadlineMs = std::max(1.0, g_tpsDeadlineMs);
-    g_dgsDelayTargetMs = std::max(1.0, g_dgsDelayTargetMs);
-    g_dppV = std::max(0.0, g_dppV);
-    g_dppLambdaSwitch = std::max(0.0, g_dppLambdaSwitch);
-    g_dppLambdaBler = std::max(0.0, g_dppLambdaBler);
-    g_dppEpochMinIntervalS = std::max(0.0, g_dppEpochMinIntervalS);
-    g_dppMuPriorMeanMbps = std::max(0.0, g_dppMuPriorMeanMbps);
-    g_dppMuPriorPrecision = std::max(1e-9, g_dppMuPriorPrecision);
-    g_dppMuObsPrecision = std::max(1e-9, g_dppMuObsPrecision);
-    g_dppBlerPriorAlpha = std::max(1e-9, g_dppBlerPriorAlpha);
-    g_dppBlerPriorBeta = std::max(1e-9, g_dppBlerPriorBeta);
-    g_bwpQueueThreshold = std::max<uint32_t>(1u, g_bwpQueueThreshold);
-    g_rlcMaxTxBufferBytes = std::max<uint32_t>(1u, g_rlcMaxTxBufferBytes);
-    g_enablePerUeMcsControl =
-        (g_mcsBaseline == "aams" || g_staticMcsOffset != 0 || g_bwpBaseline == "dpp" ||
-         (g_enableOpenGym && g_enableRlMcsControl));
     if (trafficModel != "legacy" && trafficModel != "mixed" && trafficModel != "onoff2phase")
     {
         NS_ABORT_MSG("Invalid trafficModel. Supported values: legacy|mixed|onoff2phase");
@@ -3575,12 +3934,6 @@ main(int argc, char* argv[])
     {
         NS_ABORT_MSG("Invalid appmixStateOverride. Supported values: -1|0|1|2");
     }
-    g_appmixStateOverride = appmixStateOverride;
-    g_dqnDelayTargetMs = std::max(1.0, g_dqnDelayTargetMs);
-    g_dqnThrTargetMbps = std::max(1e-6, g_dqnThrTargetMbps);
-    g_dqnLatencyUeRatio = Clamp01(g_dqnLatencyUeRatio);
-    g_dqnAlpha = Clamp01(g_dqnAlpha);
-    g_dqnBeta = Clamp01(g_dqnBeta);
     bgOnMs = std::max(1.0, bgOnMs);
     bgOffMs = std::max(1.0, bgOffMs);
     phase0BurstScale = std::max(0.05, phase0BurstScale);
@@ -3589,11 +3942,47 @@ main(int argc, char* argv[])
     phase1BgScale = std::max(0.05, phase1BgScale);
     uePatrolRadius = std::max(10.0, uePatrolRadius);
     g_losSamplePeriodS = std::max(0.005, g_losSamplePeriodS);
+    g_dqnLatencyUeRatio = std::max(0.0, std::min(1.0, g_dqnLatencyUeRatio));
     g_dtQueueLow = std::max(0.0, std::min(1.0, g_dtQueueLow));
     g_dtQueueHigh = std::max(0.0, std::min(1.0, g_dtQueueHigh));
+    g_oracleQueueLowNorm = std::max(0.0, std::min(1.0, g_oracleQueueLowNorm));
+    g_oracleQueueHighNorm = std::max(0.0, std::min(1.0, g_oracleQueueHighNorm));
+    g_oraclePhaseLeadS = std::max(0.0, g_oraclePhaseLeadS);
+    g_oracleBurstMinHoldS = std::max(0.0, g_oracleBurstMinHoldS);
     if (g_dtQueueLow > g_dtQueueHigh)
     {
         std::swap(g_dtQueueLow, g_dtQueueHigh);
+    }
+    if (g_oracleQueueLowNorm > g_oracleQueueHighNorm)
+    {
+        std::swap(g_oracleQueueLowNorm, g_oracleQueueHighNorm);
+    }
+
+    if (g_bwpBaseline != "none" && g_enableOpenGym)
+    {
+        NS_LOG_UNCOND("bwpBaseline is set; forcing enableOpenGym=false for standalone baseline mode.");
+        g_enableOpenGym = false;
+    }
+    if (!g_enableOpenGym)
+    {
+        g_enableRlBwpControl = false;
+        g_enableRlMcsControl = false;
+    }
+    if (g_bwpBaseline == "oracle_tmcs")
+    {
+        g_enableRlMcsControl = true;
+    }
+    if (g_rlRqrProfile)
+    {
+        g_minSwitchIntervalMs = std::max(1.0, 10.0 * g_switchDelayMsCfg);
+        g_enableRlBwpControl = true;
+        g_rlDrqnProfile = false;
+    }
+
+    if (g_enableOpenGym && g_enableMcsSwitch)
+    {
+        NS_LOG_UNCOND("OpenGym enabled: disabling threshold-based MCS switching to avoid policy conflicts.");
+        g_enableMcsSwitch = false;
     }
     g_ueStats.assign(numUes, UeStats{});
     g_prbStats.assign(numUes, PrbStats{});
@@ -3605,6 +3994,8 @@ main(int argc, char* argv[])
     g_policyPhaseOffsetByUe.assign(numUes, 0);
     g_policyUseOnOff2Phase = false;
     g_policySegmentDurationS = segmentDurationS;
+    g_oracleLastPhaseByUe.assign(numUes, -1);
+    g_oracleHighHoldUntilSByUe.assign(numUes, 0.0);
     g_losConditionModel = g_enableLosNlosStats ? CreateObject<BuildingsChannelConditionModel>() : nullptr;
     g_gnbMobility = nullptr;
     g_rntiByUeIdx.assign(numUes, 0);
@@ -3618,7 +4009,7 @@ main(int argc, char* argv[])
     g_lastNodeRxTimeByUe.assign(numUes, 0.0);
     g_lastCqiByUe.assign(numUes, 0.0);
     g_lastSinrDbByUe.assign(numUes, 0.0);
-    g_lastMcsByUe.assign(numUes, static_cast<double>(g_initialMcs));
+    g_lastMcsByUe.assign(numUes, static_cast<double>(g_rlInitialMcs));
     g_lastTblerByUe.assign(numUes, -1.0);
     g_lastRequestedMcsOffsetByUe.assign(numUes, 0.0);
     g_lastBwpSwitchTimeSByUe.assign(numUes, 0.0);
@@ -3657,36 +4048,35 @@ main(int argc, char* argv[])
     g_prevRewardThrMbpsByUe.assign(numUes, 0.0);
     g_prevRewardTxBytesByUe.assign(numUes, 0u);
     g_prevRewardRxBytesByUe.assign(numUes, 0u);
-    g_prevRewardTxBytesByType.assign(numUes, std::array<uint64_t, TRAFFIC_TYPES>{});
     g_lastRewardPrevQueueBytesByUe.assign(numUes, 0.0);
-    g_lastRewardPrevAoiMsByUe.assign(numUes, 0.0);
     g_lastRewardArrivedBytesByUe.assign(numUes, 0u);
     g_lastRewardDeliveredBytesByUe.assign(numUes, 0u);
     g_lastActualSwitchByUe.assign(numUes, 0);
     g_nextActualSwitchByUe.assign(numUes, 0);
-    g_targetMcsByUe.assign(numUes, g_initialMcs);
+    g_targetMcsByUe.assign(numUes, g_rlInitialMcs);
     g_policyCooldownStepsByUe.assign(numUes, 0);
     g_dtEmaAoiMsByUe.assign(numUes, 0.0);
     g_dtEmaQueueNormByUe.assign(numUes, 0.0);
-    std::array<double, G_DPP_ACTION_COUNT> muMeanInit{};
-    std::array<double, G_DPP_ACTION_COUNT> muPrecInit{};
-    std::array<double, G_DPP_ACTION_COUNT> blerAlphaInit{};
-    std::array<double, G_DPP_ACTION_COUNT> blerBetaInit{};
-    muMeanInit.fill(std::max(0.0, g_dppMuPriorMeanMbps));
-    muPrecInit.fill(std::max(1e-9, g_dppMuPriorPrecision));
-    blerAlphaInit.fill(std::max(1e-9, g_dppBlerPriorAlpha));
-    blerBetaInit.fill(std::max(1e-9, g_dppBlerPriorBeta));
-    g_dppMuPostMeanByUe.assign(numUes, muMeanInit);
-    g_dppMuPostPrecisionByUe.assign(numUes, muPrecInit);
-    g_dppBlerAlphaByUe.assign(numUes, blerAlphaInit);
-    g_dppBlerBetaByUe.assign(numUes, blerBetaInit);
-    g_dppLastActionByUe.assign(numUes, -1);
-    g_dppHasLastActionByUe.assign(numUes, false);
-    g_dppLastDecisionTimeSByUe.assign(numUes, Simulator::Now().GetSeconds());
-    g_dppLastEpochDeltaSByUe.assign(numUes, std::max(1e-6, g_envStepTime));
-    g_dppLastTbBytesCumByUe.assign(numUes, 0u);
-    g_dppLastTbCountCumByUe.assign(numUes, 0u);
-    g_dppLastTbErrorCumByUe.assign(numUes, 0u);
+    g_dqnFeatureHistoryByUe.assign(numUes, {});
+    g_dqnPrevStateByUe.assign(numUes, {});
+    g_dqnPrevActionByUe.assign(numUes, 0);
+    g_dqnHasPrevByUe.assign(numUes, false);
+    g_dqnAgent.reset();
+    if (!g_enableOpenGym && g_bwpBaseline == "dqn")
+    {
+        uint32_t stateDim = 7u * g_dqnHistoryLen;
+        g_dqnAgent = std::make_unique<SimpleDqnAgent>(stateDim,
+                                                      g_dqnHiddenSize,
+                                                      g_dqnLr,
+                                                      g_dqnGamma,
+                                                      g_dqnReplayCapacity,
+                                                      g_dqnBatchSize,
+                                                      g_dqnWarmup,
+                                                      g_dqnTargetSync,
+                                                      g_dqnEpsStart,
+                                                      g_dqnEpsEnd,
+                                                      g_dqnEpsDecay);
+    }
     g_ueIdxByRnti.clear();
     g_dlSchedulers.clear();
     g_gnbMacs.clear();
@@ -3713,9 +4103,6 @@ main(int argc, char* argv[])
     g_nextSwitchRejectMgrMissingCount = 0;
     g_nextSwitchRejectUeMgrMissingCount = 0;
     g_intervalMetrics = IntervalMetricAccumulator{};
-    g_dppLastEpochS = -1.0;
-    g_dppSwitchCountAccum = 0;
-    g_dppEpochEvent = EventId();
     g_metricsTraceFile = metricsTraceFile;
     g_aoiTraceFile = aoiTraceFile;
     g_aoiTraceUe = aoiTraceUe;
@@ -3742,7 +4129,6 @@ main(int argc, char* argv[])
     g_causeTraceStream.reset();
     g_sinrTraceStream.reset();
     g_trajectoryTraceStream.reset();
-    g_dppScoreTraceStream.reset();
     if (!g_metricsTraceFile.empty())
     {
         g_metricsTraceStream = std::make_unique<std::ofstream>(g_metricsTraceFile, std::ios::out);
@@ -3879,24 +4265,6 @@ main(int argc, char* argv[])
         {
             NS_LOG_UNCOND("Failed to open trajectoryTraceFile: " << g_trajectoryTraceFile);
             g_trajectoryTraceStream.reset();
-        }
-    }
-    if (!g_dppScoreTraceFile.empty())
-    {
-        g_dppScoreTraceStream =
-            std::make_unique<std::ofstream>(g_dppScoreTraceFile, std::ios::out);
-        if (g_dppScoreTraceStream->is_open())
-        {
-            (*g_dppScoreTraceStream)
-                << "time_s,ue_idx,action_id,selected,target_bwp,target_mcs,mcs_delta,"
-                << "backlog_bytes,backlog_ratio,epoch_delta_s,mu_post_mean_mbps,e_post_mean_bler,switch_indicator,"
-                << "reward_term,penalty_switch,penalty_bler,penalty_total,score\n";
-            g_dppScoreTraceStream->flush();
-        }
-        else
-        {
-            NS_LOG_UNCOND("Failed to open dppScoreTraceFile: " << g_dppScoreTraceFile);
-            g_dppScoreTraceStream.reset();
         }
     }
 
@@ -4088,8 +4456,6 @@ main(int argc, char* argv[])
     channelHelper->SetPathlossAttribute("ShadowingEnabled", BooleanValue(enableShadowing));
     Config::SetDefault("ns3::ThreeGppChannelModel::UpdatePeriod",
                        TimeValue(MilliSeconds(channelUpdateMs)));
-    Config::SetDefault("ns3::NrRlcUm::MaxTxBufferSize", UintegerValue(g_rlcMaxTxBufferBytes));
-    Config::SetDefault("ns3::NrRlcAm::MaxTxBufferSize", UintegerValue(g_rlcMaxTxBufferBytes));
 
     CcBwpCreator ccBwpCreator;
     CcBwpCreator::SimpleOperationBandConf lowConf(lowFreqHz, lowBandwidthHz, 1);
@@ -4103,8 +4469,8 @@ main(int argc, char* argv[])
     {
         nrHelper->SetSchedulerTypeId(NrMacSchedulerOfdmaAequitas::GetTypeId());
     }
-    else if (g_schedulerPolicy == "age_optimal" ||
-             g_schedulerPolicy == "tps" || g_schedulerPolicy == "dgs")
+    else if (g_schedulerPolicy == "age_optimal" || g_schedulerPolicy == "lyapunov" ||
+             g_schedulerPolicy == "drqn")
     {
         nrHelper->SetSchedulerTypeId(NrMacSchedulerOfdmaBaseline::GetTypeId());
         nrHelper->SetSchedulerAttribute("Mode", StringValue(ToUpper(g_schedulerPolicy)));
@@ -4123,11 +4489,11 @@ main(int argc, char* argv[])
         nrHelper->SetSchedulerAttribute("EnableMcsSelection",
                                         BooleanValue(g_aequitasEnableMcsSelection));
     }
-    nrHelper->SetSchedulerAttribute("FixedMcsDl", BooleanValue(g_enablePerUeMcsControl));
+    nrHelper->SetSchedulerAttribute("FixedMcsDl", BooleanValue(g_enableRlMcsControl));
     nrHelper->SetSchedulerAttribute("FixedMcsUl", BooleanValue(false));
-    if (g_enablePerUeMcsControl)
+    if (g_enableRlMcsControl)
     {
-        nrHelper->SetSchedulerAttribute("StartingMcsDl", UintegerValue(g_initialMcs));
+        nrHelper->SetSchedulerAttribute("StartingMcsDl", UintegerValue(g_rlInitialMcs));
     }
 
     Config::SetDefault("ns3::NrAmc::ErrorModelType",
@@ -4173,10 +4539,10 @@ main(int argc, char* argv[])
             g_dlSchedulers.push_back(sched);
             g_aequitasSchedulers.push_back(DynamicCast<NrMacSchedulerOfdmaAequitas>(sched));
             g_baselineSchedulers.push_back(DynamicCast<NrMacSchedulerOfdmaBaseline>(sched));
-            if (g_enablePerUeMcsControl && sched)
+            if (g_enableRlMcsControl && sched)
             {
                 sched->SetAttribute("FixedMcsDl", BooleanValue(true));
-                sched->SetAttribute("StartingMcsDl", UintegerValue(g_initialMcs));
+                sched->SetAttribute("StartingMcsDl", UintegerValue(g_rlInitialMcs));
             }
             Ptr<NrGnbPhy> gnbPhy = gnbNetDev->GetPhy(bwpId);
             uint32_t totalPrb = gnbPhy ? gnbPhy->GetRbNum() : 1u;
@@ -4456,23 +4822,19 @@ main(int argc, char* argv[])
         }
     }
 
-    if (ShouldDriveAequitasScheduler())
-    {
-        ApplyAequitasInputsToSchedulers();
-    }
-
 #ifdef HAVE_OPENGYM
     Ptr<OpenGymInterface> openGym;
     if (g_enableOpenGym)
     {
         openGym = CreateObject<OpenGymInterface>(g_openGymPort);
-        openGym->SetGetObservationSpaceCb(MakeCallback(&MyGetObservationSpace));
         openGym->SetGetActionSpaceCb(MakeCallback(&MyGetActionSpace));
+        openGym->SetGetObservationSpaceCb(MakeCallback(&MyGetObservationSpace));
         openGym->SetGetGameOverCb(MakeCallback(&MyGetGameOver));
         openGym->SetGetObservationCb(MakeCallback(&MyGetObservation));
         openGym->SetGetRewardCb(MakeCallback(&MyGetReward));
         openGym->SetGetExtraInfoCb(MakeCallback(&MyGetExtraInfo));
         openGym->SetExecuteActionsCb(MakeCallback(&MyExecuteActions));
+        Simulator::Schedule(Seconds(g_envStepTime), &ScheduleNextStateRead, openGym);
     }
 #else
     if (g_enableOpenGym)
@@ -4481,14 +4843,12 @@ main(int argc, char* argv[])
     }
 #endif
 
-    if (g_enableOpenGym)
+    if (!g_enableOpenGym)
     {
-#ifdef HAVE_OPENGYM
-        Simulator::Schedule(Seconds(g_envStepTime), &ScheduleNextStateRead, openGym);
-#endif
-    }
-    else
-    {
+        if (ShouldDriveAequitasScheduler())
+        {
+            ApplyAequitasInputsToSchedulers();
+        }
         Simulator::Schedule(Seconds(g_envStepTime), &ScheduleBaselinePolicyStep);
     }
     if ((g_aoiStateTraceStream && g_aoiStateTraceStream->is_open()) ||
@@ -4504,6 +4864,12 @@ main(int argc, char* argv[])
     Simulator::Stop(Seconds(simTime));
     Simulator::Run();
 
+#ifdef HAVE_OPENGYM
+    if (openGym)
+    {
+        openGym->NotifySimulationEnd();
+    }
+#endif
     FinalizeLosNlosDwellStats(simTime);
 
     double duration = simTime - appStart;
@@ -4640,7 +5006,6 @@ main(int argc, char* argv[])
     double runMeanPrbUtility = 0.0;
     double runQueueOverflowRatio = 0.0;
     double runMeanSwitchCount = 0.0;
-    double runTotalSwitchCount = 0.0;
     if (g_intervalMetrics.samples > 0)
     {
         double denom = static_cast<double>(g_intervalMetrics.samples);
@@ -4650,7 +5015,6 @@ main(int argc, char* argv[])
         runQueueOverflowRatio = g_intervalMetrics.queueOverflowRatioSum / denom;
         runMeanSwitchCount = g_intervalMetrics.switchCountSum / denom;
     }
-    runTotalSwitchCount = g_intervalMetrics.switchCountSum;
     double httpPrbEstAll = 0.0;
     double gamingPrbEstAll = 0.0;
     double videoPrbEstAll = 0.0;
@@ -4687,7 +5051,6 @@ main(int argc, char* argv[])
                              << "runMeanPrbUtility=" << runMeanPrbUtility << " "
                              << "runQueueOverflowRatio=" << runQueueOverflowRatio << " "
                              << "runMeanSwitchCount=" << runMeanSwitchCount << " "
-                             << "runTotalSwitchCount=" << runTotalSwitchCount << " "
                              << "avgMcs=" << avgMcsAll
                              << " bler=" << blerAll
                              << " avgTbler=" << avgTblerAll
@@ -4719,9 +5082,7 @@ main(int argc, char* argv[])
                 << ",runMeanAoiMs=" << runMeanAoiMs
                 << ",runMeanPrbUtility=" << runMeanPrbUtility
                 << ",runQueueOverflowRatio=" << runQueueOverflowRatio
-                << ",runMeanSwitchCount=" << runMeanSwitchCount
-                << ",runTotalSwitchCount=" << runTotalSwitchCount
-                << ",prbTotal=" << totalPrbAll
+                << ",runMeanSwitchCount=" << runMeanSwitchCount << ",prbTotal=" << totalPrbAll
                 << ",bytesPerPrb=" << bytesPerPrbAll << ",estPrbFtp=" << httpPrbEstAll
                 << ",estPrbGaming=" << gamingPrbEstAll << ",estPrbVideo=" << videoPrbEstAll
                 << ",losRatio=" << losRatioAll << ",nlosRatio=" << nlosRatioAll
@@ -4827,11 +5188,6 @@ main(int argc, char* argv[])
     {
         g_trajectoryTraceStream->flush();
         g_trajectoryTraceStream->close();
-    }
-    if (g_dppScoreTraceStream && g_dppScoreTraceStream->is_open())
-    {
-        g_dppScoreTraceStream->flush();
-        g_dppScoreTraceStream->close();
     }
 
     Simulator::Destroy();
