@@ -272,6 +272,13 @@ struct PerUeTrafficProfile
     std::string trafficClass{"legacy"};
 };
 
+struct AppStateSegment
+{
+    double startS{0.0};
+    double endS{0.0};
+    int32_t state{0}; // 0=ftp_only, 1=video_only, 2=ftp_video
+};
+
 static std::vector<UeStats> g_ueStats;
 static std::vector<PrbStats> g_prbStats;
 static std::vector<std::array<EnvKpiStats, ENV_STATES>> g_envStatsByUe;
@@ -282,8 +289,10 @@ static std::vector<int8_t> g_lastLosStateByUe;
 static std::vector<double> g_lastLosStateSampleTimeByUe;
 static std::vector<double> g_policyBaseStartSByUe;
 static std::vector<int32_t> g_policyPhaseOffsetByUe;
-static bool g_policyUseOnOff2Phase = false;
 static double g_policySegmentDurationS = 0.6;
+static std::vector<std::vector<AppStateSegment>> g_appStateTimelineByUe;
+static std::vector<double> g_packetLevelAoiSamplesMs;
+static std::array<std::vector<double>, TRAFFIC_TYPES> g_packetLevelAoiSamplesByTypeMs;
 
 static Ptr<BwpManagerGnb> g_gnbBwpMgr;
 static std::unordered_map<uint16_t, Ptr<BwpManagerUe>> g_ueMgrByRnti;
@@ -321,7 +330,7 @@ static bool g_enableLosNlosStats = true;
 static double g_losSamplePeriodS = 0.02;
 static double g_simTime = 10.0;
 static double g_appStartTime = 0.1;
-static double g_switchDelayMsCfg = 5.0;
+static double g_switchDelayMsCfg = 3.0;
 static uint32_t g_switchDelaySymbols = 14;
 static uint8_t g_switchDelayNumerology = 0;
 static bool g_useSymbolicSwitchDelay = false;
@@ -362,9 +371,12 @@ static std::vector<uint64_t> g_rxPrbCumByUe;
 static std::vector<uint64_t> g_rxTbBytesCumByUe;
 static std::vector<uint64_t> g_rxTbCountCumByUe;
 static std::vector<uint64_t> g_rxTbErrorCumByUe;
+static std::vector<uint64_t> g_rxTbErrorBytesCumByUe;
 static std::vector<uint64_t> g_schedCountCumByUe;
 static std::vector<uint64_t> g_harqFlushCountByUe;
 static std::vector<uint64_t> g_bwpSwitchExecCountByUe;
+static uint64_t g_bwpSwitchExec0To1Count = 0;
+static uint64_t g_bwpSwitchExec1To0Count = 0;
 static std::vector<uint64_t> g_outstandingAoiBytesByUe;
 static std::vector<uint64_t> g_lastDeliveryTimeNsByUe;
 static std::vector<uint64_t> g_lastStepAssignedPrbByUe;
@@ -372,6 +384,8 @@ static std::vector<double> g_lastStepSpectralEfficiencyByUe;
 static std::vector<double> g_lastBwpStepSpectralEfficiency;
 static std::vector<double> g_lastBwpAvgMcs;
 static std::vector<uint8_t> g_targetMcsByUe;
+static std::array<double, 2> g_bwpOccupancyUeTimeS = {0.0, 0.0};
+static double g_bwpOccupancySamplePeriodS = 0.001; // 1 ms sampling
 
 static std::vector<Ptr<NrMacSchedulerNs3>> g_dlSchedulers;
 static std::vector<Ptr<NrGnbMac>> g_gnbMacs;
@@ -535,26 +549,27 @@ static std::vector<double> g_dtEmaQueueNormByUe;
 static double g_dppV = 0.1;
 static double g_dppLambdaSwitch = 0.005;
 static double g_dppLambdaBler = 1.0;
-static double g_dppEpochMinIntervalS = 0.01;
+static double g_dppEpochMinIntervalS = 0.01; // 10 ms
 static double g_dppLastEpochS = -1.0;
 static uint32_t g_dppSwitchCountAccum = 0;
 static EventId g_dppEpochEvent;
-static double g_dppMuPriorMeanMbps = 1.0;
+static double g_dppMuPriorMeanBytes = 1.0;
 static double g_dppMuPriorPrecision = 1.0;
 static double g_dppMuObsPrecision = 2.0;
-static double g_dppBlerPriorAlpha = 1.0;
-static double g_dppBlerPriorBeta = 9.0;
+static double g_dppErrPriorMeanBytes = 0.0;
+static double g_dppErrPriorPrecision = 1.0;
+static double g_dppErrObsPrecision = 2.0;
+static double g_dppPosteriorDiscount = 0.9;
 static std::vector<std::array<double, G_DPP_ACTION_COUNT>> g_dppMuPostMeanByUe;
 static std::vector<std::array<double, G_DPP_ACTION_COUNT>> g_dppMuPostPrecisionByUe;
-static std::vector<std::array<double, G_DPP_ACTION_COUNT>> g_dppBlerAlphaByUe;
-static std::vector<std::array<double, G_DPP_ACTION_COUNT>> g_dppBlerBetaByUe;
+static std::vector<std::array<double, G_DPP_ACTION_COUNT>> g_dppErrPostMeanByUe;
+static std::vector<std::array<double, G_DPP_ACTION_COUNT>> g_dppErrPostPrecisionByUe;
 static std::vector<int32_t> g_dppLastActionByUe;
 static std::vector<bool> g_dppHasLastActionByUe;
 static std::vector<double> g_dppLastDecisionTimeSByUe;
 static std::vector<double> g_dppLastEpochDeltaSByUe;
 static std::vector<uint64_t> g_dppLastTbBytesCumByUe;
-static std::vector<uint64_t> g_dppLastTbCountCumByUe;
-static std::vector<uint64_t> g_dppLastTbErrorCumByUe;
+static std::vector<uint64_t> g_dppLastTbErrorBytesCumByUe;
 
 static bool
 HasPendingBwpSwitch(uint16_t rnti)
@@ -627,6 +642,14 @@ ExecutePendingBwpSwitch(uint16_t rnti, uint8_t targetBwp)
     if (forced != std::numeric_limits<uint8_t>::max())
     {
         currentBwp = forced;
+    }
+    if (currentBwp == g_lowBwpId && targetBwp == g_highBwpId)
+    {
+        g_bwpSwitchExec0To1Count++;
+    }
+    else if (currentBwp == g_highBwpId && targetBwp == g_lowBwpId)
+    {
+        g_bwpSwitchExec1To0Count++;
     }
     FlushDlHarqStateForUe(rnti, currentBwp);
 
@@ -799,6 +822,14 @@ RecordAppRx(uint32_t ueIdx, uint8_t type, Ptr<const Packet> p, double aoiMs)
     g_rxPacketsByType[ueIdx][type]++;
     st.aoiSumMs += aoiMs;
     st.aoiSamples++;
+    if (std::isfinite(aoiMs) && aoiMs >= 0.0)
+    {
+        g_packetLevelAoiSamplesMs.push_back(aoiMs);
+        if (type < TRAFFIC_TYPES)
+        {
+            g_packetLevelAoiSamplesByTypeMs[type].push_back(aoiMs);
+        }
+    }
     st.lastRxTime = Simulator::Now().GetSeconds();
     g_lastDeliveredAoiMs[ueIdx][type] = aoiMs;
     g_lastRxTimeByType[ueIdx][type] = st.lastRxTime;
@@ -1297,6 +1328,43 @@ SampleCauseTrace()
 }
 
 static void
+SampleBwpOccupancy()
+{
+    const double nowS = Simulator::Now().GetSeconds();
+    if (g_simTime <= 0.0 || g_currentBwpByUe.empty())
+    {
+        return;
+    }
+    const double dt = std::max(0.0, g_bwpOccupancySamplePeriodS);
+    if (dt <= 0.0)
+    {
+        return;
+    }
+
+    uint32_t cnt0 = 0;
+    uint32_t cnt1 = 0;
+    for (uint8_t bwp : g_currentBwpByUe)
+    {
+        if (bwp == g_lowBwpId)
+        {
+            cnt0++;
+        }
+        else if (bwp == g_highBwpId)
+        {
+            cnt1++;
+        }
+    }
+    g_bwpOccupancyUeTimeS[0] += static_cast<double>(cnt0) * dt;
+    g_bwpOccupancyUeTimeS[1] += static_cast<double>(cnt1) * dt;
+
+    const double nextS = nowS + dt;
+    if (nextS < g_simTime + 1e-9)
+    {
+        Simulator::Schedule(Seconds(dt), &SampleBwpOccupancy);
+    }
+}
+
+static void
 OnPacketSinkRx(uint32_t ueIdx, uint8_t type, Ptr<const Packet> p, const Address&)
 {
     uint64_t packetId = 0;
@@ -1440,6 +1508,7 @@ OnRxPacketTraceUe(uint32_t ueIdx, RxPacketTraceParams params)
         if (params.m_corrupt)
         {
             g_rxTbErrorCumByUe[ueIdx]++;
+            g_rxTbErrorBytesCumByUe[ueIdx] += params.m_tbSize;
         }
     }
     if (ueIdx < g_stepAssignedPrbByUe.size())
@@ -1481,6 +1550,59 @@ Clamp01(double v)
         return 0.0;
     }
     return std::max(0.0, std::min(1.0, v));
+}
+
+static double
+ComputeQuantileLinear(const std::vector<double>& sortedValues, double q)
+{
+    if (sortedValues.empty())
+    {
+        return 0.0;
+    }
+    if (sortedValues.size() == 1)
+    {
+        return sortedValues.front();
+    }
+    const double qClamped = std::max(0.0, std::min(1.0, q));
+    const double pos = qClamped * static_cast<double>(sortedValues.size() - 1);
+    const size_t lo = static_cast<size_t>(std::floor(pos));
+    const size_t hi = static_cast<size_t>(std::ceil(pos));
+    if (lo == hi)
+    {
+        return sortedValues[lo];
+    }
+    const double frac = pos - static_cast<double>(lo);
+    return sortedValues[lo] * (1.0 - frac) + sortedValues[hi] * frac;
+}
+
+struct PacketAoiStats
+{
+    double meanMs{0.0};
+    double p25Ms{0.0};
+    double p50Ms{0.0};
+    double p75Ms{0.0};
+    double minMs{0.0};
+    double maxMs{0.0};
+};
+
+static PacketAoiStats
+ComputePacketAoiStats(const std::vector<double>& samplesMs)
+{
+    PacketAoiStats out;
+    if (samplesMs.empty())
+    {
+        return out;
+    }
+    std::vector<double> sorted = samplesMs;
+    std::sort(sorted.begin(), sorted.end());
+    out.meanMs =
+        std::accumulate(sorted.begin(), sorted.end(), 0.0) / static_cast<double>(sorted.size());
+    out.p25Ms = ComputeQuantileLinear(sorted, 0.25);
+    out.p50Ms = ComputeQuantileLinear(sorted, 0.50);
+    out.p75Ms = ComputeQuantileLinear(sorted, 0.75);
+    out.minMs = sorted.front();
+    out.maxMs = sorted.back();
+    return out;
 }
 
 static int32_t
@@ -2200,8 +2322,8 @@ UpdateDppPosteriorForUe(uint32_t ueIdx)
         return;
     }
     const uint64_t tbBytesCum = (ueIdx < g_rxTbBytesCumByUe.size()) ? g_rxTbBytesCumByUe[ueIdx] : 0u;
-    const uint64_t tbCountCum = (ueIdx < g_rxTbCountCumByUe.size()) ? g_rxTbCountCumByUe[ueIdx] : 0u;
-    const uint64_t tbErrCum = (ueIdx < g_rxTbErrorCumByUe.size()) ? g_rxTbErrorCumByUe[ueIdx] : 0u;
+    const uint64_t tbErrBytesCum =
+        (ueIdx < g_rxTbErrorBytesCumByUe.size()) ? g_rxTbErrorBytesCumByUe[ueIdx] : 0u;
     const double nowS = Simulator::Now().GetSeconds();
     const double prevTimeS =
         (ueIdx < g_dppLastDecisionTimeSByUe.size()) ? g_dppLastDecisionTimeSByUe[ueIdx] : nowS;
@@ -2212,30 +2334,37 @@ UpdateDppPosteriorForUe(uint32_t ueIdx)
         const int32_t lastAction = g_dppLastActionByUe[ueIdx];
         if (lastAction >= 0 && lastAction < static_cast<int32_t>(DPP_ACTIONS))
         {
-            const uint64_t prevTbBytes = (ueIdx < g_dppLastTbBytesCumByUe.size()) ? g_dppLastTbBytesCumByUe[ueIdx] : 0u;
-            const uint64_t prevTbCount = (ueIdx < g_dppLastTbCountCumByUe.size()) ? g_dppLastTbCountCumByUe[ueIdx] : 0u;
-            const uint64_t prevTbErr = (ueIdx < g_dppLastTbErrorCumByUe.size()) ? g_dppLastTbErrorCumByUe[ueIdx] : 0u;
+            const uint64_t prevTbBytes =
+                (ueIdx < g_dppLastTbBytesCumByUe.size()) ? g_dppLastTbBytesCumByUe[ueIdx] : 0u;
+            const uint64_t prevTbErrBytes = (ueIdx < g_dppLastTbErrorBytesCumByUe.size())
+                                                ? g_dppLastTbErrorBytesCumByUe[ueIdx]
+                                                : 0u;
             const uint64_t dTbBytes = (tbBytesCum >= prevTbBytes) ? (tbBytesCum - prevTbBytes) : 0u;
-            const uint64_t dTbCount = (tbCountCum >= prevTbCount) ? (tbCountCum - prevTbCount) : 0u;
-            const uint64_t dTbErr = (tbErrCum >= prevTbErr) ? (tbErrCum - prevTbErr) : 0u;
-            const double obsGoodputMbps = static_cast<double>(dTbBytes) * 8.0 / deltaS / 1.0e6;
+            const uint64_t dTbErrBytes =
+                (tbErrBytesCum >= prevTbErrBytes) ? (tbErrBytesCum - prevTbErrBytes) : 0u;
+            const double obsSuccessBytes = static_cast<double>(dTbBytes);
+            const double obsErrBytes = static_cast<double>(dTbErrBytes);
 
             auto& muMean = g_dppMuPostMeanByUe[ueIdx][lastAction];
             auto& muPrec = g_dppMuPostPrecisionByUe[ueIdx][lastAction];
             const double obsPrec = std::max(1e-9, g_dppMuObsPrecision);
+            const double rho = Clamp01(g_dppPosteriorDiscount);
+            // Discounted Bayesian update (forgetting factor):
+            // shrink posterior toward prior before assimilating current observation.
+            muMean = rho * muMean + (1.0 - rho) * std::max(0.0, g_dppMuPriorMeanBytes);
+            muPrec = rho * muPrec + (1.0 - rho) * std::max(1e-9, g_dppMuPriorPrecision);
             const double newPrec = muPrec + obsPrec;
-            muMean = (muPrec * muMean + obsPrec * obsGoodputMbps) / std::max(1e-9, newPrec);
+            muMean = (muPrec * muMean + obsPrec * obsSuccessBytes) / std::max(1e-9, newPrec);
             muPrec = newPrec;
 
-            if (dTbCount > 0)
-            {
-                auto& alpha = g_dppBlerAlphaByUe[ueIdx][lastAction];
-                auto& beta = g_dppBlerBetaByUe[ueIdx][lastAction];
-                const uint64_t err = std::min(dTbErr, dTbCount);
-                const uint64_t succ = dTbCount - err;
-                alpha += static_cast<double>(err);
-                beta += static_cast<double>(succ);
-            }
+            auto& errMean = g_dppErrPostMeanByUe[ueIdx][lastAction];
+            auto& errPrec = g_dppErrPostPrecisionByUe[ueIdx][lastAction];
+            const double errObsPrec = std::max(1e-9, g_dppErrObsPrecision);
+            errMean = rho * errMean + (1.0 - rho) * std::max(0.0, g_dppErrPriorMeanBytes);
+            errPrec = rho * errPrec + (1.0 - rho) * std::max(1e-9, g_dppErrPriorPrecision);
+            const double newErrPrec = errPrec + errObsPrec;
+            errMean = (errPrec * errMean + errObsPrec * obsErrBytes) / std::max(1e-9, newErrPrec);
+            errPrec = newErrPrec;
         }
     }
 
@@ -2243,13 +2372,9 @@ UpdateDppPosteriorForUe(uint32_t ueIdx)
     {
         g_dppLastTbBytesCumByUe[ueIdx] = tbBytesCum;
     }
-    if (ueIdx < g_dppLastTbCountCumByUe.size())
+    if (ueIdx < g_dppLastTbErrorBytesCumByUe.size())
     {
-        g_dppLastTbCountCumByUe[ueIdx] = tbCountCum;
-    }
-    if (ueIdx < g_dppLastTbErrorCumByUe.size())
-    {
-        g_dppLastTbErrorCumByUe[ueIdx] = tbErrCum;
+        g_dppLastTbErrorBytesCumByUe[ueIdx] = tbErrBytesCum;
     }
     if (ueIdx < g_dppLastDecisionTimeSByUe.size())
     {
@@ -2264,7 +2389,7 @@ UpdateDppPosteriorForUe(uint32_t ueIdx)
 static double
 EstimateExpectedGoodputBayesianDummy(uint32_t ueIdx, uint8_t targetBwp, uint8_t targetMcs)
 {
-    // Pure Bayesian posterior mean of expected goodput mu_i(t,a).
+    // Pure Bayesian posterior mean of expected success TB bytes mu_i(t,a) per epoch.
     uint8_t action = DPP_BWP0_CQI;
     if (targetBwp == g_lowBwpId && targetMcs >= 2)
     {
@@ -2306,13 +2431,13 @@ EstimateExpectedGoodputBayesianDummy(uint32_t ueIdx, uint8_t targetBwp, uint8_t 
     {
         return std::max(0.0, g_dppMuPostMeanByUe[ueIdx][action]);
     }
-    return std::max(0.0, g_dppMuPriorMeanMbps);
+    return std::max(0.0, g_dppMuPriorMeanBytes);
 }
 
 static double
-EstimateExpectedBlerBayesianDummy(uint32_t ueIdx, uint8_t targetBwp, uint8_t targetMcs)
+EstimateExpectedErrorBytesBayesianDummy(uint32_t ueIdx, uint8_t targetBwp, uint8_t targetMcs)
 {
-    // Pure Bayesian posterior mean of expected BLER e_i(t,a).
+    // Pure Bayesian posterior mean of expected error TB bytes e_i(t,a) per epoch.
     uint8_t action = DPP_BWP0_CQI;
     if (targetBwp == g_lowBwpId)
     {
@@ -2328,14 +2453,11 @@ EstimateExpectedBlerBayesianDummy(uint32_t ueIdx, uint8_t targetBwp, uint8_t tar
         const int32_t delta = static_cast<int32_t>(targetMcs) - baseMcs;
         action = (delta <= -2) ? DPP_BWP1_CQI_M2 : ((delta <= -1) ? DPP_BWP1_CQI_M1 : DPP_BWP1_CQI);
     }
-    double postBler = g_dppBlerPriorAlpha / std::max(1e-9, (g_dppBlerPriorAlpha + g_dppBlerPriorBeta));
-    if (ueIdx < g_dppBlerAlphaByUe.size())
+    if (ueIdx < g_dppErrPostMeanByUe.size())
     {
-        const double a = g_dppBlerAlphaByUe[ueIdx][action];
-        const double b = g_dppBlerBetaByUe[ueIdx][action];
-        postBler = a / std::max(1e-9, a + b);
+        return std::max(0.0, g_dppErrPostMeanByUe[ueIdx][action]);
     }
-    return Clamp01(postBler);
+    return std::max(0.0, g_dppErrPriorMeanBytes);
 }
 
 static uint32_t
@@ -2343,17 +2465,25 @@ RunDppPolicyEpochStep()
 {
     uint32_t switchCount = 0;
     const uint32_t numUes = static_cast<uint32_t>(g_ueStats.size());
-        for (uint32_t ueIdx = 0; ueIdx < numUes; ++ueIdx)
-        {
+    for (uint32_t ueIdx = 0; ueIdx < numUes; ++ueIdx)
+    {
         UpdateDppPosteriorForUe(ueIdx);
         const double backlogBytes = std::max(0.0, ComputeDlRlcQueueBytes(ueIdx));
-        const double backlog = ComputeDppBacklogRatio(ueIdx); // Q_i(t) in [0,1]
+        const double backlog = ComputeDppBacklogRatio(ueIdx);
         const double epochDeltaS =
             (ueIdx < g_dppLastEpochDeltaSByUe.size()) ? std::max(1e-6, g_dppLastEpochDeltaSByUe[ueIdx])
                                                       : std::max(1e-6, g_envStepTime);
         const uint8_t currentBwp = GetCurrentUeBwp(ueIdx);
         const int32_t cqiMcs = (ueIdx < g_lastCqiByUe.size()) ? EstimateBaseMcsFromCqi(g_lastCqiByUe[ueIdx])
                                                               : static_cast<int32_t>(g_initialMcs);
+        const int32_t currentMcs =
+            (ueIdx < g_targetMcsByUe.size()) ? static_cast<int32_t>(g_targetMcsByUe[ueIdx])
+                                             : std::max(0, std::min(27, cqiMcs));
+        const uint8_t currentMcsClamped = static_cast<uint8_t>(std::max(0, std::min(27, currentMcs)));
+        const double muCurrent = EstimateExpectedGoodputBayesianDummy(ueIdx, currentBwp, currentMcsClamped);
+        const double gHatCurrent = std::max(0.0, muCurrent);
+        // C_sw = (switch_delay / epoch=1ms) * mu(a_curr,t): opportunity cost of staying on current action.
+        const double switchCost = std::max(0.0, g_switchDelayMsCfg) * gHatCurrent;
 
         double bestScore = -std::numeric_limits<double>::infinity();
         uint8_t bestAction = DPP_BWP0_CQI;
@@ -2365,7 +2495,8 @@ RunDppPolicyEpochStep()
         std::array<int32_t, DPP_ACTIONS> actionMcsDelta{};
         std::array<double, DPP_ACTIONS> actionMu{};
         std::array<double, DPP_ACTIONS> actionE{};
-        std::array<double, DPP_ACTIONS> actionRewardTerm{};
+        std::array<double, DPP_ACTIONS> actionGoodputHat{};
+        std::array<double, DPP_ACTIONS> actionQueueWeightedGoodput{};
         std::array<double, DPP_ACTIONS> actionPenaltySwitch{};
         std::array<double, DPP_ACTIONS> actionPenaltyBler{};
         std::array<double, DPP_ACTIONS> actionPenaltyTotal{};
@@ -2378,20 +2509,24 @@ RunDppPolicyEpochStep()
             DecodeDppAction(a, &targetBwp, &mcsDelta);
             const int32_t targetMcs = std::max(0, std::min(27, cqiMcs + mcsDelta));
             const double mu = EstimateExpectedGoodputBayesianDummy(ueIdx, targetBwp, static_cast<uint8_t>(targetMcs));
-            const double e = EstimateExpectedBlerBayesianDummy(ueIdx, targetBwp, static_cast<uint8_t>(targetMcs));
-            const double reliability = Clamp01(1.0 - e);
+            const double e =
+                EstimateExpectedErrorBytesBayesianDummy(ueIdx, targetBwp, static_cast<uint8_t>(targetMcs));
             const double switchIndicator = (targetBwp != currentBwp) ? 1.0 : 0.0;
-            const double rewardTerm = backlog * mu * epochDeltaS * reliability;
-            const double penaltySwitch = g_dppV * g_dppLambdaSwitch * switchIndicator;
-            const double penaltyBler = 0.0;
+            const double goodputHat = std::max(0.0, mu);
+            // score(a) = Q_i(t)*mu_hat_i(a,t) - V*(lambda_e*e_hat_i(a,t) + lambda_sw*C_sw*I_sw(a))
+            const double queueWeightedGoodput = backlog * goodputHat;
+            const double penaltySwitch =
+                g_dppV * g_dppLambdaSwitch * switchCost * switchIndicator;
+            const double penaltyBler = g_dppV * g_dppLambdaBler * std::max(0.0, e);
             const double penaltyTotal = penaltySwitch + penaltyBler;
-            const double score = rewardTerm - penaltyTotal;
+            const double score = queueWeightedGoodput - penaltyTotal;
             actionTargetBwp[a] = targetBwp;
             actionTargetMcs[a] = static_cast<uint8_t>(targetMcs);
             actionMcsDelta[a] = mcsDelta;
             actionMu[a] = mu;
             actionE[a] = e;
-            actionRewardTerm[a] = rewardTerm;
+            actionGoodputHat[a] = goodputHat;
+            actionQueueWeightedGoodput[a] = queueWeightedGoodput;
             actionPenaltySwitch[a] = penaltySwitch;
             actionPenaltyBler[a] = penaltyBler;
             actionPenaltyTotal[a] = penaltyTotal;
@@ -2421,8 +2556,11 @@ RunDppPolicyEpochStep()
                                              << actionMcsDelta[a] << "," << backlogBytes << ","
                                              << backlog << "," << epochDeltaS << ","
                                              << actionMu[a] << "," << actionE[a] << ","
+                                             << gHatCurrent << "," << switchCost << ","
                                              << ((actionTargetBwp[a] != currentBwp) ? 1 : 0) << ","
-                                             << actionRewardTerm[a] << "," << actionPenaltySwitch[a] << ","
+                                             << actionGoodputHat[a] << ","
+                                             << actionQueueWeightedGoodput[a] << ","
+                                             << actionPenaltySwitch[a] << ","
                                              << actionPenaltyBler[a] << "," << actionPenaltyTotal[a] << ","
                                              << actionScore[a] << "\n";
                 }
@@ -2439,9 +2577,13 @@ RunDppPolicyEpochStep()
                                                << " backlogBytes=" << backlogBytes
                                                << " backlogRatio=" << backlog
                                                << " epochDeltaS=" << epochDeltaS
+                                               << " gHatCurrent=" << gHatCurrent
+                                               << " switchCost=" << switchCost
                                                << " mu=" << actionMu[bestAction]
                                                << " e=" << actionE[bestAction]
-                                               << " rewardTerm=" << actionRewardTerm[bestAction]
+                                               << " gHat=" << actionGoodputHat[bestAction]
+                                               << " qWeightedGoodput="
+                                               << actionQueueWeightedGoodput[bestAction]
                                                << " penaltySwitch=" << actionPenaltySwitch[bestAction]
                                                << " penaltyBler=" << actionPenaltyBler[bestAction]
                                                << " score=" << actionScore[bestAction]);
@@ -2482,6 +2624,11 @@ RunDppPolicyEpoch()
     }
     g_dppLastEpochS = Simulator::Now().GetSeconds();
     g_dppSwitchCountAccum += RunDppPolicyEpochStep();
+    const double nextDelayS = std::max(1.0e-6, g_dppEpochMinIntervalS);
+    if (Simulator::Now().GetSeconds() + nextDelayS < g_simTime)
+    {
+        g_dppEpochEvent = Simulator::Schedule(Seconds(nextDelayS), &RunDppPolicyEpoch);
+    }
 }
 
 static void
@@ -2497,7 +2644,7 @@ TriggerDppPolicyEpoch()
     }
     const double nowS = Simulator::Now().GetSeconds();
     const double elapsedS = (g_dppLastEpochS < 0.0) ? 1.0e9 : (nowS - g_dppLastEpochS);
-    const double delayS = std::max(0.0, g_dppEpochMinIntervalS - elapsedS);
+    const double delayS = (g_dppLastEpochS < 0.0) ? 0.0 : std::max(0.0, g_dppEpochMinIntervalS - elapsedS);
     g_dppEpochEvent = Simulator::Schedule(Seconds(delayS), &RunDppPolicyEpoch);
 }
 
@@ -2736,15 +2883,28 @@ ComputeCurrentAppStateCode(uint32_t ueIdx)
     {
         return -1;
     }
+    if (ueIdx < g_appStateTimelineByUe.size() && !g_appStateTimelineByUe[ueIdx].empty())
+    {
+        const double nowS = Simulator::Now().GetSeconds();
+        const auto& timeline = g_appStateTimelineByUe[ueIdx];
+        for (const auto& seg : timeline)
+        {
+            if (nowS >= seg.startS && nowS < seg.endS)
+            {
+                return seg.state;
+            }
+        }
+        if (nowS < timeline.front().startS)
+        {
+            return timeline.front().state;
+        }
+        return timeline.back().state;
+    }
     const double nowS = Simulator::Now().GetSeconds();
     const double baseS = g_policyBaseStartSByUe[ueIdx];
     const int32_t phase = g_policyPhaseOffsetByUe[ueIdx];
     const double segS = std::max(1e-6, g_policySegmentDurationS);
     const int32_t segIdx = (nowS > baseS) ? static_cast<int32_t>(std::floor((nowS - baseS) / segS)) : 0;
-    if (g_policyUseOnOff2Phase)
-    {
-        return (phase + segIdx) % 2; // 0=burst-heavy, 1=bg-heavy
-    }
     if (g_appmixStateOverride >= 0)
     {
         return g_appmixStateOverride; // 0=ftp_only, 1=video_only, 2=ftp_video
@@ -2811,7 +2971,7 @@ BuildDrqnAppmixObservation(uint32_t ueIdx, const std::array<double, 4>& bwpMetri
     const double ftpShare = Clamp01(static_cast<double>(arrivedFtp) / totalArrived);
     const double videoShare = Clamp01(static_cast<double>(arrivedVideo) / totalArrived);
     const int32_t stateCode = ComputeCurrentAppStateCode(ueIdx);
-    const bool burstHeavy = g_policyUseOnOff2Phase ? (stateCode == 0) : (stateCode == 1 || stateCode == 2);
+    const bool burstHeavy = (stateCode == 1 || stateCode == 2);
     const double burstPhase = burstHeavy ? 1.0 : 0.0;
 
     return {blerNorm,
@@ -3216,10 +3376,11 @@ main(int argc, char* argv[])
     uint32_t numUes = 20;
     double simTime = g_simTime;
     double appStart = g_appStartTime;
-    double lowFreqHz = 3.5e9;
+    // double lowFreqHz = 3.5e9;
+    double lowFreqHz = 700e6;
     double highFreqHz = 6e9;
-    double lowBandwidthHz = 20e6;
-    double highBandwidthHz = 80e6;
+    double lowBandwidthHz = 10e6;
+    double highBandwidthHz = 60e6;
     double gnbTxPowerDbm = 10.0;
     double ueDistance = 20.0;
     double ueRadius = 100.0;
@@ -3246,19 +3407,15 @@ main(int argc, char* argv[])
     // Background traffic
     double backgroundRateKbps = 500.0;
     uint32_t backgroundPktSize = 500;
-    std::string trafficModel = "legacy"; // legacy|mixed|onoff2phase
-    double bgOnMs = 120.0;
-    double bgOffMs = 120.0;
+    std::string trafficModel = "legacy"; // legacy|mixed
     double appLoadScale = 1.0;
     double mixedLightRatio = 0.4;
     double mixedModerateRatio = 0.4;
     double mixedHeavyRatio = 0.2;
-    double segmentDurationS = 0.6;
+    double segmentDurationS = 0.6; // legacy fixed duration fallback
+    double segmentDurationMinMs = 500.0;
+    double segmentDurationMaxMs = 2000.0;
     int32_t appmixStateOverride = g_appmixStateOverride;
-    double phase0BurstScale = 2.0;
-    double phase0BgScale = 1.0;
-    double phase1BurstScale = 0.5;
-    double phase1BgScale = 0.5;
 
     // Channel dynamics
     bool enableShadowing = true;
@@ -3301,7 +3458,7 @@ main(int argc, char* argv[])
                  uePatrolRadius);
     cmd.AddValue("ueSpacing", "UE spacing along x-axis (m)", ueSpacing);
     cmd.AddValue("startJitterMs", "App start jitter (ms)", startJitterMs);
-    cmd.AddValue("trafficModel", "Traffic model: legacy|mixed|onoff2phase", trafficModel);
+    cmd.AddValue("trafficModel", "Traffic model: legacy|mixed", trafficModel);
     cmd.AddValue("appLoadScale",
                  "Overall semantic app traffic load scale (>0). Scales FTP file size, "
                  "gaming packet size, and video packets/packet size.",
@@ -3364,25 +3521,22 @@ main(int argc, char* argv[])
                  g_bwpQueueThreshold);
     cmd.AddValue("dppV", "DPP V coefficient", g_dppV);
     cmd.AddValue("dppLambdaSwitch", "DPP switch penalty lambda", g_dppLambdaSwitch);
-    cmd.AddValue("dppLambdaBler", "DPP expected BLER penalty lambda", g_dppLambdaBler);
+    cmd.AddValue("dppLambdaBler", "DPP expected error-bytes penalty lambda", g_dppLambdaBler);
     cmd.AddValue("dppEpochMinIntervalS",
-                 "Minimum interval between trigger-based DPP epochs (s)",
+                 "DPP epoch interval in seconds (default 0.01 for 10ms control).",
                  g_dppEpochMinIntervalS);
     cmd.AddValue("dppMuPriorMeanMbps",
-                 "DPP Bayesian prior mean of expected goodput (Mbps)",
-                 g_dppMuPriorMeanMbps);
+                 "DPP Bayesian prior mean of expected successful TB bytes per epoch.",
+                 g_dppMuPriorMeanBytes);
     cmd.AddValue("dppMuPriorPrecision",
                  "DPP Bayesian prior precision for expected goodput",
                  g_dppMuPriorPrecision);
     cmd.AddValue("dppMuObsPrecision",
                  "DPP Bayesian observation precision for expected goodput",
                  g_dppMuObsPrecision);
-    cmd.AddValue("dppBlerPriorAlpha",
-                 "DPP Beta prior alpha for expected BLER",
-                 g_dppBlerPriorAlpha);
-    cmd.AddValue("dppBlerPriorBeta",
-                 "DPP Beta prior beta for expected BLER",
-                 g_dppBlerPriorBeta);
+    cmd.AddValue("dppPosteriorDiscount",
+                 "DPP posterior forgetting factor rho in [0,1] (default 0.9).",
+                 g_dppPosteriorDiscount);
     cmd.AddValue("dppScoreDebug",
                  "Enable verbose DPP raw-score tracing to log and optional CSV file",
                  g_dppScoreDebug);
@@ -3422,8 +3576,14 @@ main(int argc, char* argv[])
                  g_dtPredictGainQueue);
     cmd.AddValue("dtEmaAlpha", "DT baseline EMA alpha", g_dtEmaAlpha);
     cmd.AddValue("segmentDurationS",
-                 "Duration of each appmix traffic-state segment in seconds.",
+                 "Legacy fixed appmix segment duration (s), used when min=max or as fallback.",
                  segmentDurationS);
+    cmd.AddValue("segmentDurationMinMs",
+                 "Minimum randomized appmix traffic-state segment duration (ms).",
+                 segmentDurationMinMs);
+    cmd.AddValue("segmentDurationMaxMs",
+                 "Maximum randomized appmix traffic-state segment duration (ms).",
+                 segmentDurationMaxMs);
     cmd.AddValue("appmixStateOverride",
                  "Override appmix state for all segments: -1=disabled, 0=ftp_only, 1=video_only, 2=ftp_video.",
                  appmixStateOverride);
@@ -3438,12 +3598,6 @@ main(int argc, char* argv[])
     cmd.AddValue("burstOffMaxMs", "Random burst OFF maximum duration (ms)", burstOffMaxMs);
     cmd.AddValue("backgroundRateKbps", "Background traffic rate (Kbps)", backgroundRateKbps);
     cmd.AddValue("backgroundPktSize", "Background packet size (bytes)", backgroundPktSize);
-    cmd.AddValue("bgOnMs", "Background OnOff ON duration (ms)", bgOnMs);
-    cmd.AddValue("bgOffMs", "Background OnOff OFF duration (ms)", bgOffMs);
-    cmd.AddValue("phase0BurstScale", "Phase-0 burst rate scale multiplier", phase0BurstScale);
-    cmd.AddValue("phase0BgScale", "Phase-0 background rate scale multiplier", phase0BgScale);
-    cmd.AddValue("phase1BurstScale", "Phase-1 burst rate scale multiplier", phase1BurstScale);
-    cmd.AddValue("phase1BgScale", "Phase-1 background rate scale multiplier", phase1BgScale);
     cmd.AddValue("enableShadowing", "Enable shadowing in pathloss", enableShadowing);
     cmd.AddValue("channelUpdateMs", "3GPP channel model update period (ms)", channelUpdateMs);
     cmd.AddValue("extraBuildings",
@@ -3544,20 +3698,22 @@ main(int argc, char* argv[])
     g_dppV = std::max(0.0, g_dppV);
     g_dppLambdaSwitch = std::max(0.0, g_dppLambdaSwitch);
     g_dppLambdaBler = std::max(0.0, g_dppLambdaBler);
-    g_dppEpochMinIntervalS = std::max(0.0, g_dppEpochMinIntervalS);
-    g_dppMuPriorMeanMbps = std::max(0.0, g_dppMuPriorMeanMbps);
+    g_dppEpochMinIntervalS = std::max(1.0e-6, g_dppEpochMinIntervalS);
+    g_dppMuPriorMeanBytes = std::max(0.0, g_dppMuPriorMeanBytes);
     g_dppMuPriorPrecision = std::max(1e-9, g_dppMuPriorPrecision);
     g_dppMuObsPrecision = std::max(1e-9, g_dppMuObsPrecision);
-    g_dppBlerPriorAlpha = std::max(1e-9, g_dppBlerPriorAlpha);
-    g_dppBlerPriorBeta = std::max(1e-9, g_dppBlerPriorBeta);
+    g_dppErrPriorMeanBytes = std::max(0.0, g_dppErrPriorMeanBytes);
+    g_dppErrPriorPrecision = std::max(1e-9, g_dppErrPriorPrecision);
+    g_dppErrObsPrecision = std::max(1e-9, g_dppErrObsPrecision);
+    g_dppPosteriorDiscount = Clamp01(g_dppPosteriorDiscount);
     g_bwpQueueThreshold = std::max<uint32_t>(1u, g_bwpQueueThreshold);
     g_rlcMaxTxBufferBytes = std::max<uint32_t>(1u, g_rlcMaxTxBufferBytes);
     g_enablePerUeMcsControl =
         (g_mcsBaseline == "aams" || g_staticMcsOffset != 0 || g_bwpBaseline == "dpp" ||
          (g_enableOpenGym && g_enableRlMcsControl));
-    if (trafficModel != "legacy" && trafficModel != "mixed" && trafficModel != "onoff2phase")
+    if (trafficModel != "legacy" && trafficModel != "mixed")
     {
-        NS_ABORT_MSG("Invalid trafficModel. Supported values: legacy|mixed|onoff2phase");
+        NS_ABORT_MSG("Invalid trafficModel. Supported values: legacy|mixed");
     }
     appLoadScale = std::max(0.05, appLoadScale);
     mixedLightRatio = std::max(0.0, mixedLightRatio);
@@ -3581,12 +3737,9 @@ main(int argc, char* argv[])
     g_dqnLatencyUeRatio = Clamp01(g_dqnLatencyUeRatio);
     g_dqnAlpha = Clamp01(g_dqnAlpha);
     g_dqnBeta = Clamp01(g_dqnBeta);
-    bgOnMs = std::max(1.0, bgOnMs);
-    bgOffMs = std::max(1.0, bgOffMs);
-    phase0BurstScale = std::max(0.05, phase0BurstScale);
-    phase0BgScale = std::max(0.05, phase0BgScale);
-    phase1BurstScale = std::max(0.05, phase1BurstScale);
-    phase1BgScale = std::max(0.05, phase1BgScale);
+    segmentDurationS = std::max(0.05, segmentDurationS);
+    segmentDurationMinMs = std::max(50.0, segmentDurationMinMs);
+    segmentDurationMaxMs = std::max(segmentDurationMinMs, segmentDurationMaxMs);
     uePatrolRadius = std::max(10.0, uePatrolRadius);
     g_losSamplePeriodS = std::max(0.005, g_losSamplePeriodS);
     g_dtQueueLow = std::max(0.0, std::min(1.0, g_dtQueueLow));
@@ -3603,8 +3756,13 @@ main(int argc, char* argv[])
     g_lastLosStateSampleTimeByUe.assign(numUes, -1.0);
     g_policyBaseStartSByUe.assign(numUes, appStart);
     g_policyPhaseOffsetByUe.assign(numUes, 0);
-    g_policyUseOnOff2Phase = false;
     g_policySegmentDurationS = segmentDurationS;
+    g_appStateTimelineByUe.assign(numUes, std::vector<AppStateSegment>{});
+    g_packetLevelAoiSamplesMs.clear();
+    for (auto& v : g_packetLevelAoiSamplesByTypeMs)
+    {
+        v.clear();
+    }
     g_losConditionModel = g_enableLosNlosStats ? CreateObject<BuildingsChannelConditionModel>() : nullptr;
     g_gnbMobility = nullptr;
     g_rntiByUeIdx.assign(numUes, 0);
@@ -3641,9 +3799,12 @@ main(int argc, char* argv[])
     g_rxTbBytesCumByUe.assign(numUes, 0);
     g_rxTbCountCumByUe.assign(numUes, 0);
     g_rxTbErrorCumByUe.assign(numUes, 0);
+    g_rxTbErrorBytesCumByUe.assign(numUes, 0);
     g_schedCountCumByUe.assign(numUes, 0);
     g_harqFlushCountByUe.assign(numUes, 0);
     g_bwpSwitchExecCountByUe.assign(numUes, 0);
+    g_bwpSwitchExec0To1Count = 0;
+    g_bwpSwitchExec1To0Count = 0;
     g_causePrevRxPrbByUe.assign(numUes, 0);
     g_causePrevRxTbBytesByUe.assign(numUes, 0);
     g_causePrevRxTbCountByUe.assign(numUes, 0);
@@ -3670,23 +3831,22 @@ main(int argc, char* argv[])
     g_dtEmaQueueNormByUe.assign(numUes, 0.0);
     std::array<double, G_DPP_ACTION_COUNT> muMeanInit{};
     std::array<double, G_DPP_ACTION_COUNT> muPrecInit{};
-    std::array<double, G_DPP_ACTION_COUNT> blerAlphaInit{};
-    std::array<double, G_DPP_ACTION_COUNT> blerBetaInit{};
-    muMeanInit.fill(std::max(0.0, g_dppMuPriorMeanMbps));
+    std::array<double, G_DPP_ACTION_COUNT> errMeanInit{};
+    std::array<double, G_DPP_ACTION_COUNT> errPrecInit{};
+    muMeanInit.fill(std::max(0.0, g_dppMuPriorMeanBytes));
     muPrecInit.fill(std::max(1e-9, g_dppMuPriorPrecision));
-    blerAlphaInit.fill(std::max(1e-9, g_dppBlerPriorAlpha));
-    blerBetaInit.fill(std::max(1e-9, g_dppBlerPriorBeta));
+    errMeanInit.fill(std::max(0.0, g_dppErrPriorMeanBytes));
+    errPrecInit.fill(std::max(1e-9, g_dppErrPriorPrecision));
     g_dppMuPostMeanByUe.assign(numUes, muMeanInit);
     g_dppMuPostPrecisionByUe.assign(numUes, muPrecInit);
-    g_dppBlerAlphaByUe.assign(numUes, blerAlphaInit);
-    g_dppBlerBetaByUe.assign(numUes, blerBetaInit);
+    g_dppErrPostMeanByUe.assign(numUes, errMeanInit);
+    g_dppErrPostPrecisionByUe.assign(numUes, errPrecInit);
     g_dppLastActionByUe.assign(numUes, -1);
     g_dppHasLastActionByUe.assign(numUes, false);
     g_dppLastDecisionTimeSByUe.assign(numUes, Simulator::Now().GetSeconds());
-    g_dppLastEpochDeltaSByUe.assign(numUes, std::max(1e-6, g_envStepTime));
+    g_dppLastEpochDeltaSByUe.assign(numUes, std::max(1e-6, g_dppEpochMinIntervalS));
     g_dppLastTbBytesCumByUe.assign(numUes, 0u);
-    g_dppLastTbCountCumByUe.assign(numUes, 0u);
-    g_dppLastTbErrorCumByUe.assign(numUes, 0u);
+    g_dppLastTbErrorBytesCumByUe.assign(numUes, 0u);
     g_ueIdxByRnti.clear();
     g_dlSchedulers.clear();
     g_gnbMacs.clear();
@@ -3713,6 +3873,7 @@ main(int argc, char* argv[])
     g_nextSwitchRejectMgrMissingCount = 0;
     g_nextSwitchRejectUeMgrMissingCount = 0;
     g_intervalMetrics = IntervalMetricAccumulator{};
+    g_bwpOccupancyUeTimeS = {0.0, 0.0};
     g_dppLastEpochS = -1.0;
     g_dppSwitchCountAccum = 0;
     g_dppEpochEvent = EventId();
@@ -3889,8 +4050,9 @@ main(int argc, char* argv[])
         {
             (*g_dppScoreTraceStream)
                 << "time_s,ue_idx,action_id,selected,target_bwp,target_mcs,mcs_delta,"
-                << "backlog_bytes,backlog_ratio,epoch_delta_s,mu_post_mean_mbps,e_post_mean_bler,switch_indicator,"
-                << "reward_term,penalty_switch,penalty_bler,penalty_total,score\n";
+                << "backlog_bytes,backlog_ratio,epoch_delta_s,mu_post_mean_bytes,e_post_mean_bytes,"
+                << "mu_current_bytes,switch_cost_bytes,switch_indicator,"
+                << "g_hat_bytes,q_weighted_g_hat,penalty_switch,penalty_bler,penalty_total,score\n";
             g_dppScoreTraceStream->flush();
         }
         else
@@ -4075,6 +4237,7 @@ main(int argc, char* argv[])
     {
         Simulator::Schedule(Seconds(0.0), &SampleCauseTrace);
     }
+    Simulator::Schedule(Seconds(0.0), &SampleBwpOccupancy);
 
     Ptr<NrPointToPointEpcHelper> epcHelper = CreateObject<NrPointToPointEpcHelper>();
     Ptr<IdealBeamformingHelper> beamformingHelper = CreateObject<IdealBeamformingHelper>();
@@ -4221,11 +4384,9 @@ main(int argc, char* argv[])
     }
 
     const std::string tgProtocol = "ns3::UdpSocketFactory";
-    const bool useOnOff2Phase = (trafficModel == "onoff2phase");
-    if (!useOnOff2Phase && trafficModel != "mixed")
+    if (trafficModel == "legacy")
     {
-        NS_LOG_UNCOND("App-mix scenario uses dynamic FTP/VIDEO cycling unless trafficModel=onoff2phase; "
-                      << "ignoring value '" << trafficModel << "'.");
+        NS_LOG_UNCOND("trafficModel=legacy is treated the same as mixed (dynamic FTP/VIDEO cycling).");
     }
     const uint32_t ftpPacketSize = 1000;
     const double ftpReadingTimeMeanS = 0.1;
@@ -4258,8 +4419,6 @@ main(int argc, char* argv[])
         {
             g_policyPhaseOffsetByUe[i] = phase;
         }
-        g_policyUseOnOff2Phase = useOnOff2Phase;
-
         const uint16_t ftpPort = static_cast<uint16_t>(4000 + i);
         PacketSinkHelper ftpSinkHelper(tgProtocol, InetSocketAddress(Ipv4Address::GetAny(), ftpPort));
         ApplicationContainer ftpSinkApps = ftpSinkHelper.Install(ueNodes.Get(i));
@@ -4302,81 +4461,27 @@ main(int argc, char* argv[])
         uePingApps.Start(Seconds(appStart * 0.25));
         uePingApps.Stop(Seconds(appStart * 0.45));
 
-        for (double segStartS = baseStartS; segStartS < simTime; segStartS += segmentDurationS)
+        std::uniform_real_distribution<double> segDurDist(segmentDurationMinMs / 1000.0,
+                                                          segmentDurationMaxMs / 1000.0);
+        double segStartS = baseStartS;
+        int segIdx = 0;
+        while (segStartS < simTime)
         {
-            const double segStopS = std::min(simTime, segStartS + segmentDurationS);
+            const double segDurS = std::max(1e-3, segDurDist(trafficRng));
+            const double segStopS = std::min(simTime, segStartS + segDurS);
             if (segStopS <= segStartS + 1e-6)
             {
-                continue;
+                break;
             }
-            if (useOnOff2Phase)
             {
-                const int segIdx =
-                    static_cast<int>(std::floor((segStartS - baseStartS) / segmentDurationS));
-                const int phaseIdx = (phase + segIdx) % 2;
-                const double burstScale = (phaseIdx == 0) ? phase0BurstScale : phase1BurstScale;
-                const double bgScale = (phaseIdx == 0) ? phase0BgScale : phase1BgScale;
-                const double burstRateBps =
-                    std::max(1.0, burstRateMbps * 1e6 * appLoadScale * burstScale);
-                const double bgRateBps =
-                    std::max(1.0, backgroundRateKbps * 1e3 * appLoadScale * bgScale);
-                if (g_appStateTraceStream && g_appStateTraceStream->is_open() &&
-                    i == static_cast<uint32_t>(std::max<int32_t>(0, g_appStateTraceUe)))
-                {
-                    const std::string stateLabel = (phaseIdx == 0) ? "phase0_burst_heavy" : "phase1_bg_heavy";
-                    (*g_appStateTraceStream) << i << "," << phaseIdx << "," << stateLabel << ","
-                                             << std::fixed << std::setprecision(6) << segStartS << ","
-                                             << segStopS << ",1,1\n";
-                    g_appStateTraceStream->flush();
-                }
-
-                OnOffHelper bgHelper(tgProtocol, InetSocketAddress(ueIfaces.GetAddress(i), ftpPort));
-                bgHelper.SetAttribute("DataRate",
-                                      DataRateValue(DataRate(static_cast<uint64_t>(std::round(bgRateBps)))));
-                bgHelper.SetAttribute("PacketSize", UintegerValue(backgroundPktSize));
-                bgHelper.SetAttribute("OnTime",
-                                      StringValue("ns3::ConstantRandomVariable[Constant=" +
-                                                  std::to_string(bgOnMs / 1000.0) + "]"));
-                bgHelper.SetAttribute("OffTime",
-                                      StringValue("ns3::ConstantRandomVariable[Constant=" +
-                                                  std::to_string(bgOffMs / 1000.0) + "]"));
-                ApplicationContainer bgApps = bgHelper.Install(remoteHost);
-                clientApps.Add(bgApps);
-                Ptr<OnOffApplication> bg = DynamicCast<OnOffApplication>(bgApps.Get(0));
-                if (bg)
-                {
-                    bg->TraceConnectWithoutContext("Tx", MakeBoundCallback(&OnAppTx, i, LIGHT_HTTP));
-                }
-                bgApps.Start(Seconds(segStartS));
-                bgApps.Stop(Seconds(segStopS));
-
-                OnOffHelper burstHelper(tgProtocol, InetSocketAddress(ueIfaces.GetAddress(i), videoPort));
-                burstHelper.SetAttribute("DataRate",
-                                         DataRateValue(DataRate(static_cast<uint64_t>(std::round(burstRateBps)))));
-                burstHelper.SetAttribute("PacketSize", UintegerValue(burstPktSize));
-                burstHelper.SetAttribute("OnTime",
-                                         StringValue("ns3::ConstantRandomVariable[Constant=" +
-                                                     std::to_string(burstOnMs / 1000.0) + "]"));
-                burstHelper.SetAttribute("OffTime",
-                                         StringValue("ns3::ConstantRandomVariable[Constant=" +
-                                                     std::to_string(burstOffMs / 1000.0) + "]"));
-                ApplicationContainer burstApps = burstHelper.Install(remoteHost);
-                clientApps.Add(burstApps);
-                Ptr<OnOffApplication> burst = DynamicCast<OnOffApplication>(burstApps.Get(0));
-                if (burst)
-                {
-                    burst->TraceConnectWithoutContext("Tx", MakeBoundCallback(&OnAppTx, i, HEAVY_VIDEO));
-                }
-                burstApps.Start(Seconds(segStartS));
-                burstApps.Stop(Seconds(segStopS));
-            }
-            else
-            {
-                int state =
-                    (phase + static_cast<int>(std::floor((segStartS - baseStartS) / segmentDurationS))) % 3;
+                int state = (phase + segIdx) % 3;
                 if (appmixStateOverride >= 0)
                 {
                     state = appmixStateOverride;
+                }
+                if (i < g_appStateTimelineByUe.size())
+                {
+                    g_appStateTimelineByUe[i].push_back({segStartS, segStopS, state});
                 }
                 const bool enableFtp = (state == 0 || state == 2);
                 const bool enableVideo = (state == 1 || state == 2);
@@ -4453,6 +4558,8 @@ main(int argc, char* argv[])
                     videoApps.Stop(Seconds(segStopS));
                 }
             }
+            segStartS = segStopS;
+            ++segIdx;
         }
     }
 
@@ -4490,6 +4597,10 @@ main(int argc, char* argv[])
     else
     {
         Simulator::Schedule(Seconds(g_envStepTime), &ScheduleBaselinePolicyStep);
+    }
+    if (g_bwpBaseline == "dpp")
+    {
+        TriggerDppPolicyEpoch();
     }
     if ((g_aoiStateTraceStream && g_aoiStateTraceStream->is_open()) ||
         (g_queueTraceStream && g_queueTraceStream->is_open()))
@@ -4540,6 +4651,9 @@ main(int argc, char* argv[])
         const auto& video = g_ueStats[i].flow[HEAVY_VIDEO];
         uint64_t totalBytes = http.rxBytes + gaming.rxBytes + video.rxBytes;
         double thrMbps = (totalBytes * 8.0) / duration / 1e6;
+        const double goodputFtpUeMbps = (static_cast<double>(http.rxBytes) * 8.0) / duration / 1e6;
+        const double goodputGamingUeMbps = (static_cast<double>(gaming.rxBytes) * 8.0) / duration / 1e6;
+        const double goodputVideoUeMbps = (static_cast<double>(video.rxBytes) * 8.0) / duration / 1e6;
         double avgAoiFtpMs = (http.aoiSamples > 0) ? (http.aoiSumMs / http.aoiSamples) : 0.0;
         double avgAoiGamingMs =
             (gaming.aoiSamples > 0) ? (gaming.aoiSumMs / gaming.aoiSamples) : 0.0;
@@ -4563,15 +4677,6 @@ main(int argc, char* argv[])
             (envNlos.aoiSamples > 0) ? (envNlos.aoiSumMs / envNlos.aoiSamples) : 0.0;
         double bytesPerPrb =
             (prb.prbTotal > 0) ? (static_cast<double>(totalBytes) / prb.prbTotal) : 0.0;
-        double httpPrbEst = 0.0;
-        double gamingPrbEst = 0.0;
-        double videoPrbEst = 0.0;
-        if (totalBytes > 0 && prb.prbTotal > 0)
-        {
-            httpPrbEst = prb.prbTotal * (static_cast<double>(http.rxBytes) / totalBytes);
-            gamingPrbEst = prb.prbTotal * (static_cast<double>(gaming.rxBytes) / totalBytes);
-            videoPrbEst = prb.prbTotal * (static_cast<double>(video.rxBytes) / totalBytes);
-        }
         double avgMcs = (prb.mcsCount > 0) ? (prb.mcsSum / prb.mcsCount) : 0.0;
         double bler = (prb.tbCount > 0) ? (static_cast<double>(prb.tbError) / prb.tbCount) : 0.0;
         double avgTbler =
@@ -4581,30 +4686,18 @@ main(int argc, char* argv[])
                                  << "UE" << i
                                  << " class=" << ueTrafficProfiles[i].trafficClass
                                  << " thr=" << thrMbps << " Mbps"
+                                 << " goodput(FTP/GAMING/VIDEO)="
+                                 << goodputFtpUeMbps << "/" << goodputGamingUeMbps << "/"
+                                 << goodputVideoUeMbps << " Mbps"
                                  << " AoI(node)=" << ComputeUeKpiAoiMs(i) << " ms"
-                                 << " AoI(FTP)=" << avgAoiFtpMs << " ms"
-                                 << " AoI(GAMING)=" << avgAoiGamingMs << " ms"
-                                 << " AoI(VIDEO)=" << avgAoiVideoMs << " ms"
+                                 << " packetAoI(FTP/GAMING/VIDEO)="
+                                 << avgAoiFtpMs << "/" << avgAoiGamingMs << "/" << avgAoiVideoMs
+                                 << " ms"
                                  << " avgMcs=" << avgMcs
                                  << " bler=" << bler
                                  << " avgTbler=" << avgTbler
                                  << " PRB(total)=" << prb.prbTotal
                                  << " bytes/PRB=" << bytesPerPrb
-                                 << " estPRB(FTP)=" << httpPrbEst
-                                 << " estPRB(GAMING)=" << gamingPrbEst
-                                 << " estPRB(VIDEO)=" << videoPrbEst
-                                 << " txPkts(FTP/GAMING/VIDEO)="
-                                 << g_txPacketsByType[i][LIGHT_HTTP] << "/"
-                                 << g_txPacketsByType[i][MODERATE_GAMING] << "/"
-                                 << g_txPacketsByType[i][HEAVY_VIDEO]
-                                 << " rxPkts(FTP/GAMING/VIDEO)="
-                                 << g_rxPacketsByType[i][LIGHT_HTTP] << "/"
-                                 << g_rxPacketsByType[i][MODERATE_GAMING] << "/"
-                                 << g_rxPacketsByType[i][HEAVY_VIDEO]
-                                 << " missTag(FTP/GAMING/VIDEO)="
-                                 << g_rxMissingTagPacketsByType[i][LIGHT_HTTP] << "/"
-                                 << g_rxMissingTagPacketsByType[i][MODERATE_GAMING] << "/"
-                                 << g_rxMissingTagPacketsByType[i][HEAVY_VIDEO]
                                  << " LOS_ratio=" << losRatio
                                  << " NLOS_ratio=" << nlosRatio
                                  << " thr(LOS)=" << thrLosMbps << " Mbps"
@@ -4637,7 +4730,6 @@ main(int argc, char* argv[])
         (totalPrbAll > 0) ? (static_cast<double>(totalBytesAll) / totalPrbAll) : 0.0;
     double runMeanThrMbps = 0.0;
     double runMeanAoiMs = 0.0;
-    double runMeanPrbUtility = 0.0;
     double runQueueOverflowRatio = 0.0;
     double runMeanSwitchCount = 0.0;
     double runTotalSwitchCount = 0.0;
@@ -4646,26 +4738,15 @@ main(int argc, char* argv[])
         double denom = static_cast<double>(g_intervalMetrics.samples);
         runMeanThrMbps = g_intervalMetrics.meanThrMbpsSum / denom;
         runMeanAoiMs = g_intervalMetrics.meanAoiMsSum / denom;
-        runMeanPrbUtility = g_intervalMetrics.meanPrbUtilitySum / denom;
         runQueueOverflowRatio = g_intervalMetrics.queueOverflowRatioSum / denom;
         runMeanSwitchCount = g_intervalMetrics.switchCountSum / denom;
     }
     runTotalSwitchCount = g_intervalMetrics.switchCountSum;
-    double httpPrbEstAll = 0.0;
-    double gamingPrbEstAll = 0.0;
-    double videoPrbEstAll = 0.0;
     double avgMcsAll = (totalMcsCountAll > 0) ? (totalMcsSumAll / totalMcsCountAll) : 0.0;
     double blerAll =
         (totalTbCountAll > 0) ? (static_cast<double>(totalTbErrorAll) / totalTbCountAll) : 0.0;
     double avgTblerAll =
         (totalTblerCountAll > 0) ? (totalTblerSumAll / totalTblerCountAll) : 0.0;
-    if (totalBytesAll > 0 && totalPrbAll > 0)
-    {
-        httpPrbEstAll = totalPrbAll * (static_cast<double>(totalHttpBytesAll) / totalBytesAll);
-        gamingPrbEstAll =
-            totalPrbAll * (static_cast<double>(totalGamingBytesAll) / totalBytesAll);
-        videoPrbEstAll = totalPrbAll * (static_cast<double>(totalVideoBytesAll) / totalBytesAll);
-    }
     const double totalEnvTimeAll = totalLosTimeAll + totalNlosTimeAll;
     const double losRatioAll = (totalEnvTimeAll > 0.0) ? (totalLosTimeAll / totalEnvTimeAll) : 0.0;
     const double nlosRatioAll =
@@ -4679,30 +4760,70 @@ main(int argc, char* argv[])
         (totalLosAoiSamplesAll > 0) ? (totalLosAoiSumMsAll / totalLosAoiSamplesAll) : 0.0;
     const double avgAoiNlosAllMs =
         (totalNlosAoiSamplesAll > 0) ? (totalNlosAoiSumMsAll / totalNlosAoiSamplesAll) : 0.0;
+    const double dppServiceRateGoodputMbps =
+        (duration > 0.0) ? (static_cast<double>(totalBytesAll) * 8.0 / duration / 1e6) : 0.0;
+    const double goodputFtpMbps =
+        (duration > 0.0) ? (static_cast<double>(totalHttpBytesAll) * 8.0 / duration / 1e6) : 0.0;
+    const double goodputGamingMbps =
+        (duration > 0.0) ? (static_cast<double>(totalGamingBytesAll) * 8.0 / duration / 1e6) : 0.0;
+    const double goodputVideoMbps =
+        (duration > 0.0) ? (static_cast<double>(totalVideoBytesAll) * 8.0 / duration / 1e6) : 0.0;
+
+    const PacketAoiStats packetAoiAll = ComputePacketAoiStats(g_packetLevelAoiSamplesMs);
+    const PacketAoiStats packetAoiFtp = ComputePacketAoiStats(g_packetLevelAoiSamplesByTypeMs[LIGHT_HTTP]);
+    const PacketAoiStats packetAoiGaming =
+        ComputePacketAoiStats(g_packetLevelAoiSamplesByTypeMs[MODERATE_GAMING]);
+    const PacketAoiStats packetAoiVideo =
+        ComputePacketAoiStats(g_packetLevelAoiSamplesByTypeMs[HEAVY_VIDEO]);
+    uint64_t actualBwpSwitchExecTotal = 0u;
+    for (uint64_t v : g_bwpSwitchExecCountByUe)
+    {
+        actualBwpSwitchExecTotal += v;
+    }
+    const double actualBwpSwitchExecMeanPerUe =
+        (numUes > 0) ? (static_cast<double>(actualBwpSwitchExecTotal) / static_cast<double>(numUes))
+                     : 0.0;
+    const double totalUeTimeS = static_cast<double>(numUes) * std::max(1e-9, g_simTime);
+    const double bwp0OccupancyRatio = Clamp01(g_bwpOccupancyUeTimeS[0] / totalUeTimeS);
+    const double bwp1OccupancyRatio = Clamp01(g_bwpOccupancyUeTimeS[1] / totalUeTimeS);
 
     NS_LOG_UNCOND("\n=== Aggregate PRB (bytes-share estimate) ===");
     NS_LOG_UNCOND(std::fixed << std::setprecision(3)
                              << "runMeanThr=" << runMeanThrMbps << " Mbps "
                              << "runMeanAoI=" << runMeanAoiMs << " ms "
-                             << "runMeanPrbUtility=" << runMeanPrbUtility << " "
                              << "runQueueOverflowRatio=" << runQueueOverflowRatio << " "
                              << "runMeanSwitchCount=" << runMeanSwitchCount << " "
                              << "runTotalSwitchCount=" << runTotalSwitchCount << " "
+                             << "actualBwpSwitchExecTotal=" << actualBwpSwitchExecTotal << " "
+                             << "actualBwpSwitchExec0To1=" << g_bwpSwitchExec0To1Count << " "
+                             << "actualBwpSwitchExec1To0=" << g_bwpSwitchExec1To0Count << " "
+                             << "actualBwpSwitchExecMeanPerUe=" << actualBwpSwitchExecMeanPerUe
+                             << " "
                              << "avgMcs=" << avgMcsAll
                              << " bler=" << blerAll
                              << " avgTbler=" << avgTblerAll
                              << " PRB(total)=" << totalPrbAll
-                             << " bytes/PRB=" << bytesPerPrbAll
-                             << " estPRB(FTP)=" << httpPrbEstAll
-                             << " estPRB(GAMING)=" << gamingPrbEstAll
-                             << " estPRB(VIDEO)=" << videoPrbEstAll);
+                             << " bytes/PRB=" << bytesPerPrbAll);
     NS_LOG_UNCOND(std::fixed << std::setprecision(3)
                              << "LOS_ratio=" << losRatioAll
                              << " NLOS_ratio=" << nlosRatioAll
                              << " thr(LOS)=" << thrLosAllMbps << " Mbps"
                              << " thr(NLOS)=" << thrNlosAllMbps << " Mbps"
                              << " AoI(LOS)=" << avgAoiLosAllMs << " ms"
-                             << " AoI(NLOS)=" << avgAoiNlosAllMs << " ms");
+                             << " AoI(NLOS)=" << avgAoiNlosAllMs << " ms"
+                             << " serviceRateGoodput=" << dppServiceRateGoodputMbps << " Mbps"
+                             << " bwpOccupancyRatio(BWP0/BWP1)=" << bwp0OccupancyRatio << "/"
+                             << bwp1OccupancyRatio
+                             << " packetAoI(mean/p25/p50/p75/min/max)="
+                             << packetAoiAll.meanMs << "/" << packetAoiAll.p25Ms << "/"
+                             << packetAoiAll.p50Ms << "/" << packetAoiAll.p75Ms << "/"
+                             << packetAoiAll.minMs << "/" << packetAoiAll.maxMs << " ms");
+    NS_LOG_UNCOND(std::fixed << std::setprecision(3)
+                             << "goodputByType(FTP/GAMING/VIDEO)=" << goodputFtpMbps << "/"
+                             << goodputGamingMbps << "/" << goodputVideoMbps << " Mbps"
+                             << " packetAoIByTypeMean(FTP/GAMING/VIDEO)=" << packetAoiFtp.meanMs
+                             << "/" << packetAoiGaming.meanMs << "/" << packetAoiVideo.meanMs
+                             << " ms");
 
     if (!summaryFile.empty())
     {
@@ -4717,16 +4838,50 @@ main(int argc, char* argv[])
                 << ",duration=" << duration << ",avgMcs=" << avgMcsAll << ",bler=" << blerAll
                 << ",avgTbler=" << avgTblerAll << ",runMeanThrMbps=" << runMeanThrMbps
                 << ",runMeanAoiMs=" << runMeanAoiMs
-                << ",runMeanPrbUtility=" << runMeanPrbUtility
                 << ",runQueueOverflowRatio=" << runQueueOverflowRatio
                 << ",runMeanSwitchCount=" << runMeanSwitchCount
                 << ",runTotalSwitchCount=" << runTotalSwitchCount
+                << ",actualBwpSwitchExecTotal=" << actualBwpSwitchExecTotal
+                << ",actualBwpSwitchExec0To1=" << g_bwpSwitchExec0To1Count
+                << ",actualBwpSwitchExec1To0=" << g_bwpSwitchExec1To0Count
+                << ",actualBwpSwitchExecMeanPerUe=" << actualBwpSwitchExecMeanPerUe
                 << ",prbTotal=" << totalPrbAll
-                << ",bytesPerPrb=" << bytesPerPrbAll << ",estPrbFtp=" << httpPrbEstAll
-                << ",estPrbGaming=" << gamingPrbEstAll << ",estPrbVideo=" << videoPrbEstAll
+                << ",bytesPerPrb=" << bytesPerPrbAll
                 << ",losRatio=" << losRatioAll << ",nlosRatio=" << nlosRatioAll
                 << ",thrLosMbps=" << thrLosAllMbps << ",thrNlosMbps=" << thrNlosAllMbps
                 << ",aoiLosMs=" << avgAoiLosAllMs << ",aoiNlosMs=" << avgAoiNlosAllMs
+                << ",dppServiceRateGoodputMbps=" << dppServiceRateGoodputMbps
+                << ",bwp0OccupancyRatio=" << bwp0OccupancyRatio
+                << ",bwp1OccupancyRatio=" << bwp1OccupancyRatio
+                << ",bwp0OccupancyUeTimeS=" << g_bwpOccupancyUeTimeS[0]
+                << ",bwp1OccupancyUeTimeS=" << g_bwpOccupancyUeTimeS[1]
+                << ",goodputFtpMbps=" << goodputFtpMbps
+                << ",goodputGamingMbps=" << goodputGamingMbps
+                << ",goodputVideoMbps=" << goodputVideoMbps
+                << ",packetAoiMeanMs=" << packetAoiAll.meanMs
+                << ",packetAoiP25Ms=" << packetAoiAll.p25Ms
+                << ",packetAoiP50Ms=" << packetAoiAll.p50Ms
+                << ",packetAoiP75Ms=" << packetAoiAll.p75Ms
+                << ",packetAoiMinMs=" << packetAoiAll.minMs
+                << ",packetAoiMaxMs=" << packetAoiAll.maxMs
+                << ",packetAoiFtpMeanMs=" << packetAoiFtp.meanMs
+                << ",packetAoiFtpP25Ms=" << packetAoiFtp.p25Ms
+                << ",packetAoiFtpP50Ms=" << packetAoiFtp.p50Ms
+                << ",packetAoiFtpP75Ms=" << packetAoiFtp.p75Ms
+                << ",packetAoiFtpMinMs=" << packetAoiFtp.minMs
+                << ",packetAoiFtpMaxMs=" << packetAoiFtp.maxMs
+                << ",packetAoiGamingMeanMs=" << packetAoiGaming.meanMs
+                << ",packetAoiGamingP25Ms=" << packetAoiGaming.p25Ms
+                << ",packetAoiGamingP50Ms=" << packetAoiGaming.p50Ms
+                << ",packetAoiGamingP75Ms=" << packetAoiGaming.p75Ms
+                << ",packetAoiGamingMinMs=" << packetAoiGaming.minMs
+                << ",packetAoiGamingMaxMs=" << packetAoiGaming.maxMs
+                << ",packetAoiVideoMeanMs=" << packetAoiVideo.meanMs
+                << ",packetAoiVideoP25Ms=" << packetAoiVideo.p25Ms
+                << ",packetAoiVideoP50Ms=" << packetAoiVideo.p50Ms
+                << ",packetAoiVideoP75Ms=" << packetAoiVideo.p75Ms
+                << ",packetAoiVideoMinMs=" << packetAoiVideo.minMs
+                << ",packetAoiVideoMaxMs=" << packetAoiVideo.maxMs
                 << "\n";
             for (uint32_t i = 0; i < numUes; ++i)
             {
@@ -4735,6 +4890,12 @@ main(int argc, char* argv[])
                 const auto& video = g_ueStats[i].flow[HEAVY_VIDEO];
                 uint64_t totalBytes = http.rxBytes + gaming.rxBytes + video.rxBytes;
                 double thrMbps = (totalBytes * 8.0) / duration / 1e6;
+                const double goodputFtpUeMbps =
+                    (static_cast<double>(http.rxBytes) * 8.0) / duration / 1e6;
+                const double goodputGamingUeMbps =
+                    (static_cast<double>(gaming.rxBytes) * 8.0) / duration / 1e6;
+                const double goodputVideoUeMbps =
+                    (static_cast<double>(video.rxBytes) * 8.0) / duration / 1e6;
                 double avgAoiFtpMs = (http.aoiSamples > 0) ? (http.aoiSumMs / http.aoiSamples) : 0.0;
                 double avgAoiGamingMs =
                     (gaming.aoiSamples > 0) ? (gaming.aoiSumMs / gaming.aoiSamples) : 0.0;
@@ -4760,20 +4921,17 @@ main(int argc, char* argv[])
                     (prb.prbTotal > 0) ? (static_cast<double>(totalBytes) / prb.prbTotal) : 0.0;
                 double avgSinr = (prb.sinrSamples > 0) ? (prb.sinrSumDb / prb.sinrSamples) : -100.0;
                 out << "ue=" << i << ",class=" << ueTrafficProfiles[i].trafficClass
-                    << ",thrMbps=" << thrMbps << ",aoiNodeMs=" << ComputeUeKpiAoiMs(i)
-                    << ",aoiFtpMs=" << avgAoiFtpMs << ",aoiGamingMs=" << avgAoiGamingMs
-                    << ",aoiVideoMs=" << avgAoiVideoMs << ",avgSinrDb=" << avgSinr
+                    << ",thrMbps=" << thrMbps
+                    << ",goodputFtpMbps=" << goodputFtpUeMbps
+                    << ",goodputGamingMbps=" << goodputGamingUeMbps
+                    << ",goodputVideoMbps=" << goodputVideoUeMbps
+                    << ",aoiNodeMs=" << ComputeUeKpiAoiMs(i)
+                    << ",packetAoiFtpMeanMs=" << avgAoiFtpMs
+                    << ",packetAoiGamingMeanMs=" << avgAoiGamingMs
+                    << ",packetAoiVideoMeanMs=" << avgAoiVideoMs
+                    << ",avgSinrDb=" << avgSinr
                     << ",prbTotal=" << prb.prbTotal
                     << ",bytesPerPrb=" << bytesPerPrb
-                    << ",txPktsFtp=" << g_txPacketsByType[i][LIGHT_HTTP]
-                    << ",txPktsGaming=" << g_txPacketsByType[i][MODERATE_GAMING]
-                    << ",txPktsVideo=" << g_txPacketsByType[i][HEAVY_VIDEO]
-                    << ",rxPktsFtp=" << g_rxPacketsByType[i][LIGHT_HTTP]
-                    << ",rxPktsGaming=" << g_rxPacketsByType[i][MODERATE_GAMING]
-                    << ",rxPktsVideo=" << g_rxPacketsByType[i][HEAVY_VIDEO]
-                    << ",missTagFtp=" << g_rxMissingTagPacketsByType[i][LIGHT_HTTP]
-                    << ",missTagGaming=" << g_rxMissingTagPacketsByType[i][MODERATE_GAMING]
-                    << ",missTagVideo=" << g_rxMissingTagPacketsByType[i][HEAVY_VIDEO]
                     << ",losRatio=" << losRatio << ",nlosRatio=" << nlosRatio
                     << ",thrLosMbps=" << thrLosMbps << ",thrNlosMbps=" << thrNlosMbps
                     << ",aoiLosMs=" << avgAoiLosMs << ",aoiNlosMs=" << avgAoiNlosMs

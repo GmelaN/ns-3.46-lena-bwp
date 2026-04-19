@@ -207,7 +207,11 @@ def main():
 
     cfg, env = build_env(args, seed=args.seed)
     episode_step_budget = steps_per_episode(cfg, shared_per_ue=bool(args.shared_per_ue))
-    effective_total_env_steps = max(args.total_env_steps, episode_step_budget * max(1, args.min_completed_episodes))
+    effective_total_env_steps = args.total_env_steps
+    if args.min_completed_episodes > 0:
+        effective_total_env_steps = max(
+            effective_total_env_steps, episode_step_budget * args.min_completed_episodes
+        )
     obs, _ = env.reset(seed=args.seed)
     obs = obs.astype("float32")
     obs_dim = int(obs.shape[0])

@@ -109,12 +109,14 @@ def run_once(args, out_dir: Path, run_idx: int, case_name: str = "default", over
         ]
         for kv in ns3_arg_list:
             if kv.startswith("--"):
-                full_cmd.extend(["--ns3-arg", kv[2:]])
+                full_cmd.extend(["", kv[2:]])
     else:
-        ns3_run_str = f"scratch/aoi-prb-urban-appmix {' '.join(cmd_args)}"
-        full_cmd = ["./ns3", "run", ns3_run_str]
+        # ns3_run_str = f"scratch/aoi-prb-urban-appmix {' '.join(cmd_args)}"
+        # full_cmd = ["./ns3", "run", ns3_run_str]
+        ns3_run_str = f"{' '.join(cmd_args)}"
+        full_cmd = ["/home/jshyeon/ns-3.46-bwp/build/scratch/ns3.46-aoi-prb-urban-appmix-optimized", ns3_run_str]
 
-    print(f"\n[{case_name} run {run_idx}] {shlex.join(full_cmd)}")
+    print(f"\n[{case_name} run {run_idx}] {" ".join(full_cmd)}")
     cp = subprocess.run(full_cmd, text=True, capture_output=True)
     if cp.returncode != 0:
         print(cp.stdout)
@@ -234,7 +236,7 @@ def main():
     p = argparse.ArgumentParser(description="Runner for scratch/aoi-prb-urban-appmix with summary stats")
     p.add_argument("--runs", type=int, default=1)
     p.add_argument("--num-ues", type=int, default=20)
-    p.add_argument("--sim-time", type=float, default=10.0)
+    p.add_argument("--sim-time", type=float, default=5.0)
     p.add_argument("--app-start", type=float, default=0.1)
     p.add_argument("--env-step-time", type=float, default=0.02)
     p.add_argument("--bwp-baseline", type=str, default="dpp")
