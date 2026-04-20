@@ -3486,8 +3486,8 @@ main(int argc, char* argv[])
     // double lowFreqHz = 3.5e9;
     double lowFreqHz = 700e6;
     double highFreqHz = 6e9;
-    double lowBandwidthHz = 10e6;
-    double highBandwidthHz = 60e6;
+    double lowBandwidthHz = 20e6;
+    double highBandwidthHz = 100e6;
     double gnbTxPowerDbm = 10.0;
     double ueDistance = 20.0;
     double ueRadius = 100.0;
@@ -3514,7 +3514,7 @@ main(int argc, char* argv[])
     // Background traffic
     double backgroundRateKbps = 500.0;
     uint32_t backgroundPktSize = 500;
-    std::string trafficModel = "legacy"; // legacy|mixed
+    std::string trafficModel = "mixed"; // legacy|mixed
     double appLoadScale = 2.5;
     double mixedLightRatio = 0.4;
     double mixedModerateRatio = 0.4;
