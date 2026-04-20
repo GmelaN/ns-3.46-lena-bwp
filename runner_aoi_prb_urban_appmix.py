@@ -10,6 +10,18 @@ from pathlib import Path
 from tqdm import tqdm
 
 
+def parse_float_list(text: str):
+    vals = []
+    for tok in str(text).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        vals.append(float(tok))
+    if not vals:
+        raise argparse.ArgumentTypeError("expected at least one numeric value")
+    return vals
+
+
 def _to_num(v: str):
     try:
         if "." in v or "e" in v.lower():
@@ -111,10 +123,7 @@ def run_once(args, out_dir: Path, run_idx: int, case_name: str = "default", over
             if kv.startswith("--"):
                 full_cmd.extend(["", kv[2:]])
     else:
-        # ns3_run_str = f"scratch/aoi-prb-urban-appmix {' '.join(cmd_args)}"
-        # full_cmd = ["./ns3", "run", ns3_run_str]
-        ns3_run_str = f"{' '.join(cmd_args)}"
-        full_cmd = ["/home/jshyeon/ns-3.46-bwp/build/scratch/ns3.46-aoi-prb-urban-appmix-optimized", ns3_run_str]
+        full_cmd = ["/home/jshyeon/ns-3.46-bwp/build/scratch/ns3.46-aoi-prb-urban-appmix-optimized", *cmd_args]
 
     print(f"\n[{case_name} run {run_idx}] {" ".join(full_cmd)}")
     cp = subprocess.run(full_cmd, text=True, capture_output=True)
@@ -202,7 +211,7 @@ def build_16_combo_cases(args):
     bwp_modes = ["BWP0ONLY", "BWP1ONLY", "threshold", "DRQN"]
     if args.include_dpp:
         bwp_modes.append("DPP")
-    schedulers = ["rr", "aequitas", "tps", "dgs"]
+    schedulers = ["rr", "aequitas", "tps", "age_optimal"]
     out = []
     for bwp in bwp_modes:
         for sched in schedulers:
@@ -229,6 +238,24 @@ def build_16_combo_cases(args):
                 overrides.update({"bwpBaseline": "dpp"})
             case_name = f"{bwp.lower()}_{sched}"
             out.append((case_name, overrides))
+    return out
+
+
+def build_dpp_sweep_cases(args):
+    out = []
+    for v in args.sweep_dpp_v_list:
+        for lam_sw in args.sweep_dpp_lambda_switch_list:
+            for lam_bler in args.sweep_dpp_lambda_bler_list:
+                case_name = f"dpp_v{v:g}_lsw{lam_sw:g}_lbler{lam_bler:g}"
+                overrides = {
+                    "bwpBaseline": "dpp",
+                    "schedulerPolicy": args.scheduler_policy,
+                    "dppV": v,
+                    "dppLambdaSwitch": lam_sw,
+                    "dppLambdaBler": lam_bler,
+                    "enableMcsSwitch": False,
+                }
+                out.append((case_name, overrides))
     return out
 
 
@@ -259,6 +286,21 @@ def main():
     p.add_argument("--include-dpp",
                    action="store_true",
                    help="When used with --run-16-combos, add DPP x scheduler 4 cases (total 20 combos).")
+    p.add_argument("--sweep-dpp",
+                   action="store_true",
+                   help="Run DPP hyperparameter sweep over V/lambda lists.")
+    p.add_argument("--sweep-dpp-v-list",
+                   type=parse_float_list,
+                   default=parse_float_list("0.5"),
+                   help="Comma-separated list for dppV (e.g., 0.5,1.0,2.0).")
+    p.add_argument("--sweep-dpp-lambda-switch-list",
+                   type=parse_float_list,
+                   default=parse_float_list("0.005"),
+                   help="Comma-separated list for dppLambdaSwitch.")
+    p.add_argument("--sweep-dpp-lambda-bler-list",
+                   type=parse_float_list,
+                   default=parse_float_list("1.0"),
+                   help="Comma-separated list for dppLambdaBler.")
     p.add_argument("--max-workers", type=int, default=4)
     p.add_argument("--drqn-model-path",
                    type=str,
@@ -273,7 +315,34 @@ def main():
     out_dir = Path(args.out_dir) if args.out_dir else Path("scratch/rl_bwp/runs") / f"runner_{ts}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.run_16_combos:
+    if args.sweep_dpp:
+        cases = build_dpp_sweep_cases(args)
+        case_aggs = {name: [] for name, _ in cases}
+        futures = {}
+        with cf.ThreadPoolExecutor(max_workers=max(1, args.max_workers)) as ex:
+            for i in range(1, args.runs + 1):
+                rr = args.random_run + (i - 1)
+                for case_name, base_overrides in cases:
+                    overrides = dict(base_overrides)
+                    overrides["randomSeed"] = args.random_seed
+                    overrides["randomRun"] = rr
+                    fut = ex.submit(run_once, args, out_dir, i, case_name, overrides)
+                    futures[fut] = (i, case_name)
+
+            total_jobs = len(cases) * args.runs
+            pbar = tqdm(total=total_jobs, desc="Running DPP sweep")
+            for fut in cf.as_completed(futures):
+                i, case_name = futures[fut]
+                agg, ues, summary_path = fut.result()
+                print_run_stats(i, agg, ues)
+                print(f"[{case_name} run {i}] summary: {summary_path}")
+                case_aggs[case_name].append(agg)
+                pbar.update(1)
+
+        for case_name in sorted(case_aggs.keys()):
+            print(f"\n[multi-run] {case_name}")
+            print_multi_run_stats(case_aggs[case_name])
+    elif args.run_16_combos:
         cases = build_16_combo_cases(args)
         case_aggs = {name: [] for name, _ in cases}
         futures = {}

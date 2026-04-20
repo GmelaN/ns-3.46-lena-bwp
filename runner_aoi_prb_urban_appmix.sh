@@ -23,6 +23,10 @@ RANDOM_SEED=1
 RANDOM_RUN=1
 RUN_16_COMBOS=0
 INCLUDE_DPP=0
+SWEEP_DPP=0
+SWEEP_DPP_V_LIST="0.5"
+SWEEP_DPP_LAMBDA_SWITCH_LIST="0.005"
+SWEEP_DPP_LAMBDA_BLER_LIST="1.0"
 MAX_WORKERS=4
 DRQN_MODEL_PATH="scratch/rl_bwp/runs/drqn/final_model.pt"
 PYTHON_BIN="ns3gym-venv/bin/python"
@@ -32,6 +36,7 @@ ENABLE_MCS_SWITCH=0
 INITIAL_BWP_ID=""
 
 EXTRA_ARGS=()
+FAILED_JOBS=0
 
 usage() {
   cat << USAGE
@@ -58,7 +63,11 @@ Core options:
 
 Batch modes:
   --run-16-combos
-  --include-dpp
+  --include-dpp   (alone: run DPP with 4 schedulers; with --run-16-combos: add DPP mode)
+  --sweep-dpp
+  --sweep-dpp-v-list CSV
+  --sweep-dpp-lambda-switch-list CSV
+  --sweep-dpp-lambda-bler-list CSV
   --max-workers N
   --drqn-model-path PATH
   --python-bin PATH
@@ -95,6 +104,10 @@ while [[ $# -gt 0 ]]; do
     --random-run) RANDOM_RUN="$2"; shift 2 ;;
     --run-16-combos) RUN_16_COMBOS=1; shift ;;
     --include-dpp) INCLUDE_DPP=1; shift ;;
+    --sweep-dpp) SWEEP_DPP=1; shift ;;
+    --sweep-dpp-v-list) SWEEP_DPP_V_LIST="$2"; shift 2 ;;
+    --sweep-dpp-lambda-switch-list) SWEEP_DPP_LAMBDA_SWITCH_LIST="$2"; shift 2 ;;
+    --sweep-dpp-lambda-bler-list) SWEEP_DPP_LAMBDA_BLER_LIST="$2"; shift 2 ;;
     --max-workers) MAX_WORKERS="$2"; shift 2 ;;
     --drqn-model-path) DRQN_MODEL_PATH="$2"; shift 2 ;;
     --python-bin) PYTHON_BIN="$2"; shift 2 ;;
@@ -132,7 +145,22 @@ throttle_jobs() {
     if (( running < MAX_WORKERS )); then
       break
     fi
-    wait -n || true
+    if ! wait -n; then
+      FAILED_JOBS=$((FAILED_JOBS + 1))
+    fi
+  done
+}
+
+wait_all_jobs() {
+  while true; do
+    local running
+    running=$(jobs -rp | wc -l | tr -d ' ')
+    if (( running == 0 )); then
+      break
+    fi
+    if ! wait -n; then
+      FAILED_JOBS=$((FAILED_JOBS + 1))
+    fi
   done
 }
 
@@ -202,8 +230,13 @@ run_one() {
     echo "[$case_name run ${run_idx}] ${full_cmd[*]}"
     "${full_cmd[@]}" >"$log_path" 2>&1
   else
-    local run_str="scratch/aoi-prb-urban-appmix ${cmd_args[*]}"
-    local full_cmd=("./ns3" "run" "$run_str")
+    local bin_path="build/scratch/ns3.46-aoi-prb-urban-appmix-optimized"
+    if [[ ! -x "$bin_path" ]]; then
+      echo "Binary not found or not executable: $bin_path" >&2
+      echo "Build first: ./ns3 build --build-profile=optimized" >&2
+      exit 1
+    fi
+    local full_cmd=("$bin_path" "${cmd_args[@]}")
     echo "[$case_name run ${run_idx}] ${full_cmd[*]}"
     "${full_cmd[@]}" >"$log_path" 2>&1
   fi
@@ -211,12 +244,32 @@ run_one() {
   echo "[$case_name run ${run_idx}] done: ${summary_path}"
 }
 
-if (( RUN_16_COMBOS == 1 )); then
+if (( SWEEP_DPP == 1 )); then
+  IFS=',' read -r -a v_list <<< "$SWEEP_DPP_V_LIST"
+  IFS=',' read -r -a lsw_list <<< "$SWEEP_DPP_LAMBDA_SWITCH_LIST"
+  IFS=',' read -r -a lbler_list <<< "$SWEEP_DPP_LAMBDA_BLER_LIST"
+  case_idx=0
+  for ((i=1; i<=RUNS; i++)); do
+    rr=$((RANDOM_RUN + i - 1))
+    for v in "${v_list[@]}"; do
+      for lsw in "${lsw_list[@]}"; do
+        for lbler in "${lbler_list[@]}"; do
+          case_name="dpp_v${v}_lsw${lsw}_lbler${lbler}"
+          throttle_jobs
+          DPP_V="$v" DPP_LAMBDA_SWITCH="$lsw" DPP_LAMBDA_BLER="$lbler" \
+            run_one "$i" "$case_name" "ns3" "dpp" "$SCHEDULER_POLICY" "$INITIAL_BWP_ID" 0 "$rr" "$OPEN_GYM_PORT_BASE" &
+          case_idx=$((case_idx + 1))
+        done
+      done
+    done
+  done
+  wait_all_jobs
+elif (( RUN_16_COMBOS == 1 )); then
   bwp_modes=("BWP0ONLY" "BWP1ONLY" "threshold" "DRQN")
   if (( INCLUDE_DPP == 1 )); then
     bwp_modes+=("DPP")
   fi
-  schedulers=("rr" "aequitas" "tps" "dgs")
+  schedulers=("rr" "aequitas" "tps" "age_optimal")
 
   case_idx=0
   for ((i=1; i<=RUNS; i++)); do
@@ -259,14 +312,29 @@ if (( RUN_16_COMBOS == 1 )); then
       done
     done
   done
-  wait
+  wait_all_jobs
+elif (( INCLUDE_DPP == 1 )); then
+  schedulers=("rr" "aequitas" "tps" "age_optimal")
+  for ((i=1; i<=RUNS; i++)); do
+    rr=$((RANDOM_RUN + i - 1))
+    for sched in "${schedulers[@]}"; do
+      case_name="dpp_${sched}"
+      throttle_jobs
+      run_one "$i" "$case_name" "ns3" "dpp" "$sched" "$INITIAL_BWP_ID" 0 "$rr" "$OPEN_GYM_PORT_BASE" &
+    done
+  done
+  wait_all_jobs
 else
   for ((i=1; i<=RUNS; i++)); do
     rr=$((RANDOM_RUN + i - 1))
     throttle_jobs
     run_one "$i" "default" "ns3" "$BWP_BASELINE" "$SCHEDULER_POLICY" "$INITIAL_BWP_ID" "$ENABLE_MCS_SWITCH" "$rr" "$OPEN_GYM_PORT_BASE" &
   done
-  wait
+  wait_all_jobs
 fi
 
 echo "All runs completed. OUT_DIR=${OUT_DIR}"
+if (( FAILED_JOBS > 0 )); then
+  echo "Completed with ${FAILED_JOBS} failed run(s). Check per-run logs under ${OUT_DIR}." >&2
+  exit 1
+fi

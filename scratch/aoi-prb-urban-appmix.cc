@@ -337,7 +337,7 @@ static bool g_useSymbolicSwitchDelay = false;
 static double g_queueNormBytes = 200000.0;
 static uint8_t g_initialMcs = 10;
 static bool g_enablePerUeMcsControl = false;
-static uint32_t g_rlcMaxTxBufferBytes = 10 * 1024;
+static uint32_t g_rlcMaxTxBufferBytes = 512 * 1024;    // 256 KB
 static int32_t g_staticMcsOffset = 0;
 static double g_prbDemandC0 = 5.0;
 static double g_prbDemandC1 = 2.0;
@@ -504,6 +504,11 @@ static bool g_dppScoreDebug = false;
 static std::string g_dppScoreTraceFile = "";
 static std::unique_ptr<std::ofstream> g_dppScoreTraceStream;
 static int32_t g_dppScoreTraceUe = -1;
+static bool g_debugDpp = false;
+static std::string g_dppPosteriorTraceFile = "";
+static std::unique_ptr<std::ofstream> g_dppPosteriorTraceStream;
+static std::string g_dppTrafficStateTraceFile = "";
+static std::unique_ptr<std::ofstream> g_dppTrafficStateTraceStream;
 
 static std::string g_schedulerPolicy = "rr"; // rr|pf|aequitas|age_optimal|tps|dgs
 
@@ -516,7 +521,7 @@ static uint32_t g_policySwitchCooldownSteps = 2;
 static std::vector<uint32_t> g_policyCooldownStepsByUe;
 
 // Queue-Threshold BWP baseline parameters (Device_Power_Saving paper)
-static uint32_t g_bwpQueueThreshold = 800; // threshold in bytes
+static uint32_t g_bwpQueueThreshold = 1000; // threshold in bytes
 
 // AAMS MCS baseline parameters
 static double g_aamsTargetBler = 0.10; // 10% target BLER
@@ -546,10 +551,10 @@ static std::vector<double> g_dtEmaAoiMsByUe;
 static std::vector<double> g_dtEmaQueueNormByUe;
 
 // DPP baseline parameters and trigger-epoch state.
-static double g_dppV = 0.1;
-static double g_dppLambdaSwitch = 0.005;
-static double g_dppLambdaBler = 1.0;
-static double g_dppEpochMinIntervalS = 0.01; // 10 ms
+static double g_dppV = 1;
+static double g_dppLambdaSwitch = 0.5;
+static double g_dppLambdaBler = 0.5;
+static double g_dppEpochMinIntervalS = 0.010; // 10 ms
 static double g_dppLastEpochS = -1.0;
 static uint32_t g_dppSwitchCountAccum = 0;
 static EventId g_dppEpochEvent;
@@ -560,6 +565,8 @@ static double g_dppErrPriorMeanBytes = 0.0;
 static double g_dppErrPriorPrecision = 1.0;
 static double g_dppErrObsPrecision = 2.0;
 static double g_dppPosteriorDiscount = 0.9;
+static double g_dppExploreRandomDurationS = 1.0; // random exploration only during early warmup
+static Ptr<UniformRandomVariable> g_dppExploreRv;
 static std::vector<std::array<double, G_DPP_ACTION_COUNT>> g_dppMuPostMeanByUe;
 static std::vector<std::array<double, G_DPP_ACTION_COUNT>> g_dppMuPostPrecisionByUe;
 static std::vector<std::array<double, G_DPP_ACTION_COUNT>> g_dppErrPostMeanByUe;
@@ -2268,6 +2275,22 @@ enum DppAction : uint8_t
     DPP_ACTIONS = G_DPP_ACTION_COUNT
 };
 
+static const char*
+GetAppStateLabel(int state)
+{
+    switch (state)
+    {
+    case 0:
+        return "ftp_only";
+    case 1:
+        return "video_only";
+    case 2:
+        return "ftp_video";
+    default:
+        return "unknown";
+    }
+}
+
 static void
 DecodeDppAction(uint8_t action, uint8_t* targetBwp, int32_t* mcsDelta)
 {
@@ -2347,6 +2370,8 @@ UpdateDppPosteriorForUe(uint32_t ueIdx)
 
             auto& muMean = g_dppMuPostMeanByUe[ueIdx][lastAction];
             auto& muPrec = g_dppMuPostPrecisionByUe[ueIdx][lastAction];
+            const double muMeanBefore = muMean;
+            const double muPrecBefore = muPrec;
             const double obsPrec = std::max(1e-9, g_dppMuObsPrecision);
             const double rho = Clamp01(g_dppPosteriorDiscount);
             // Discounted Bayesian update (forgetting factor):
@@ -2359,12 +2384,39 @@ UpdateDppPosteriorForUe(uint32_t ueIdx)
 
             auto& errMean = g_dppErrPostMeanByUe[ueIdx][lastAction];
             auto& errPrec = g_dppErrPostPrecisionByUe[ueIdx][lastAction];
+            const double errMeanBefore = errMean;
+            const double errPrecBefore = errPrec;
             const double errObsPrec = std::max(1e-9, g_dppErrObsPrecision);
             errMean = rho * errMean + (1.0 - rho) * std::max(0.0, g_dppErrPriorMeanBytes);
             errPrec = rho * errPrec + (1.0 - rho) * std::max(1e-9, g_dppErrPriorPrecision);
             const double newErrPrec = errPrec + errObsPrec;
             errMean = (errPrec * errMean + errObsPrec * obsErrBytes) / std::max(1e-9, newErrPrec);
             errPrec = newErrPrec;
+
+            if (g_dppPosteriorTraceStream && g_dppPosteriorTraceStream->is_open())
+            {
+                (*g_dppPosteriorTraceStream) << std::fixed << std::setprecision(6)
+                                             << nowS << "," << ueIdx << "," << lastAction << ","
+                                             << deltaS << "," << obsSuccessBytes << "," << obsErrBytes << ","
+                                             << muMeanBefore << "," << muPrecBefore << ","
+                                             << muMean << "," << muPrec << ","
+                                             << errMeanBefore << "," << errPrecBefore << ","
+                                             << errMean << "," << errPrec << "," << rho << "\n";
+            }
+            if (g_debugDpp)
+            {
+                NS_LOG_UNCOND("[dpp-post] t=" << std::fixed << std::setprecision(6) << nowS
+                                              << " ue=" << ueIdx
+                                              << " lastAction=" << lastAction
+                                              << " dS=" << deltaS
+                                              << " obsSuccBytes=" << obsSuccessBytes
+                                              << " obsErrBytes=" << obsErrBytes
+                                              << " mu(" << muMeanBefore << "->" << muMean << ")"
+                                              << " muPrec(" << muPrecBefore << "->" << muPrec << ")"
+                                              << " err(" << errMeanBefore << "->" << errMean << ")"
+                                              << " errPrec(" << errPrecBefore << "->" << errPrec << ")"
+                                              << " rho=" << rho);
+            }
         }
     }
 
@@ -2481,7 +2533,7 @@ RunDppPolicyEpochStep()
                                              : std::max(0, std::min(27, cqiMcs));
         const uint8_t currentMcsClamped = static_cast<uint8_t>(std::max(0, std::min(27, currentMcs)));
         const double muCurrent = EstimateExpectedGoodputBayesianDummy(ueIdx, currentBwp, currentMcsClamped);
-        const double gHatCurrent = std::max(0.0, muCurrent);
+        const double gHatCurrent = std::max(0.0, muCurrent) / (g_dppEpochMinIntervalS * 1000);
         // C_sw = (switch_delay / epoch=1ms) * mu(a_curr,t): opportunity cost of staying on current action.
         const double switchCost = std::max(0.0, g_switchDelayMsCfg) * gHatCurrent;
 
@@ -2540,6 +2592,33 @@ RunDppPolicyEpochStep()
                 bestDelta = mcsDelta;
             }
         }
+        const bool inRandomExploreWindow =
+            (g_dppExploreRandomDurationS > 0.0) &&
+            (Simulator::Now().GetSeconds() < g_dppExploreRandomDurationS);
+        if (inRandomExploreWindow)
+        {
+            if (!g_dppExploreRv)
+            {
+                g_dppExploreRv = CreateObject<UniformRandomVariable>();
+            }
+            const uint8_t sampledAction =
+                static_cast<uint8_t>(g_dppExploreRv->GetInteger(0, static_cast<uint32_t>(DPP_ACTIONS - 1)));
+            bestAction = sampledAction;
+            bestTargetBwp = actionTargetBwp[sampledAction];
+            bestTargetMcs = actionTargetMcs[sampledAction];
+            bestDelta = actionMcsDelta[sampledAction];
+            bestScore = actionScore[sampledAction];
+            if (g_debugDpp)
+            {
+                NS_LOG_UNCOND("[dpp-explore] t=" << std::fixed << std::setprecision(6)
+                                                 << Simulator::Now().GetSeconds()
+                                                 << " ue=" << ueIdx
+                                                 << " sampledAction=" << static_cast<uint32_t>(sampledAction)
+                                                 << " targetBwp=" << static_cast<uint32_t>(bestTargetBwp)
+                                                 << " targetMcs=" << static_cast<uint32_t>(bestTargetMcs)
+                                                 << " score=" << bestScore);
+            }
+        }
         const bool traceThisUe = (g_dppScoreTraceUe < 0) || (ueIdx == static_cast<uint32_t>(g_dppScoreTraceUe));
         if (traceThisUe && (g_dppScoreDebug || (g_dppScoreTraceStream && g_dppScoreTraceStream->is_open())))
         {
@@ -2568,6 +2647,34 @@ RunDppPolicyEpochStep()
             if (g_dppScoreTraceStream && g_dppScoreTraceStream->is_open())
             {
                 g_dppScoreTraceStream->flush();
+            }
+            if (g_debugDpp)
+            {
+                for (uint8_t a = 0; a < DPP_ACTIONS; ++a)
+                {
+                    NS_LOG_UNCOND("[dpp-score] t=" << std::fixed << std::setprecision(6)
+                                                   << Simulator::Now().GetSeconds()
+                                                   << " ue=" << ueIdx
+                                                   << " action=" << static_cast<uint32_t>(a)
+                                                   << " sel=" << ((a == bestAction) ? 1 : 0)
+                                                   << " targetBwp="
+                                                   << static_cast<uint32_t>(actionTargetBwp[a])
+                                                   << " targetMcs="
+                                                   << static_cast<uint32_t>(actionTargetMcs[a])
+                                                   << " mcsDelta=" << actionMcsDelta[a]
+                                                   << " backlogBytes=" << backlogBytes
+                                                   << " backlogRatio=" << backlog
+                                                   << " mu=" << actionMu[a]
+                                                   << " e=" << actionE[a]
+                                                   << " muCurrent=" << gHatCurrent
+                                                   << " switchCost=" << switchCost
+                                                   << " switchInd="
+                                                   << ((actionTargetBwp[a] != currentBwp) ? 1 : 0)
+                                                   << " qWeighted=" << actionQueueWeightedGoodput[a]
+                                                   << " penSw=" << actionPenaltySwitch[a]
+                                                   << " penE=" << actionPenaltyBler[a]
+                                                   << " score=" << actionScore[a]);
+                }
             }
             if (g_dppScoreDebug)
             {
@@ -3408,7 +3515,7 @@ main(int argc, char* argv[])
     double backgroundRateKbps = 500.0;
     uint32_t backgroundPktSize = 500;
     std::string trafficModel = "legacy"; // legacy|mixed
-    double appLoadScale = 1.0;
+    double appLoadScale = 2.5;
     double mixedLightRatio = 0.4;
     double mixedModerateRatio = 0.4;
     double mixedHeavyRatio = 0.2;
@@ -3420,7 +3527,7 @@ main(int argc, char* argv[])
     // Channel dynamics
     bool enableShadowing = true;
     double channelUpdateMs = 1000.0;
-    uint32_t extraBuildings = 4;
+    uint32_t extraBuildings = 3;
     std::string summaryFile = "";
     std::string metricsTraceFile = "";
     std::string aoiTraceFile = "";
@@ -3439,6 +3546,7 @@ main(int argc, char* argv[])
     std::string layoutTraceFile = "";
     std::string trajectoryTraceFile = "";
     double trajectorySamplePeriodS = 0.1;
+    bool debugDpp = false;
 
     std::string errorModel = "ns3::NrEesmCcT2";
 
@@ -3537,6 +3645,9 @@ main(int argc, char* argv[])
     cmd.AddValue("dppPosteriorDiscount",
                  "DPP posterior forgetting factor rho in [0,1] (default 0.9).",
                  g_dppPosteriorDiscount);
+    cmd.AddValue("dppExploreRandomDurationS",
+                 "Initial random-action exploration window for DPP in seconds (then pure score policy).",
+                 g_dppExploreRandomDurationS);
     cmd.AddValue("dppScoreDebug",
                  "Enable verbose DPP raw-score tracing to log and optional CSV file",
                  g_dppScoreDebug);
@@ -3546,6 +3657,9 @@ main(int argc, char* argv[])
     cmd.AddValue("dppScoreTraceUe",
                  "UE index filter for DPP raw-score tracing (-1 means all UEs).",
                  g_dppScoreTraceUe);
+    cmd.AddValue("debug-dpp",
+                 "Enable DPP debug bundle (posterior, estimator/score terms, traffic state timeline).",
+                 debugDpp);
     cmd.AddValue("schedulerPolicy",
                  "NR MAC scheduler policy: rr|pf|aequitas|age_optimal|tps|dgs",
                  g_schedulerPolicy);
@@ -3706,6 +3820,25 @@ main(int argc, char* argv[])
     g_dppErrPriorPrecision = std::max(1e-9, g_dppErrPriorPrecision);
     g_dppErrObsPrecision = std::max(1e-9, g_dppErrObsPrecision);
     g_dppPosteriorDiscount = Clamp01(g_dppPosteriorDiscount);
+    g_dppExploreRandomDurationS = std::max(0.0, g_dppExploreRandomDurationS);
+    g_debugDpp = debugDpp;
+    if (g_debugDpp)
+    {
+        g_dppScoreDebug = true;
+        g_dppScoreTraceUe = -1;
+        if (g_dppScoreTraceFile.empty())
+        {
+            g_dppScoreTraceFile = "scratch/rl_bwp/runs/debug_dpp_score.csv";
+        }
+        if (g_dppPosteriorTraceFile.empty())
+        {
+            g_dppPosteriorTraceFile = "scratch/rl_bwp/runs/debug_dpp_posterior.csv";
+        }
+        if (g_dppTrafficStateTraceFile.empty())
+        {
+            g_dppTrafficStateTraceFile = "scratch/rl_bwp/runs/debug_dpp_traffic_state.csv";
+        }
+    }
     g_bwpQueueThreshold = std::max<uint32_t>(1u, g_bwpQueueThreshold);
     g_rlcMaxTxBufferBytes = std::max<uint32_t>(1u, g_rlcMaxTxBufferBytes);
     g_enablePerUeMcsControl =
@@ -3877,6 +4010,7 @@ main(int argc, char* argv[])
     g_dppLastEpochS = -1.0;
     g_dppSwitchCountAccum = 0;
     g_dppEpochEvent = EventId();
+    g_dppExploreRv = nullptr;
     g_metricsTraceFile = metricsTraceFile;
     g_aoiTraceFile = aoiTraceFile;
     g_aoiTraceUe = aoiTraceUe;
@@ -3904,6 +4038,8 @@ main(int argc, char* argv[])
     g_sinrTraceStream.reset();
     g_trajectoryTraceStream.reset();
     g_dppScoreTraceStream.reset();
+    g_dppPosteriorTraceStream.reset();
+    g_dppTrafficStateTraceStream.reset();
     if (!g_metricsTraceFile.empty())
     {
         g_metricsTraceStream = std::make_unique<std::ofstream>(g_metricsTraceFile, std::ios::out);
@@ -4061,6 +4197,40 @@ main(int argc, char* argv[])
             g_dppScoreTraceStream.reset();
         }
     }
+    if (!g_dppPosteriorTraceFile.empty())
+    {
+        g_dppPosteriorTraceStream =
+            std::make_unique<std::ofstream>(g_dppPosteriorTraceFile, std::ios::out);
+        if (g_dppPosteriorTraceStream->is_open())
+        {
+            (*g_dppPosteriorTraceStream)
+                << "time_s,ue_idx,last_action,delta_s,obs_success_bytes,obs_error_bytes,"
+                << "mu_mean_before,mu_prec_before,mu_mean_after,mu_prec_after,"
+                << "err_mean_before,err_prec_before,err_mean_after,err_prec_after,rho\n";
+            g_dppPosteriorTraceStream->flush();
+        }
+        else
+        {
+            NS_LOG_UNCOND("Failed to open dppPosteriorTraceFile: " << g_dppPosteriorTraceFile);
+            g_dppPosteriorTraceStream.reset();
+        }
+    }
+    if (!g_dppTrafficStateTraceFile.empty())
+    {
+        g_dppTrafficStateTraceStream =
+            std::make_unique<std::ofstream>(g_dppTrafficStateTraceFile, std::ios::out);
+        if (g_dppTrafficStateTraceStream->is_open())
+        {
+            (*g_dppTrafficStateTraceStream)
+                << "ue_idx,state_code,state_label,start_s,end_s,ftp_on,video_on\n";
+            g_dppTrafficStateTraceStream->flush();
+        }
+        else
+        {
+            NS_LOG_UNCOND("Failed to open dppTrafficStateTraceFile: " << g_dppTrafficStateTraceFile);
+            g_dppTrafficStateTraceStream.reset();
+        }
+    }
 
     NodeContainer gnbNodes;
     gnbNodes.Create(1);
@@ -4151,12 +4321,12 @@ main(int argc, char* argv[])
     addBuilding(-4.0, 6.0, 16.0, 30.0, 20.0, 4);
     addBuilding(-2.0, 8.0, -30.0, -16.0, 18.0, 3);
     // Always add a denser urban core around gNB so UE patrol trajectories alternate LOS/NLOS.
-    addBuilding(-20.0, -14.0, -4.0, 6.0, 22.0, 5);
+    addBuilding(-8.0, -2.0, -13.0, -9.0, 22.0, 5);
     addBuilding(14.0, 20.0, -6.0, 4.0, 22.0, 5);
     addBuilding(-10.0, -4.0, -20.0, -14.0, 20.0, 4);
-    addBuilding(4.0, 10.0, 14.0, 20.0, 20.0, 4);
+    addBuilding(4.0, 10.0, 8.0, 14.0, 20.0, 4);
     addBuilding(-22.0, -16.0, 12.0, 18.0, 20.0, 4);
-    addBuilding(16.0, 22.0, -18.0, -12.0, 20.0, 4);
+    addBuilding(16.0, 22.0, -30.0, -24.0, 20.0, 4);
     addBuilding(-32.0,
                 -22.0,
                 -6.0,
@@ -4167,17 +4337,17 @@ main(int argc, char* argv[])
 
     if (extraBuildings >= 1)
     {
-        addBuilding(-18.0, -10.0, 12.0, 18.0, 16.0, 3);
-        addBuilding(-10.0, -2.0, -16.0, -10.0, 15.0, 3);
+        addBuilding(-12.0, -4.0, 18.0, 24.0, 16.0, 3);
+        addBuilding(-2.0, 6.0, -16.0, -10.0, 15.0, 3);
         addBuilding(2.0, 10.0, -6.0, 2.0, 14.0, 2);
-        addBuilding(10.0, 18.0, 2.0, 8.0, 18.0, 3);
+        addBuilding(22.0, 30.0, 2.0, 8.0, 18.0, 3);
     }
     if (extraBuildings >= 2)
     {
         addBuilding(-6.0, 2.0, 8.0, 14.0, 16.0, 3);
-        addBuilding(4.0, 12.0, -14.0, -8.0, 16.0, 3);
+        addBuilding(-30.0, -22.0, -14.0, -8.0, 16.0, 3);
         addBuilding(-20.0, -12.0, -18.0, -12.0, 18.0, 4);
-        addBuilding(14.0, 20.0, -9.0, -3.0, 18.0, 4);
+        addBuilding(22.0, 28.0, -9.0, -3.0, 18.0, 4);
     }
     if (extraBuildings >= 3)
     {
@@ -4185,11 +4355,11 @@ main(int argc, char* argv[])
         addBuilding(-1.5, 1.5, 3.0, 7.0, 24.0, 6);
         addBuilding(-1.5, 1.5, -7.0, -3.0, 24.0, 6);
         addBuilding(6.0, 9.0, 3.0, 7.0, 22.0, 5);
-        addBuilding(6.0, 9.0, -7.0, -3.0, 22.0, 5);
+        addBuilding(10.0, 13.0, -7.0, -3.0, 22.0, 5);
         addBuilding(-9.0, -6.0, 10.0, 14.0, 20.0, 5);
-        addBuilding(-9.0, -6.0, -22.0, -18.0, 20.0, 5);
-        addBuilding(12.0, 15.0, -1.5, 1.5, 20.0, 5);
-        addBuilding(-26.0, -22.0, 3.0, 7.0, 18.0, 4);
+        addBuilding(-15.0, -12.0, -24.0, -20.0, 20.0, 5);
+        addBuilding(24.0, 27.0, -1.5, 1.5, 20.0, 5);
+        addBuilding(-30.0, -26.0, 10.0, 14.0, 18.0, 4);
     }
     if (extraBuildings >= 4)
     {
@@ -4488,24 +4658,31 @@ main(int argc, char* argv[])
                 if (g_appStateTraceStream && g_appStateTraceStream->is_open() &&
                     i == static_cast<uint32_t>(std::max<int32_t>(0, g_appStateTraceUe)))
                 {
-                    std::string stateLabel = "unknown";
-                    if (state == 0)
-                    {
-                        stateLabel = "ftp_only";
-                    }
-                    else if (state == 1)
-                    {
-                        stateLabel = "video_only";
-                    }
-                    else if (state == 2)
-                    {
-                        stateLabel = "ftp_video";
-                    }
+                    const std::string stateLabel = GetAppStateLabel(state);
                     (*g_appStateTraceStream) << i << "," << state << "," << stateLabel << ","
                                              << std::fixed << std::setprecision(6) << segStartS << ","
                                              << segStopS << "," << (enableFtp ? 1 : 0) << ","
                                              << (enableVideo ? 1 : 0) << "\n";
                     g_appStateTraceStream->flush();
+                }
+                if (g_dppTrafficStateTraceStream && g_dppTrafficStateTraceStream->is_open())
+                {
+                    (*g_dppTrafficStateTraceStream) << i << "," << state << "," << GetAppStateLabel(state)
+                                                   << "," << std::fixed << std::setprecision(6)
+                                                   << segStartS << "," << segStopS << ","
+                                                   << (enableFtp ? 1 : 0) << ","
+                                                   << (enableVideo ? 1 : 0) << "\n";
+                }
+                if (g_debugDpp)
+                {
+                    NS_LOG_UNCOND("[dpp-traffic] ue=" << i
+                                                      << " state=" << state
+                                                      << " label=" << GetAppStateLabel(state)
+                                                      << " start=" << std::fixed << std::setprecision(6)
+                                                      << segStartS
+                                                      << " end=" << segStopS
+                                                      << " ftp=" << (enableFtp ? 1 : 0)
+                                                      << " video=" << (enableVideo ? 1 : 0));
                 }
 
                 if (enableFtp)
@@ -4990,6 +5167,16 @@ main(int argc, char* argv[])
     {
         g_dppScoreTraceStream->flush();
         g_dppScoreTraceStream->close();
+    }
+    if (g_dppPosteriorTraceStream && g_dppPosteriorTraceStream->is_open())
+    {
+        g_dppPosteriorTraceStream->flush();
+        g_dppPosteriorTraceStream->close();
+    }
+    if (g_dppTrafficStateTraceStream && g_dppTrafficStateTraceStream->is_open())
+    {
+        g_dppTrafficStateTraceStream->flush();
+        g_dppTrafficStateTraceStream->close();
     }
 
     Simulator::Destroy();
