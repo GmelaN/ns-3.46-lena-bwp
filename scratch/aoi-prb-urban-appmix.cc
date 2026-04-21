@@ -258,18 +258,7 @@ struct EnvKpiStats
 
 struct PerUeTrafficProfile
 {
-    double burstRateMbps{100.0};
-    uint32_t burstPktSize{1200};
-    bool burstRandomize{true};
-    double burstOnMs{180.0};
-    double burstOffMs{120.0};
-    double burstOnMinMs{140.0};
-    double burstOnMaxMs{260.0};
-    double burstOffMinMs{80.0};
-    double burstOffMaxMs{220.0};
-    double backgroundRateKbps{500.0};
-    uint32_t backgroundPktSize{400};
-    std::string trafficClass{"legacy"};
+    std::string trafficClass{"dynamic_ftp_video"};
 };
 
 struct AppStateSegment
@@ -551,9 +540,9 @@ static std::vector<double> g_dtEmaAoiMsByUe;
 static std::vector<double> g_dtEmaQueueNormByUe;
 
 // DPP baseline parameters and trigger-epoch state.
-static double g_dppV = 1;
-static double g_dppLambdaSwitch = 0.5;
-static double g_dppLambdaBler = 0.5;
+static double g_dppV = 10;
+static double g_dppLambdaSwitch = 1.0;
+static double g_dppLambdaBler = 1.0;
 static double g_dppEpochMinIntervalS = 0.010; // 10 ms
 static double g_dppLastEpochS = -1.0;
 static uint32_t g_dppSwitchCountAccum = 0;
@@ -2365,8 +2354,12 @@ UpdateDppPosteriorForUe(uint32_t ueIdx)
             const uint64_t dTbBytes = (tbBytesCum >= prevTbBytes) ? (tbBytesCum - prevTbBytes) : 0u;
             const uint64_t dTbErrBytes =
                 (tbErrBytesCum >= prevTbErrBytes) ? (tbErrBytesCum - prevTbErrBytes) : 0u;
+            const uint64_t dTbTotalBytes = dTbBytes + dTbErrBytes;
             const double obsSuccessBytes = static_cast<double>(dTbBytes);
-            const double obsErrBytes = static_cast<double>(dTbErrBytes);
+            const double obsErrRatio =
+                (dTbTotalBytes > 0u)
+                    ? Clamp01(static_cast<double>(dTbErrBytes) / static_cast<double>(dTbTotalBytes))
+                    : 0.0;
 
             auto& muMean = g_dppMuPostMeanByUe[ueIdx][lastAction];
             auto& muPrec = g_dppMuPostPrecisionByUe[ueIdx][lastAction];
@@ -2387,17 +2380,17 @@ UpdateDppPosteriorForUe(uint32_t ueIdx)
             const double errMeanBefore = errMean;
             const double errPrecBefore = errPrec;
             const double errObsPrec = std::max(1e-9, g_dppErrObsPrecision);
-            errMean = rho * errMean + (1.0 - rho) * std::max(0.0, g_dppErrPriorMeanBytes);
+            errMean = rho * errMean + (1.0 - rho) * Clamp01(g_dppErrPriorMeanBytes);
             errPrec = rho * errPrec + (1.0 - rho) * std::max(1e-9, g_dppErrPriorPrecision);
             const double newErrPrec = errPrec + errObsPrec;
-            errMean = (errPrec * errMean + errObsPrec * obsErrBytes) / std::max(1e-9, newErrPrec);
+            errMean = (errPrec * errMean + errObsPrec * obsErrRatio) / std::max(1e-9, newErrPrec);
             errPrec = newErrPrec;
 
             if (g_dppPosteriorTraceStream && g_dppPosteriorTraceStream->is_open())
             {
                 (*g_dppPosteriorTraceStream) << std::fixed << std::setprecision(6)
                                              << nowS << "," << ueIdx << "," << lastAction << ","
-                                             << deltaS << "," << obsSuccessBytes << "," << obsErrBytes << ","
+                                             << deltaS << "," << obsSuccessBytes << "," << obsErrRatio << ","
                                              << muMeanBefore << "," << muPrecBefore << ","
                                              << muMean << "," << muPrec << ","
                                              << errMeanBefore << "," << errPrecBefore << ","
@@ -2410,7 +2403,7 @@ UpdateDppPosteriorForUe(uint32_t ueIdx)
                                               << " lastAction=" << lastAction
                                               << " dS=" << deltaS
                                               << " obsSuccBytes=" << obsSuccessBytes
-                                              << " obsErrBytes=" << obsErrBytes
+                                              << " obsErrRatio=" << obsErrRatio
                                               << " mu(" << muMeanBefore << "->" << muMean << ")"
                                               << " muPrec(" << muPrecBefore << "->" << muPrec << ")"
                                               << " err(" << errMeanBefore << "->" << errMean << ")"
@@ -2489,7 +2482,7 @@ EstimateExpectedGoodputBayesianDummy(uint32_t ueIdx, uint8_t targetBwp, uint8_t 
 static double
 EstimateExpectedErrorBytesBayesianDummy(uint32_t ueIdx, uint8_t targetBwp, uint8_t targetMcs)
 {
-    // Pure Bayesian posterior mean of expected error TB bytes e_i(t,a) per epoch.
+    // Pure Bayesian posterior mean of expected TB error ratio e_i(t,a) per epoch.
     uint8_t action = DPP_BWP0_CQI;
     if (targetBwp == g_lowBwpId)
     {
@@ -2507,9 +2500,9 @@ EstimateExpectedErrorBytesBayesianDummy(uint32_t ueIdx, uint8_t targetBwp, uint8
     }
     if (ueIdx < g_dppErrPostMeanByUe.size())
     {
-        return std::max(0.0, g_dppErrPostMeanByUe[ueIdx][action]);
+        return Clamp01(g_dppErrPostMeanByUe[ueIdx][action]);
     }
-    return std::max(0.0, g_dppErrPriorMeanBytes);
+    return Clamp01(g_dppErrPriorMeanBytes);
 }
 
 static uint32_t
@@ -3486,8 +3479,8 @@ main(int argc, char* argv[])
     // double lowFreqHz = 3.5e9;
     double lowFreqHz = 700e6;
     double highFreqHz = 6e9;
-    double lowBandwidthHz = 20e6;
-    double highBandwidthHz = 100e6;
+    double lowBandwidthHz = 10e6;
+    double highBandwidthHz = 80e6;
     double gnbTxPowerDbm = 10.0;
     double ueDistance = 20.0;
     double ueRadius = 100.0;
@@ -3500,26 +3493,9 @@ main(int argc, char* argv[])
     uint32_t randomSeed = 1;
     uint32_t randomRun = 1;
 
-    // Bursty traffic
-    double burstRateMbps = 8.0;
-    uint32_t burstPktSize = 1200;
-    double burstOnMs = 180.0;
-    double burstOffMs = 120.0;
-    bool burstRandomize = true;
-    double burstOnMinMs = 140.0;
-    double burstOnMaxMs = 260.0;
-    double burstOffMinMs = 80.0;
-    double burstOffMaxMs = 220.0;
-
-    // Background traffic
-    double backgroundRateKbps = 500.0;
-    uint32_t backgroundPktSize = 500;
-    std::string trafficModel = "mixed"; // legacy|mixed
-    double appLoadScale = 2.5;
-    double mixedLightRatio = 0.4;
-    double mixedModerateRatio = 0.4;
-    double mixedHeavyRatio = 0.2;
-    double segmentDurationS = 0.6; // legacy fixed duration fallback
+    // App-mix traffic (FTP/VIDEO cycling)
+    double appLoadScale = 1.0;
+    double enqueueRelaxFactor = 0.5; // more factor, less enqueue rate
     double segmentDurationMinMs = 500.0;
     double segmentDurationMaxMs = 2000.0;
     int32_t appmixStateOverride = g_appmixStateOverride;
@@ -3527,7 +3503,7 @@ main(int argc, char* argv[])
     // Channel dynamics
     bool enableShadowing = true;
     double channelUpdateMs = 1000.0;
-    uint32_t extraBuildings = 3;
+    uint32_t extraBuildings = 2;
     std::string summaryFile = "";
     std::string metricsTraceFile = "";
     std::string aoiTraceFile = "";
@@ -3538,7 +3514,6 @@ main(int argc, char* argv[])
     int32_t queueTraceUe = 0;
     std::string appStateTraceFile = "";
     int32_t appStateTraceUe = 0;
-    std::string burstStateTraceFile = "";
     std::string causeTraceFile = "";
     double causeSamplePeriodS = 0.005;
     std::string sinrTraceFile = "";
@@ -3566,14 +3541,14 @@ main(int argc, char* argv[])
                  uePatrolRadius);
     cmd.AddValue("ueSpacing", "UE spacing along x-axis (m)", ueSpacing);
     cmd.AddValue("startJitterMs", "App start jitter (ms)", startJitterMs);
-    cmd.AddValue("trafficModel", "Traffic model: legacy|mixed", trafficModel);
     cmd.AddValue("appLoadScale",
                  "Overall semantic app traffic load scale (>0). Scales FTP file size, "
                  "gaming packet size, and video packets/packet size.",
                  appLoadScale);
-    cmd.AddValue("mixedLightRatio", "UE ratio for light mixed-traffic class", mixedLightRatio);
-    cmd.AddValue("mixedModerateRatio", "UE ratio for moderate mixed-traffic class", mixedModerateRatio);
-    cmd.AddValue("mixedHeavyRatio", "UE ratio for heavy mixed-traffic class", mixedHeavyRatio);
+    cmd.AddValue("enqueueRelaxFactor",
+                 "Relax enqueue cadence while preserving average offered load "
+                 "(intervals and per-event payload are scaled together).",
+                 enqueueRelaxFactor);
     cmd.AddValue("ueSpeed", "UE speed along x-axis (m/s)", ueSpeed);
     cmd.AddValue("enableMobility", "Enable UE mobility", enableMobility);
     cmd.AddValue("randomSeed", "Global ns-3 RNG seed (fixed for reproducibility)", randomSeed);
@@ -3629,7 +3604,7 @@ main(int argc, char* argv[])
                  g_bwpQueueThreshold);
     cmd.AddValue("dppV", "DPP V coefficient", g_dppV);
     cmd.AddValue("dppLambdaSwitch", "DPP switch penalty lambda", g_dppLambdaSwitch);
-    cmd.AddValue("dppLambdaBler", "DPP expected error-bytes penalty lambda", g_dppLambdaBler);
+    cmd.AddValue("dppLambdaBler", "DPP expected TB error-ratio penalty lambda", g_dppLambdaBler);
     cmd.AddValue("dppEpochMinIntervalS",
                  "DPP epoch interval in seconds (default 0.01 for 10ms control).",
                  g_dppEpochMinIntervalS);
@@ -3689,9 +3664,6 @@ main(int argc, char* argv[])
                  "DT baseline queue trend prediction gain",
                  g_dtPredictGainQueue);
     cmd.AddValue("dtEmaAlpha", "DT baseline EMA alpha", g_dtEmaAlpha);
-    cmd.AddValue("segmentDurationS",
-                 "Legacy fixed appmix segment duration (s), used when min=max or as fallback.",
-                 segmentDurationS);
     cmd.AddValue("segmentDurationMinMs",
                  "Minimum randomized appmix traffic-state segment duration (ms).",
                  segmentDurationMinMs);
@@ -3701,17 +3673,6 @@ main(int argc, char* argv[])
     cmd.AddValue("appmixStateOverride",
                  "Override appmix state for all segments: -1=disabled, 0=ftp_only, 1=video_only, 2=ftp_video.",
                  appmixStateOverride);
-    cmd.AddValue("burstRateMbps", "Bursty traffic rate (Mbps) during ON", burstRateMbps);
-    cmd.AddValue("burstPktSize", "Bursty packet size (bytes)", burstPktSize);
-    cmd.AddValue("burstOnMs", "Bursty ON duration (ms)", burstOnMs);
-    cmd.AddValue("burstOffMs", "Bursty OFF duration (ms)", burstOffMs);
-    cmd.AddValue("burstRandomize", "Use randomized burst On/Off durations", burstRandomize);
-    cmd.AddValue("burstOnMinMs", "Random burst ON minimum duration (ms)", burstOnMinMs);
-    cmd.AddValue("burstOnMaxMs", "Random burst ON maximum duration (ms)", burstOnMaxMs);
-    cmd.AddValue("burstOffMinMs", "Random burst OFF minimum duration (ms)", burstOffMinMs);
-    cmd.AddValue("burstOffMaxMs", "Random burst OFF maximum duration (ms)", burstOffMaxMs);
-    cmd.AddValue("backgroundRateKbps", "Background traffic rate (Kbps)", backgroundRateKbps);
-    cmd.AddValue("backgroundPktSize", "Background packet size (bytes)", backgroundPktSize);
     cmd.AddValue("enableShadowing", "Enable shadowing in pathloss", enableShadowing);
     cmd.AddValue("channelUpdateMs", "3GPP channel model update period (ms)", channelUpdateMs);
     cmd.AddValue("extraBuildings",
@@ -3735,9 +3696,6 @@ main(int argc, char* argv[])
                  "Write app traffic-state interval trace CSV for the selected UE to this file path.",
                  appStateTraceFile);
     cmd.AddValue("appStateTraceUe", "UE index for app traffic-state interval tracing.", appStateTraceUe);
-    cmd.AddValue("burstStateTraceFile",
-                 "Write burst source-side On/Off state trace CSV for the selected UE to this file path.",
-                 burstStateTraceFile);
     cmd.AddValue("causeTraceFile",
                  "Write 5ms-cadence PHY/MAC/RRC observable cause trace CSV for all UEs.",
                  causeTraceFile);
@@ -3778,7 +3736,6 @@ main(int argc, char* argv[])
     g_bwpBaseline = ToLower(g_bwpBaseline);
     g_schedulerPolicy = ToLower(g_schedulerPolicy);
     g_mcsBaseline = ToLower(g_mcsBaseline);
-    trafficModel = ToLower(trafficModel);
     if (g_bwpBaseline != "none" && g_bwpBaseline != "dt" &&
         g_bwpBaseline != "aequitas" && g_bwpBaseline != "queue" &&
         g_bwpBaseline != "dpp")
@@ -3816,7 +3773,7 @@ main(int argc, char* argv[])
     g_dppMuPriorMeanBytes = std::max(0.0, g_dppMuPriorMeanBytes);
     g_dppMuPriorPrecision = std::max(1e-9, g_dppMuPriorPrecision);
     g_dppMuObsPrecision = std::max(1e-9, g_dppMuObsPrecision);
-    g_dppErrPriorMeanBytes = std::max(0.0, g_dppErrPriorMeanBytes);
+    g_dppErrPriorMeanBytes = Clamp01(g_dppErrPriorMeanBytes);
     g_dppErrPriorPrecision = std::max(1e-9, g_dppErrPriorPrecision);
     g_dppErrObsPrecision = std::max(1e-9, g_dppErrObsPrecision);
     g_dppPosteriorDiscount = Clamp01(g_dppPosteriorDiscount);
@@ -3844,22 +3801,8 @@ main(int argc, char* argv[])
     g_enablePerUeMcsControl =
         (g_mcsBaseline == "aams" || g_staticMcsOffset != 0 || g_bwpBaseline == "dpp" ||
          (g_enableOpenGym && g_enableRlMcsControl));
-    if (trafficModel != "legacy" && trafficModel != "mixed")
-    {
-        NS_ABORT_MSG("Invalid trafficModel. Supported values: legacy|mixed");
-    }
     appLoadScale = std::max(0.05, appLoadScale);
-    mixedLightRatio = std::max(0.0, mixedLightRatio);
-    mixedModerateRatio = std::max(0.0, mixedModerateRatio);
-    mixedHeavyRatio = std::max(0.0, mixedHeavyRatio);
-    double mixedRatioSum = mixedLightRatio + mixedModerateRatio + mixedHeavyRatio;
-    if (mixedRatioSum <= 0.0)
-    {
-        mixedLightRatio = 0.4;
-        mixedModerateRatio = 0.4;
-        mixedHeavyRatio = 0.2;
-        mixedRatioSum = 1.0;
-    }
+    enqueueRelaxFactor = std::max(0.1, enqueueRelaxFactor);
     if (appmixStateOverride < -1 || appmixStateOverride > 2)
     {
         NS_ABORT_MSG("Invalid appmixStateOverride. Supported values: -1|0|1|2");
@@ -3870,7 +3813,6 @@ main(int argc, char* argv[])
     g_dqnLatencyUeRatio = Clamp01(g_dqnLatencyUeRatio);
     g_dqnAlpha = Clamp01(g_dqnAlpha);
     g_dqnBeta = Clamp01(g_dqnBeta);
-    segmentDurationS = std::max(0.05, segmentDurationS);
     segmentDurationMinMs = std::max(50.0, segmentDurationMinMs);
     segmentDurationMaxMs = std::max(segmentDurationMinMs, segmentDurationMaxMs);
     uePatrolRadius = std::max(10.0, uePatrolRadius);
@@ -3889,7 +3831,7 @@ main(int argc, char* argv[])
     g_lastLosStateSampleTimeByUe.assign(numUes, -1.0);
     g_policyBaseStartSByUe.assign(numUes, appStart);
     g_policyPhaseOffsetByUe.assign(numUes, 0);
-    g_policySegmentDurationS = segmentDurationS;
+    g_policySegmentDurationS = std::max(1.0e-3, 0.5 * (segmentDurationMinMs + segmentDurationMaxMs) / 1000.0);
     g_appStateTimelineByUe.assign(numUes, std::vector<AppStateSegment>{});
     g_packetLevelAoiSamplesMs.clear();
     for (auto& v : g_packetLevelAoiSamplesByTypeMs)
@@ -3968,7 +3910,7 @@ main(int argc, char* argv[])
     std::array<double, G_DPP_ACTION_COUNT> errPrecInit{};
     muMeanInit.fill(std::max(0.0, g_dppMuPriorMeanBytes));
     muPrecInit.fill(std::max(1e-9, g_dppMuPriorPrecision));
-    errMeanInit.fill(std::max(0.0, g_dppErrPriorMeanBytes));
+    errMeanInit.fill(Clamp01(g_dppErrPriorMeanBytes));
     errPrecInit.fill(std::max(1e-9, g_dppErrPriorPrecision));
     g_dppMuPostMeanByUe.assign(numUes, muMeanInit);
     g_dppMuPostPrecisionByUe.assign(numUes, muPrecInit);
@@ -4020,7 +3962,7 @@ main(int argc, char* argv[])
     g_queueTraceUe = queueTraceUe;
     g_appStateTraceFile = appStateTraceFile;
     g_appStateTraceUe = appStateTraceUe;
-    g_burstStateTraceFile = burstStateTraceFile;
+    g_burstStateTraceFile.clear();
     g_causeTraceFile = causeTraceFile;
     g_causeSamplePeriodS = std::max(0.001, causeSamplePeriodS);
     g_sinrTraceFile = sinrTraceFile;
@@ -4204,7 +4146,7 @@ main(int argc, char* argv[])
         if (g_dppPosteriorTraceStream->is_open())
         {
             (*g_dppPosteriorTraceStream)
-                << "time_s,ue_idx,last_action,delta_s,obs_success_bytes,obs_error_bytes,"
+                << "time_s,ue_idx,last_action,delta_s,obs_success_bytes,obs_error_ratio,"
                 << "mu_mean_before,mu_prec_before,mu_mean_after,mu_prec_after,"
                 << "err_mean_before,err_prec_before,err_mean_after,err_prec_after,rho\n";
             g_dppPosteriorTraceStream->flush();
@@ -4554,19 +4496,16 @@ main(int argc, char* argv[])
     }
 
     const std::string tgProtocol = "ns3::UdpSocketFactory";
-    if (trafficModel == "legacy")
-    {
-        NS_LOG_UNCOND("trafficModel=legacy is treated the same as mixed (dynamic FTP/VIDEO cycling).");
-    }
+    const double enqueueRelax = enqueueRelaxFactor;
     const uint32_t ftpPacketSize = 1000;
-    const double ftpReadingTimeMeanS = 0.1;
-    const double ftpFileSizeMu = 12 + std::log(appLoadScale);
+    const double ftpReadingTimeMeanS = 0.1 * enqueueRelax;
+    const double ftpFileSizeMu = 12 + std::log(appLoadScale) + std::log(enqueueRelax);
     const double ftpFileSizeSigma = 0.3;
     const uint32_t ftpMaxFileSizeBytes =
-        static_cast<uint32_t>(std::max(100000.0, 1500000.0 * appLoadScale));
+        static_cast<uint32_t>(std::max(100000.0, 1500000.0 * appLoadScale * enqueueRelax));
     const uint32_t heavyVideoPacketsPerFrame =
-        static_cast<uint32_t>(std::max(1.0, std::round(64.0 * appLoadScale)));
-    const Time heavyVideoInterframe = MilliSeconds(30);
+        static_cast<uint32_t>(std::max(1.0, std::round(64.0 * appLoadScale * enqueueRelax)));
+    const Time heavyVideoInterframe = MilliSeconds(30.0 * enqueueRelax);
     const double heavyVideoPacketSizeScale = 1000.0 * appLoadScale;
     const double heavyVideoPacketSizeShape = 1.0;
     const double heavyVideoPacketSizeBound = std::max(200.0, 1600.0 * appLoadScale);
@@ -5009,9 +4948,8 @@ main(int argc, char* argv[])
         {
             out << std::fixed << std::setprecision(6);
             out << "simTime=" << simTime << ",appStart=" << appStart << ",numUes=" << numUes
-                << ",bwpBaseline=" << g_bwpBaseline << ",trafficModel=" << trafficModel
-                << ",burstRateMbps=" << burstRateMbps
-                << ",backgroundRateKbps=" << backgroundRateKbps
+                << ",bwpBaseline=" << g_bwpBaseline
+                << ",enqueueRelaxFactor=" << enqueueRelaxFactor
                 << ",duration=" << duration << ",avgMcs=" << avgMcsAll << ",bler=" << blerAll
                 << ",avgTbler=" << avgTblerAll << ",runMeanThrMbps=" << runMeanThrMbps
                 << ",runMeanAoiMs=" << runMeanAoiMs
