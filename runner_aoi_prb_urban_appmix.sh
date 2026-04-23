@@ -4,7 +4,7 @@ set -euo pipefail
 # Shell runner for scratch/aoi-prb-urban-appmix
 # Scope: execution orchestration only (no CSV parsing/stat summary)
 
-/home/jshyeon/ns-3.46-bwp/ns3 build
+/home/jshyeon/src/ns-3.46-bwp-temp/ns3 build
 
 RUNS=1
 NUM_UES=20
